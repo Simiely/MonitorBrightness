@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+build_tk/
+dist/
+dist_tk/
+*.spec
+
+# 编辑器 / Obsidian
+.obsidian/
+.vscode/
+
+# 系统文件
+Thumbs.db
+.DS_Store
+desktop.ini
