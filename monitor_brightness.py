@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -996,6 +996,61 @@ def install_dark_tickbox(style, root=None):
     ])
 
 
+class DarkBox:
+    """深色模态消息框：messagebox 的替代品。
+
+    原因：messagebox 是 Windows 原生对话框，不吃 ttk 深色主题；
+    实测 SetPreferredAppMode(ForceDark) 只能暗标题栏、内容区仍为浅色（A/B 截图）。
+    模态模式（Toplevel + grab_set + wait_window）与 CustomTkinter 的对话框一致。
+    """
+
+    _ICONS = {"info": ("\u2139", "#4a9eff"),
+              "warn": ("\u26a0", "#e5c07b"),
+              "error": ("\u2715", "#e06c75")}
+
+    def __init__(self, root):
+        self.root = root
+
+    def _show(self, kind, title, message):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.configure(background=DARK["surface"])
+        apply_dark_titlebar(dlg)
+        icon, color = self._ICONS[kind]
+        body = tk.Frame(dlg, background=DARK["surface"])
+        body.pack(fill="both", expand=True, padx=20, pady=(18, 4))
+        tk.Label(body, text=icon, fg=color, bg=DARK["surface"],
+                 font=("Segoe UI Symbol", 18)).pack(side="left", padx=(0, 14))
+        tk.Label(body, text=message, fg=DARK["fg"], bg=DARK["surface"],
+                 font=("Microsoft YaHei UI", 10), justify="left",
+                 wraplength=400).pack(side="left")
+        btn = ttk.Button(dlg, text="确定", style="Accent.TButton", command=dlg.destroy)
+        btn.pack(pady=(6, 16))
+        btn.focus_set()
+        dlg.bind("<Return>", lambda e: dlg.destroy())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.transient(self.root)
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width()
+                                              - dlg.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height()
+                                              - dlg.winfo_height()) // 2)
+        dlg.geometry("+%d+%d" % (x, y))
+        dlg.wait_visibility()
+        dlg.grab_set()
+        dlg.wait_window()
+
+    def showinfo(self, title, message):
+        self._show("info", title, message)
+
+    def showwarning(self, title, message):
+        self._show("warn", title, message)
+
+    def showerror(self, title, message):
+        self._show("error", title, message)
+
+
 class MonitorPanel(ttk.LabelFrame):
     """显示器勾选区（View）：只管勾选行的创建与显示，业务在 App。"""
 
@@ -1205,11 +1260,11 @@ class SchedulePanel(ttk.LabelFrame):
         for r in self._rows:
             t = r["entry"].get().strip()
             if not _valid_hhmm(t):
-                messagebox.showerror("格式不对",
+                self.app.msg.showerror("格式不对",
                                      "时间需要写成 HH:MM，例如 09:00。当前是：%s" % t)
                 return None
             if t in seen:
-                messagebox.showerror("时间重复", "同一时刻 %s 只能有一档。" % t)
+                self.app.msg.showerror("时间重复", "同一时刻 %s 只能有一档。" % t)
                 return None
             seen.add(t)
             try:
@@ -1218,7 +1273,7 @@ class SchedulePanel(ttk.LabelFrame):
                 lv = 50
             out.append({"time": t, "level": lv})
         if not out:
-            messagebox.showinfo("提示", "至少保留一个时间段。")
+            self.app.msg.showinfo("提示", "至少保留一个时间段。")
             return None
         return sorted(out, key=lambda x: parse_hhmm(x["time"], (0, 0)))
 
@@ -1258,6 +1313,7 @@ class App:
         self._busy = False
         self._task_querying = False
         self.status_var = tk.StringVar(value="就绪")
+        self.msg = DarkBox(self.root)     # 深色弹窗（替代 messagebox）
 
         self.mon_panel = MonitorPanel(self)
         self.bri_panel = BrightnessPanel(self, current_level(self.cfg))
@@ -1439,7 +1495,7 @@ class App:
         if errs:
             detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
             self.status_var.set("部分失败：" + detail.replace("\n", " "))
-            messagebox.showwarning("部分显示器失败", detail)
+            self.msg.showwarning("部分显示器失败", detail)
         self.read_current()
 
     def test_current(self):
@@ -1454,7 +1510,7 @@ class App:
         ok, errs = _as_ok_errs(result)
         self.status_var.set("测试：当前档位亮度 %d%%，已下发 %d 台" % (level, len(ok)))
         if errs:
-            messagebox.showwarning("部分失败", "\n".join(
+            self.msg.showwarning("部分失败", "\n".join(
                 ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
         self.read_current()
 
@@ -1464,12 +1520,12 @@ class App:
         try:
             self._save_schedule_inner()
         except Exception as e:
-            messagebox.showerror("保存定时出错", "%s: %s" % (type(e).__name__, e))
+            self.msg.showerror("保存定时出错", "%s: %s" % (type(e).__name__, e))
             self.status_var.set("保存定时出错")
 
     def _save_schedule_inner(self):
         if not self.sch_panel.schedule_enabled():
-            messagebox.showinfo("提示", "请先勾选「启用每日定时」")
+            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
             return
         slots = self.sch_panel.read_slots()
         if slots is None:
@@ -1480,7 +1536,7 @@ class App:
         self.cfg.update(part)
         ok, msg = save_config(self.cfg)
         if not ok:
-            messagebox.showerror("保存失败", msg)
+            self.msg.showerror("保存失败", msg)
             return
         # 注册要冷启动一个子进程（实测 ~3s），必须放后台
         self.status_var.set("正在写入任务计划…")
@@ -1492,12 +1548,12 @@ class App:
             result = (False, str(result))
         ok, out = result
         if not ok:
-            messagebox.showerror("注册任务失败", out or "未知错误")
+            self.msg.showerror("注册任务失败", out or "未知错误")
             self.status_var.set("注册任务失败")
             return
         self._refresh_task_status()
         self.status_var.set("定时已启用")
-        messagebox.showinfo("定时已保存", _saved_summary(part, out))
+        self.msg.showinfo("定时已保存", _saved_summary(part, out))
 
     def cancel_schedule(self):
         self.cfg["enabled"] = False
