@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -110,6 +110,7 @@ SETTINGS = (
     {"key": "catch_up_on_logon", "kind": "flag", "default": True},
     {"key": "screen_hotkeys", "kind": "flag", "default": False},          # 熄屏/点亮热键（需常驻）
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
+    {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 4
@@ -1488,6 +1489,10 @@ class ScreenPanel(ttk.LabelFrame):
                   style="Hint.TLabel").pack(side="left")
         au = ttk.Frame(self, style="Surface.TFrame")
         au.pack(fill="x", padx=10, pady=(2, 0))
+        self.tray_var = tk.BooleanVar(value=bool(cfg.get("tray_enabled", True)))
+        ttk.Checkbutton(au, text="系统托盘图标（关闭后点 X 直接退出程序）",
+                        variable=self.tray_var,
+                        command=app.toggle_tray).pack(anchor="w")
         self.autostart_var = tk.BooleanVar(value=get_autostart()[0])
         ttk.Checkbutton(au, text="开机自动启动（启动后直接进托盘；点 X 也是进托盘，退出在托盘菜单）",
                         variable=self.autostart_var,
@@ -1541,7 +1546,8 @@ class App:
 
         self.refresh_monitors(silent=True)
         self._refresh_task_status()
-        self._create_tray()
+        if self.cfg.get("tray_enabled", True):
+            self._create_tray()
         if start_minimized and self.tray is not None:
             self.root.withdraw()
 
@@ -1799,6 +1805,22 @@ class App:
         else:
             self._stop_hotkey_listener()
             self.status_var.set("已停用熄屏热键")
+
+    def toggle_tray(self):
+        enable = bool(self.screen_panel.tray_var.get())
+        self.cfg["tray_enabled"] = enable
+        save_config(self.cfg)
+        if enable:
+            self._create_tray()
+            self.status_var.set("托盘图标已启用（点 X 进托盘）")
+        else:
+            if self.tray is not None:
+                try:
+                    self.tray.stop()
+                except Exception:
+                    pass
+                self.tray = None
+            self.status_var.set("托盘图标已关闭（点 X 直接退出）")
 
     def toggle_autostart(self):
         enable = bool(self.screen_panel.autostart_var.get())
@@ -2081,6 +2103,54 @@ def set_autostart(enable, command):
             pass
 
 
+# ---- 单实例（命名互斥体；重复启动唤起已有窗口后退出）------------------------
+# ⚠️ 只约束 GUI：CLI 模式（--apply-schedule 等计划任务动作）不获取互斥体，
+#    否则托盘常驻时定时任务会被自己拦死。
+_MUTEX_NAME = "MonitorBrightness_SingleInstance"
+_mutex_handle = None
+
+
+def acquire_single_instance():
+    """尝试获取单实例互斥体。返回 True=本进程是首个实例。
+
+    已有实例时：尝试把它的主窗口恢复并置前，然后返回 False（调用方应退出）。
+    互斥体随进程退出自动释放（崩溃残留的 abandoned 状态不影响下次创建）。
+    """
+    global _mutex_handle
+    if os.name != "nt":
+        return True
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = k32.CreateMutexW(None, False, _MUTEX_NAME)
+    if ctypes.get_last_error() == 183:          # ERROR_ALREADY_EXISTS
+        _activate_existing_window()
+        if handle:
+            k32.CloseHandle(handle)
+        return False
+    _mutex_handle = handle                      # 保引用，防止句柄被 GC 关闭
+    return True
+
+
+def _activate_existing_window():
+    """把已运行实例的主窗口（按标题前缀枚举，含托盘隐藏态）恢复并置前。"""
+    user32 = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _lparam):
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        if buf.value.startswith(APP_TITLE):
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(cb, 0)
+    for hwnd in found:
+        user32.ShowWindow(hwnd, 9)              # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+
+
 def parse_screen_action(text):
     """'off'/'on' -> 规范动作名；其他 -> None（供 CLI 与测试复用）。"""
     t = str(text).strip().lower()
@@ -2125,6 +2195,8 @@ def main():
         if cmd == "--selftest":
             cli_selftest()
             return
+    if not acquire_single_instance():
+        return                                  # 已有实例：已唤起其窗口，直接退出
     root = tk.Tk()
     App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)
