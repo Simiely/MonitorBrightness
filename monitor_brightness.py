@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -103,6 +103,7 @@ DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': ''}, {'time': '21:00',
 # 每个时间段可携带的屏幕动作：""（不变）/ off（到点熄灭）/ on（到点点亮）
 SCREEN_ACTIONS = (("", "不变"), ("off", "熄灭"), ("on", "点亮"))
 SCREEN_VALUE_BY_LABEL = {label: value for value, label in SCREEN_ACTIONS}
+SCREEN_LABEL_BY_VALUE = {value: label for value, label in SCREEN_ACTIONS}
 SETTINGS = (
     {"key": "monitors", "kind": "indices", "default": []},
     {"key": "slots", "kind": "slots", "default": DEFAULT_SLOTS},
@@ -1404,8 +1405,7 @@ class SchedulePanel(ttk.LabelFrame):
         ttk.Label(row, text="屏幕", style="Hint.TLabel").pack(side="left", padx=(8, 0))
         combo = ttk.Combobox(row, values=[l for _v, l in SCREEN_ACTIONS],
                              state="readonly", width=5)
-        combo.set({label: value for value, label in SCREEN_ACTIONS}.get(
-            screen_value, "不变"))
+        combo.set(SCREEN_LABEL_BY_VALUE.get(screen_value, "不变"))
         combo.pack(side="left", padx=4)
         del_btn = ttk.Button(row, text="删除", width=6,
                              command=lambda: self._del_row(row))
