@@ -11,6 +11,7 @@
       MonitorBrightness.exe --set <序号|all|0,1> <亮度>   立即调整
       MonitorBrightness.exe --apply-schedule              按「当前时间」判定白天/晚上并下发
       MonitorBrightness.exe --list                        列出显示器
+      MonitorBrightness.exe --screen off|on               熄灭 / 点亮选中的显示器
       MonitorBrightness.exe --selftest                    自检（打印时间分档判定结果）
 
 v1.1.0 相比 v1.0.0：
@@ -29,6 +30,9 @@ import json
 import queue
 import threading
 import subprocess
+import time
+import ctypes.wintypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 
 import tkinter as tk
@@ -40,7 +44,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -91,6 +95,8 @@ SETTINGS = (
     {"key": "slots", "kind": "slots", "default": DEFAULT_SLOTS},
     {"key": "enabled", "kind": "flag", "default": False},
     {"key": "catch_up_on_logon", "kind": "flag", "default": True},
+    {"key": "screen_hotkeys", "kind": "flag", "default": False},          # 熄屏/点亮热键（需常驻）
+    {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 3
@@ -362,6 +368,88 @@ def get_brightness_many(indices):
             values[i] = None
             errs.append((i, str(e)))
     return values, errs
+
+
+# ---- 熄屏 / 点亮（S6）----------------------------------------------------
+# ⚠️ 硬件红线（本机 Legion R27qe x2 实测事故）：0xD6=4/5（软关/硬关）后面板进入
+# 固件级熄灭，DDC 点亮/驱动重启/拓扑重握手/信号源切换全部唤不醒，只有物理电源键能救；
+# 且 0xD6 回读值与面板实际状态不符。故熄灭只用 2（待机），点亮只用信号源切换（0x60）。
+
+def _physical_handles():
+    """枚举物理显示器句柄（DXVA2）。顺序与 list_monitors() 一致（同为 EnumDisplayMonitors）。"""
+    dxva2 = ctypes.windll.dxva2
+    user32 = ctypes.windll.user32
+    cb_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                 ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+    class _PHYS(ctypes.Structure):
+        _fields_ = [("handle", wintypes.HANDLE), ("desc", wintypes.WCHAR * 128)]
+
+    out = []
+
+    def _cb(hmon, hdc, lprect, lparam):
+        count = wintypes.DWORD()
+        if dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(count)):
+            arr = (_PHYS * count.value)()
+            if dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, count.value, arr):
+                out.extend(p.handle for p in arr)
+        return True
+
+    user32.EnumDisplayMonitors(None, None, cb_type(_cb), 0)
+    return out
+
+
+def screen_off_many(indices):
+    """批量熄灭（0xD6=2 待机）。indices 空 -> 全部。返回 (成功序号, [(序号, 错误), ...])。"""
+    handles = _physical_handles()
+    if not handles:
+        raise RuntimeError(NO_MONITOR_MSG)
+    targets = list(indices) if indices else list(range(len(handles)))
+    ok, errs = [], []
+    for i in targets:
+        if i < 0 or i >= len(handles):
+            errs.append((i, "序号超出范围"))
+            continue
+        if ctypes.windll.dxva2.SetVCPFeature(handles[i], wintypes.BYTE(0xD6), wintypes.DWORD(2)):
+            ok.append(i)
+        else:
+            errs.append((i, "SetVCPFeature 失败"))
+    return ok, errs
+
+
+def screen_wake_many(indices):
+    """批量点亮（0x60 信号源：切到另一输入口 3 秒再切回）。
+
+    本机实测：0xD6 写回点亮不生效（回读还是假的 on），信号源切换是唯一
+    被单变量验证可靠的软件唤醒路径（端到端 2/2 成功）。
+    """
+    handles = _physical_handles()
+    if not handles:
+        raise RuntimeError(NO_MONITOR_MSG)
+    targets = list(indices) if indices else list(range(len(handles)))
+    dxva2 = ctypes.windll.dxva2
+    ok, errs = [], []
+    for i in targets:
+        if i < 0 or i >= len(handles):
+            errs.append((i, "序号超出范围"))
+            continue
+        h = handles[i]
+        cur, mx = wintypes.DWORD(), wintypes.DWORD()
+        if not dxva2.GetVCPFeatureAndVCPFeatureReply(h, wintypes.BYTE(0x60), None,
+                                                     ctypes.byref(cur), ctypes.byref(mx)):
+            errs.append((i, "读信号源失败"))
+            continue
+        cur = cur.value
+        other = 17 if cur != 17 else 4
+        if not dxva2.SetVCPFeature(h, wintypes.BYTE(0x60), wintypes.DWORD(other)):
+            errs.append((i, "切换信号源失败"))
+            continue
+        time.sleep(3)
+        if not dxva2.SetVCPFeature(h, wintypes.BYTE(0x60), wintypes.DWORD(cur)):
+            errs.append((i, "切回信号源失败"))
+            continue
+        ok.append(i)
+    return ok, errs
 
 
 # ============================================================
@@ -1292,6 +1380,45 @@ class SchedulePanel(ttk.LabelFrame):
                 pass
 
 
+class ScreenPanel(ttk.LabelFrame):
+    """熄屏/点亮区（View）：按钮、热键开关与自动点亮保险丝，业务在 App。"""
+
+    def __init__(self, app, cfg):
+        super().__init__(app.root, text=" 熄屏 / 点亮 ")
+        self.app = app
+        self.pack(fill="x", padx=8, pady=4)
+        row = ttk.Frame(self, style="Surface.TFrame")
+        row.pack(fill="x", padx=10, pady=(8, 2))
+        self.off_btn = ttk.Button(row, text="熄灭显示器", command=app.screen_off)
+        self.off_btn.pack(side="left")
+        self.on_btn = ttk.Button(row, text="点亮显示器", command=app.screen_on)
+        self.on_btn.pack(side="left", padx=6)
+        ttk.Label(row, text="点亮时信号源会自动切换一次（亮着的屏闪 3 秒，正常现象）",
+                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        hk = ttk.Frame(self, style="Surface.TFrame")
+        hk.pack(fill="x", padx=10)
+        self.hotkey_var = tk.BooleanVar(value=bool(cfg.get("screen_hotkeys", False)))
+        ttk.Checkbutton(hk, text="启用热键：Ctrl+Alt+Shift+O 熄灭 / P 点亮（需保持本程序运行）",
+                        variable=self.hotkey_var,
+                        command=app.toggle_screen_hotkeys).pack(anchor="w")
+        ar = ttk.Frame(self, style="Surface.TFrame")
+        ar.pack(fill="x", padx=10, pady=(2, 8))
+        ttk.Label(ar, text="熄灭后", style="Hint.TLabel").pack(side="left")
+        self.relight_spin = ttk.Spinbox(ar, from_=0, to=120, width=5, justify="center")
+        self.relight_spin.set(cfg.get("screen_auto_relight_min", 0))
+        self.relight_spin.pack(side="left", padx=4)
+        ttk.Label(ar, text="分钟自动点亮（0 = 不自动；远程时建议设个值防失联）",
+                  style="Hint.TLabel").pack(side="left")
+
+    def set_actions_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for btn in (self.off_btn, self.on_btn):
+            try:
+                btn.config(state=state)
+            except Exception:
+                pass
+
+
 class App:
     """协调者（Presenter）：服务调用、异步编排与弹窗；界面细节都在三个 Panel 里。"""
 
@@ -1312,12 +1439,19 @@ class App:
         self._read_pending = False
         self._busy = False
         self._task_querying = False
+        self._hotkeys_on = False      # 热键监听线程运行中（保持轮询活着的条件之一）
+        self._relight_pending = False # 有定时自动点亮在等（同上）
+        self._hotkey_tid = None       # 热键线程 id（用于 PostThreadMessage 退出）
         self.status_var = tk.StringVar(value="就绪")
         self.msg = DarkBox(self.root)     # 深色弹窗（替代 messagebox）
 
         self.mon_panel = MonitorPanel(self)
         self.bri_panel = BrightnessPanel(self, current_level(self.cfg))
         self.sch_panel = SchedulePanel(self, self.cfg)
+        self.screen_panel = ScreenPanel(self, self.cfg)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.cfg.get("screen_hotkeys"):
+            self._start_hotkey_listener()
         ttk.Label(self.root, textvariable=self.status_var, style="Dim.TLabel").pack(
             anchor="w", padx=12, pady=(0, 8))
 
@@ -1406,6 +1540,12 @@ class App:
                 kind, payload, _extra = self._read_queue.get_nowait()
             except queue.Empty:
                 break
+            if kind == "hotkey":
+                (self.screen_off if payload == "off" else self.screen_on)()
+                continue
+            if kind == "hotkey_error":
+                self.status_var.set(payload)
+                continue
             if kind != "done":
                 continue
             on_done, result, busy = payload
@@ -1415,8 +1555,8 @@ class App:
                 self._set_actions_enabled(True)
             if on_done is not None:
                 on_done(result)
-        if self._bg_tasks > 0:
-            self.root.after(120, self._poll_read_queue)
+        if self._bg_tasks > 0 or self._hotkeys_on or self._relight_pending:
+            self.root.after(150, self._poll_read_queue)
         elif self._read_pending:
             self._read_pending = False
             self.root.after(50, self.read_current)
@@ -1424,6 +1564,7 @@ class App:
     def _set_actions_enabled(self, enabled):
         self.bri_panel.set_actions_enabled(enabled)
         self.sch_panel.set_actions_enabled(enabled)
+        self.screen_panel.set_actions_enabled(enabled)
 
     # ---------- 亮度 ----------
     def read_current(self):
@@ -1513,6 +1654,101 @@ class App:
             self.msg.showwarning("部分失败", "\n".join(
                 ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
         self.read_current()
+
+    # ---------- 熄屏 / 点亮 ----------
+    def screen_off(self):
+        """后台熄灭选中显示器（0xD6=2 待机；绝不用 4/5，见服务层硬件红线）。"""
+        if self._busy:
+            return
+        targets = self.selected_indices()
+        self.status_var.set("正在熄灭显示器…")
+        self.run_bg(lambda: screen_off_many(targets),
+                    self._finish_screen_off, busy=True)
+
+    def _finish_screen_off(self, result):
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            self.status_var.set("已熄灭 %d 台显示器" % len(ok))
+        if errs:
+            self.msg.showwarning("熄灭部分失败", "\n".join(
+                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
+        mins = self._auto_relight_minutes()
+        if ok and mins > 0:
+            # 保险丝：N 分钟后自动点亮（经队列回主线程执行）
+            self._relight_pending = True
+            threading.Timer(mins * 60,
+                            lambda: self._read_queue.put(("hotkey", "on", None))).start()
+
+    def screen_on(self):
+        """后台点亮（0x60 信号源切换，每台约 4 秒）。"""
+        if self._busy:
+            return
+        targets = self.selected_indices()
+        self.status_var.set("正在点亮显示器（信号源切换，约 4 秒）…")
+        self.run_bg(lambda: screen_wake_many(targets),
+                    self._finish_screen_on, busy=True)
+
+    def _finish_screen_on(self, result):
+        ok, errs = _as_ok_errs(result)
+        self._relight_pending = False
+        if ok:
+            self.status_var.set("已点亮 %d 台显示器" % len(ok))
+        if errs:
+            self.msg.showwarning("点亮部分失败", "\n".join(
+                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
+
+    def _auto_relight_minutes(self):
+        try:
+            return max(0, min(120, int(float(self.screen_panel.relight_spin.get()))))
+        except Exception:
+            return 0
+
+    def toggle_screen_hotkeys(self):
+        enabled = bool(self.screen_panel.hotkey_var.get())
+        self.cfg["screen_hotkeys"] = enabled
+        save_config(self.cfg)
+        if enabled:
+            self._start_hotkey_listener()
+        else:
+            self._stop_hotkey_listener()
+            self.status_var.set("已停用熄屏热键")
+
+    def _start_hotkey_listener(self):
+        """常驻热键监听（可选功能）：RegisterHotKey + 消息循环，事件经队列回主线程。"""
+        if self._hotkeys_on:
+            return
+        self._hotkeys_on = True
+
+        def listener():
+            user32 = ctypes.windll.user32
+            mods = 0x0001 | 0x0002 | 0x0004 | 0x4000     # ALT|CONTROL|SHIFT|NOREPEAT
+            ids = {1: ("off", 0x4F), 2: ("on", 0x50)}    # O / P
+            for hid, (_act, vk) in ids.items():
+                if not user32.RegisterHotKey(None, hid, mods, vk):
+                    self._hotkeys_on = False
+                    self._read_queue.put(("hotkey_error",
+                                          "热键注册失败（可能被其他程序占用）", None))
+                    return
+            self._hotkey_tid = threading.get_ident()
+            msg = ctypes.wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312 and msg.wParam in ids:
+                    self._read_queue.put(("hotkey", ids[msg.wParam][0], None))
+            for hid in ids:
+                user32.UnregisterHotKey(None, hid)
+
+        threading.Thread(target=listener, daemon=True).start()
+        self.status_var.set("熄屏热键已启用（Ctrl+Alt+Shift+O / P）")
+
+    def _stop_hotkey_listener(self):
+        self._hotkeys_on = False
+        if self._hotkey_tid is not None:
+            ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
+            self._hotkey_tid = None
+
+    def _on_close(self):
+        self._stop_hotkey_listener()
+        self.root.destroy()
 
     # ---------- 定时 ----------
     def save_schedule(self):
@@ -1613,6 +1849,27 @@ def _valid_hhmm(text):
 
 # 八、入口
 # ============================================================
+def parse_screen_action(text):
+    """'off'/'on' -> 规范动作名；其他 -> None（供 CLI 与测试复用）。"""
+    t = str(text).strip().lower()
+    return t if t in ("off", "on") else None
+
+
+def cli_screen(action):
+    """熄灭/点亮选中的显示器（配置 monitors；空 = 全部）。"""
+    targets = load_config().get("monitors") or []
+    if action == "off":
+        ok, errs = screen_off_many(targets)
+        _out("已熄灭 %d 台显示器" % len(ok) if ok else "熄灭失败")
+    else:
+        ok, errs = screen_wake_many(targets)
+        _out("已点亮 %d 台显示器" % len(ok) if ok else "点亮失败")
+    for i, e in errs:
+        _out("显示器 %d：%s" % (i, e))
+    if errs and not ok:
+        sys.exit(1)
+
+
 def main():
     args = sys.argv[1:]
     if args:
@@ -1622,6 +1879,13 @@ def main():
             return
         if cmd == "--apply-schedule":
             cli_apply_schedule()
+            return
+        if cmd == "--screen" and len(args) >= 2:
+            action = parse_screen_action(args[1])
+            if action is None:
+                _out("--screen 参数需为 off 或 on")
+                sys.exit(2)
+            cli_screen(action)
             return
         if cmd == "--list":
             cli_list()
