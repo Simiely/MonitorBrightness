@@ -38,13 +38,22 @@ from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+# 托盘（可选依赖）：缺 pystray 时 GUI 照常工作，仅没有托盘/最小化到托盘能力
+try:
+    import pystray
+    from pystray import Icon as _TrayIcon, Menu as _TrayMenu, MenuItem as _TrayItem
+    TRAY_OK = True
+except Exception:
+    _TrayIcon = _TrayMenu = _TrayItem = None
+    TRAY_OK = False
+
 try:
     from monitorcontrol import get_monitors
 except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -89,7 +98,11 @@ FONT_UI = ("Microsoft YaHei UI", 9)
 # 加一个设置要同时改 默认值表 / 校验 / 建控件 / 读表单 / 拼注册脚本 五六处。
 # 现在只有这里声明一次，其余地方一律派生。
 #   kind: indices 显示器序号列表 | hhmm 时间 | level 亮度 0-100 | flag 开关
-DEFAULT_SLOTS = [{"time": "08:30", "level": 80}, {"time": "21:00", "level": 0}]
+DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': ''}, {'time': '21:00', 'level': 0, 'screen': ''}]
+
+# 每个时间段可携带的屏幕动作：""（不变）/ off（到点熄灭）/ on（到点点亮）
+SCREEN_ACTIONS = (("", "不变"), ("off", "熄灭"), ("on", "点亮"))
+SCREEN_VALUE_BY_LABEL = {label: value for value, label in SCREEN_ACTIONS}
 SETTINGS = (
     {"key": "monitors", "kind": "indices", "default": []},
     {"key": "slots", "kind": "slots", "default": DEFAULT_SLOTS},
@@ -99,7 +112,7 @@ SETTINGS = (
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 def coerce_setting(key, value):
     """按声明表把值规整到合法域；非法/缺失一律回落默认值。"""
@@ -136,7 +149,10 @@ def _coerce_slots(value):
                 lv = max(0, min(100, int(float(item.get("level", 50)))))
             except Exception:
                 lv = 50
-            out.append({"time": t, "level": lv})
+            scr = str(item.get("screen", "")).strip().lower()
+            if scr not in ("", "off", "on"):
+                scr = ""
+            out.append({"time": t, "level": lv, "screen": scr})
     if not out:                      # 至少一档，否则调度无从判定
         out = [dict(d) for d in DEFAULT_SLOTS]
     return sorted(out, key=lambda x: parse_hhmm(x["time"], (0, 0)))
@@ -498,6 +514,22 @@ def active_slot(slots, now_min):
     return best
 
 
+def active_slot_dict(slots, now_min):
+    """同 active_slot 的选择规则，但作用于原始档位 dict（含 screen 动作）。
+
+    取 time <= now_min 的最后一档；一个都没有 -> 时间最大的最后一档（跨午夜回绕）。
+    """
+    best = None
+    best_m = None
+    for s in slots:
+        m = parse_hhmm(s.get("time"), (0, 0))
+        if m <= now_min and (best is None or m >= best_m):
+            best, best_m = s, m
+    if best is None:
+        best = max(slots, key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
+    return best
+
+
 def current_level(cfg=None, now=None):
     """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""
     cfg = cfg or load_config()
@@ -505,11 +537,25 @@ def current_level(cfg=None, now=None):
 
 
 def apply_schedule(cfg=None):
-    """按当前时间套用对应档位。返回 (level, ok, errs)。"""
+    """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
+
+    返回 (level, screen, ok, errs)；screen 为该档屏幕动作（""/off/on）。
+    屏幕动作失败的错误以序号 -1 记入 errs（界面按原文显示）。
+    """
     cfg = cfg or load_config()
-    level = current_level(cfg)
+    slot = active_slot_dict(cfg.get("slots", []), _minutes())
+    level = slot.get("level", 50)
+    screen = slot.get("screen", "")
     ok, errs = set_brightness_many(cfg.get("monitors"), level)
-    return level, ok, errs
+    if screen == "off":
+        sok, serrs = screen_off_many(cfg.get("monitors"))
+    elif screen == "on":
+        sok, serrs = screen_wake_many(cfg.get("monitors"))
+    else:
+        sok, serrs = [], []
+    ok = ok + sok
+    errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
+    return level, screen, ok, errs
 
 
 # ============================================================
@@ -786,7 +832,10 @@ def _as_ok_errs(result):
 def _saved_summary(part, out):
     """注册成功后的提示正文（抽成函数，让回调保持短小）。"""
     lines = ["定时任务已写入 Windows 任务计划程序："]
-    lines += ["• %s → %d%%" % (x["time"], x["level"]) for x in part.get("slots", [])]
+    lines += ["• %s → %d%%%s" % (x["time"], x["level"],
+              "（同时熄屏）" if x.get("screen") == "off" else
+              "（同时点亮）" if x.get("screen") == "on" else "")
+              for x in part.get("slots", [])]
     if not part["catch_up_on_logon"]:
         lines.append("• 登录后自动校准：未开启")
     elif "CATCHUP=FAIL" in (out or ""):
@@ -964,9 +1013,11 @@ def cli_set(spec, value):
 
 def cli_apply_schedule():
     try:
-        level, ok, errs = apply_schedule()
+        level, screen, ok, errs = apply_schedule()
         for i, e in errs:
             _err("显示器 %s: %s" % (i, e))
+        if screen:
+            _out("屏幕动作: %s" % screen)
         sys.exit(0 if ok else 1)
     except Exception as e:
         _err(e)
@@ -1272,7 +1323,8 @@ class SchedulePanel(ttk.LabelFrame):
         ttk.Label(hint, text="同一时刻只能有一档；到点切换为该档亮度",
                   style="Hint.TLabel").pack(side="left", padx=(8, 0))
         for x in cfg.get("slots", []):
-            self.add_row(x.get("time", "12:00"), x.get("level", 50))
+            self.add_row(x.get("time", "12:00"), x.get("level", 50),
+                         x.get("screen", ""))
         self.catchup_chk = ttk.Checkbutton(
             self, text="登录后自动校准（开机时已过切换点也能补上）", variable=self.catchup_var)
         self.catchup_chk.pack(anchor="w", padx=10, pady=(4, 0))
@@ -1291,7 +1343,7 @@ class SchedulePanel(ttk.LabelFrame):
         self.task_lbl.pack(anchor="w", padx=10, pady=(0, 8))
         self.set_enabled_state()
 
-    def _build_row(self, time_text, level_value):
+    def _build_row(self, time_text, level_value, screen_value=""):
         row = ttk.Frame(self.rows_box, style="Surface.TFrame")
         row.pack(fill="x", pady=1)
         entry = ttk.Entry(row, width=7, justify="center")
@@ -1301,15 +1353,22 @@ class SchedulePanel(ttk.LabelFrame):
         spin = ttk.Spinbox(row, from_=0, to=100, width=5, justify="center")
         spin.set(level_value)
         spin.pack(side="left", padx=4)
+        ttk.Label(row, text="屏幕", style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        combo = ttk.Combobox(row, values=[l for _v, l in SCREEN_ACTIONS],
+                             state="readonly", width=5)
+        combo.set({label: value for value, label in SCREEN_ACTIONS}.get(
+            screen_value, "不变"))
+        combo.pack(side="left", padx=4)
         del_btn = ttk.Button(row, text="删除", width=6,
                              command=lambda: self._del_row(row))
         del_btn.pack(side="left", padx=6)
-        rec = {"frame": row, "entry": entry, "spin": spin, "del_btn": del_btn}
+        rec = {"frame": row, "entry": entry, "spin": spin, "combo": combo,
+               "del_btn": del_btn}
         self._rows.append(rec)
         return rec
 
-    def add_row(self, time_text="12:00", level_value=50):
-        rec = self._build_row(time_text, level_value)
+    def add_row(self, time_text="12:00", level_value=50, screen_value=""):
+        rec = self._build_row(time_text, level_value, screen_value)
         self.set_enabled_state()
         return rec
 
@@ -1359,7 +1418,8 @@ class SchedulePanel(ttk.LabelFrame):
                 lv = max(0, min(100, int(float(r["spin"].get()))))
             except Exception:
                 lv = 50
-            out.append({"time": t, "level": lv})
+            out.append({"time": t, "level": lv,
+                        "screen": SCREEN_VALUE_BY_LABEL.get(r["combo"].get(), "")})
         if not out:
             self.app.msg.showinfo("提示", "至少保留一个时间段。")
             return None
@@ -1384,7 +1444,7 @@ class ScreenPanel(ttk.LabelFrame):
     """熄屏/点亮区（View）：按钮、热键开关与自动点亮保险丝，业务在 App。"""
 
     def __init__(self, app, cfg):
-        super().__init__(app.root, text=" 熄屏 / 点亮 ")
+        super().__init__(app.root, text=" 熄屏 / 点亮 / 托盘 ")
         self.app = app
         self.pack(fill="x", padx=8, pady=4)
         row = ttk.Frame(self, style="Surface.TFrame")
@@ -1409,6 +1469,12 @@ class ScreenPanel(ttk.LabelFrame):
         self.relight_spin.pack(side="left", padx=4)
         ttk.Label(ar, text="分钟自动点亮（0 = 不自动；远程时建议设个值防失联）",
                   style="Hint.TLabel").pack(side="left")
+        au = ttk.Frame(self, style="Surface.TFrame")
+        au.pack(fill="x", padx=10, pady=(2, 0))
+        self.autostart_var = tk.BooleanVar(value=get_autostart()[0])
+        ttk.Checkbutton(au, text="开机自动启动（启动后直接进托盘；点 X 也是进托盘，退出在托盘菜单）",
+                        variable=self.autostart_var,
+                        command=app.toggle_autostart).pack(anchor="w")
 
     def set_actions_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -1422,8 +1488,9 @@ class ScreenPanel(ttk.LabelFrame):
 class App:
     """协调者（Presenter）：服务调用、异步编排与弹窗；界面细节都在三个 Panel 里。"""
 
-    def __init__(self, root):
+    def __init__(self, root, start_minimized=False):
         self.root = root
+        self.tray = None            # pystray.Icon（延迟创建，见 _create_tray）
         root.title("%s v%s" % (APP_TITLE, APP_VERSION))
         root.resizable(False, False)
         apply_dark_theme(root)
@@ -1457,6 +1524,9 @@ class App:
 
         self.refresh_monitors(silent=True)
         self._refresh_task_status()
+        self._create_tray()
+        if start_minimized and self.tray is not None:
+            self.root.withdraw()
 
     # ---------- 显示器勾选 ----------
     def select_all(self):
@@ -1713,6 +1783,17 @@ class App:
             self._stop_hotkey_listener()
             self.status_var.set("已停用熄屏热键")
 
+    def toggle_autostart(self):
+        enable = bool(self.screen_panel.autostart_var.get())
+        exe, prefix = task_target()
+        cmd = ('"%s" %s--minimized' % (exe, prefix)).strip()
+        try:
+            set_autostart(enable, cmd)
+            self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
+        except Exception as e:
+            self.screen_panel.autostart_var.set(not enable)
+            self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
+
     def _start_hotkey_listener(self):
         """常驻热键监听（可选功能）：RegisterHotKey + 消息循环，事件经队列回主线程。"""
         if self._hotkeys_on:
@@ -1746,7 +1827,103 @@ class App:
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
             self._hotkey_tid = None
 
+    # ---------- 托盘 ----------
+    def _tray_image(self):
+        """托盘图标（纯代码绘制：深色圆 + 亮度滑杆意象，不依赖外部资源）。"""
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=(30, 30, 30, 255),
+                  outline=(74, 158, 255, 255), width=3)
+        d.rounded_rectangle((14, 28, 50, 36), radius=4, fill=(74, 158, 255, 255))
+        d.ellipse((36, 23, 52, 41), fill=(255, 255, 255, 255))
+        return img
+
+    def _tray_tooltip_text(self):
+        """托盘悬停文本：定时档位摘要 + 下次运行时间（超长截断到 120 字符）。"""
+        if not self.cfg.get("enabled"):
+            return "%s\n定时未启用" % APP_TITLE
+        slots = self.cfg.get("slots", [])
+        brief = "  ".join("%s→%d%%%s" % (x.get("time"), x.get("level", 0),
+                                          "熄" if x.get("screen") == "off" else
+                                          "亮" if x.get("screen") == "on" else "")
+                           for x in slots)
+        nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots])
+        text = "%s\n定时: %s\n下次 %s" % (APP_TITLE, brief, nxt)
+        return text[:120]
+
+    def _tray_update_tooltip(self):
+        if self.tray is not None:
+            try:
+                self.tray.tooltip = self._tray_tooltip_text()
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def _create_tray(self):
+        """创建托盘图标。pystray 必须与 tkinter 分线程运行（多来源一致的权威模式）：
+        图标跑在独立 daemon 线程；回调里操作 Tk 控件前先 root.after(0, ...) 投递，
+        否则 RuntimeError: main thread is not in main loop。"""
+        if not TRAY_OK or self.tray is not None or not self.root.winfo_exists():
+            return
+        menu = _TrayMenu(
+            _TrayItem("打开主窗口", lambda *_: self.root.after(0, self._tray_show_main),
+                      default=True),
+            _TrayItem("熄灭显示器", lambda *_: self.root.after(0, self.screen_off)),
+            _TrayItem("点亮显示器", lambda *_: self.root.after(0, self.screen_on)),
+            _TrayItem("启用定时", lambda *_: self.root.after(0, self._tray_toggle_schedule),
+                      checked=lambda _item: bool(self.cfg.get("enabled"))),
+            _TrayItem("退出", lambda *_: self.root.after(0, self._tray_quit)),
+        )
+        self.tray = _TrayIcon("MonitorBrightness", self._tray_image(),
+                              self._tray_tooltip_text(), menu)
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _tray_show_main(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.status_var.set("就绪")
+
+    def _tray_toggle_schedule(self):
+        if self.sch_panel.schedule_enabled():
+            self.cancel_schedule()
+        else:
+            self.sch_panel.set_enabled_flag(True)
+            self.cfg["enabled"] = True
+            save_config(self.cfg)
+            self.status_var.set("正在写入任务计划…")
+            self.run_bg(lambda: register_tasks(self.cfg),
+                        self._finish_tray_register, busy=True)
+
+    def _finish_tray_register(self, result):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            self.msg.showerror("注册任务失败", out or "未知错误")
+            self.status_var.set("注册任务失败")
+            self.sch_panel.set_enabled_flag(False)
+            self.cfg["enabled"] = False
+            return
+        self._refresh_task_status()
+        self.status_var.set("定时已启用")
+
+    def _tray_quit(self):
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
+        self._stop_hotkey_listener()
+        self.root.destroy()
+
     def _on_close(self):
+        """点 X = 最小化到托盘（退出走托盘菜单）；无托盘环境照旧退出。"""
+        if self.tray is not None:
+            self.root.withdraw()
+            self.status_var.set("已最小化到托盘（右下角图标，右键可退出）")
+            return
         self._stop_hotkey_listener()
         self.root.destroy()
 
@@ -1836,6 +2013,7 @@ class App:
         for name, short in TASK_SHORT.items():
             lines.append(_format_task_line(name, short, by_name.get(name)))
         self.sch_panel.set_task_status("\n".join(lines))
+        self._tray_update_tooltip()
 
 
 def _valid_hhmm(text):
@@ -1849,6 +2027,43 @@ def _valid_hhmm(text):
 
 # 八、入口
 # ============================================================
+# ---- 开机自启动（HKCU Run 键，免管理员）------------------------------------
+AUTOSTART_RUN_NAME = "MonitorBrightness"
+
+
+def _autostart_path():
+    return r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def get_autostart():
+    """读开机自启动项。返回 (是否存在, 命令文本 or "")。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _autostart_path()) as k:
+            val, _t = winreg.QueryValueEx(k, AUTOSTART_RUN_NAME)
+            return True, str(val)
+    except FileNotFoundError:
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def set_autostart(enable, command):
+    """写/删开机自启动项。command 例：'"C:////...exe" --minimized'。"""
+    import winreg
+    if enable:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _autostart_path(), 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, AUTOSTART_RUN_NAME, 0, winreg.REG_SZ, command)
+    else:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _autostart_path(), 0,
+                                winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, AUTOSTART_RUN_NAME)
+        except FileNotFoundError:
+            pass
+
+
 def parse_screen_action(text):
     """'off'/'on' -> 规范动作名；其他 -> None（供 CLI 与测试复用）。"""
     t = str(text).strip().lower()
@@ -1894,7 +2109,7 @@ def main():
             cli_selftest()
             return
     root = tk.Tk()
-    App(root)
+    App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)
     if get_monitors is None:
         messagebox.showerror("缺少依赖", "monitorcontrol 未能加载，请重新安装本程序。")
