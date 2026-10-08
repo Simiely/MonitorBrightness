@@ -3,6 +3,19 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0] - 2026-10-08
+
+### 新增（深色弹窗）
+
+- **所有弹出通知改为深色模式**（用户反馈：启用定时后弹出的通知不是深色）：
+  自定义 `DarkBox` 模态对话框全面替代 `messagebox` —— 深色背景/文字、主题蓝"确定"按钮、
+  居中于主窗口、支持 Enter/ESC 关闭，info/warn/error 三种类型各配图标与颜色
+- 原因：messagebox 是 Windows 原生对话框，不吃 ttk 深色主题；
+  实测 `SetPreferredAppMode(ForceDark)` 只能暗标题栏、内容区仍为浅色（A/B 截图：
+  标题栏暗但内容均值 184 vs 基线 196），故放弃该未公开 API 路线，改用完全可控的自绘对话框
+- 模态模式与 CustomTkinter 对话框一致（Toplevel + grab_set + wait_window）
+- 移除无效果的 `_force_dark_dialogs`（未公开序数 API，避免系统更新后失效的隐患）
+
 ## [1.3.2] - 2026-10-08
 
 ### 修复
