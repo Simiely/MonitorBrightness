@@ -3,6 +3,15 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.6.1] - 2026-10-08
+
+### 修复
+
+- **「屏幕」下拉框深色模式**（用户反馈）：ttk Combobox 输入框部分走 `TCombobox` style
+  （fieldbackground/arrowcolor 均深色）；弹出的下拉列表是原生 Listbox 且弹层路径
+  可能不含 TCombobox 前缀，故 `*TCombobox*Listbox.*` 与 `*Listbox.*` 两种
+  option 模式双保险，深色底/浅色字/主题蓝选中
+
 ## [1.6.0] - 2026-10-08
 
 ### 新增（S7：定时熄屏 + 托盘 + 开机启动）

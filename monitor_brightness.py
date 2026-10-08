@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -893,6 +893,23 @@ def apply_dark_theme(root):
                           ("disabled", D["surface"])],
               foreground=[("disabled", D["fg_dim"])],
               bordercolor=[("active", D["accent_hover"])])
+
+    # Combobox（定时行的「屏幕」下拉框）：ttk 输入框部分走 style；
+    # 弹出的下拉列表是原生 Listbox，必须走 option_add 才能变深色
+    style.configure("TCombobox", fieldbackground=D["surface"], background=D["surface"],
+                    foreground=D["fg"], arrowcolor=D["fg"], bordercolor=D["border"],
+                    lightcolor=D["surface"], darkcolor=D["surface"])
+    style.map("TCombobox",
+              fieldbackground=[("readonly", D["surface"])],
+              foreground=[("readonly", D["fg"])],
+              bordercolor=[("active", D["accent"])])
+    # ttk 弹层路径可能不含 TCombobox 前缀，两种模式都设（Listbox 全项目仅下拉框使用）
+    for _pat in ("*TCombobox*Listbox.", "*Listbox."):
+        root.option_add(_pat + "background", D["surface"])
+        root.option_add(_pat + "foreground", D["fg"])
+        root.option_add(_pat + "selectBackground", D["accent"])
+        root.option_add(_pat + "selectForeground", "#ffffff")
+        root.option_add(_pat + "font", FONT_UI)
 
     # 勾选框不用 ttk.Checkbutton：clam 主题的"选中"态画的是**叉**（X）而不是勾，
     # 语义别扭；经典 tk.Checkbutton 的 selectcolor 又会让"未勾选"也带颜色。
