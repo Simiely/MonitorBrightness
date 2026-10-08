@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -112,6 +112,7 @@ SETTINGS = (
     {"key": "screen_hotkeys", "kind": "flag", "default": False},          # 熄屏/点亮热键（需常驻）
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
     {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
+    {"key": "screen_state", "kind": "screenstate", "default": "on"},      # 屏幕状态记账（软件最后一次操作）
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 4
@@ -133,6 +134,9 @@ def coerce_setting(key, value):
         return bool(value)
     if kind == "slots":
         return _coerce_slots(value)
+    if kind == "screenstate":
+        # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
+        return value if value in ("on", "off") else spec["default"]
     return normalize_indices(value)
 
 
@@ -543,7 +547,9 @@ def apply_schedule(cfg=None):
 
     返回 (level, screen, ok, errs)；screen 为该档屏幕动作（""/off/on）。
     屏幕动作失败的错误以序号 -1 记入 errs（界面按原文显示）。
+    内部加载配置时，屏幕动作执行后会把屏幕状态记账落盘（供状态显示 / --screen status）。
     """
+    internal = cfg is None
     cfg = cfg or load_config()
     slot = active_slot_dict(cfg.get("slots", []), _minutes())
     level = slot.get("level", 50)
@@ -557,6 +563,10 @@ def apply_schedule(cfg=None):
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
+    if screen in ("off", "on") and ok:
+        cfg["screen_state"] = screen
+        if internal:
+            save_config(cfg)
     return level, screen, ok, errs
 
 
@@ -1517,6 +1527,11 @@ class ScreenPanel(ttk.LabelFrame):
         self.relight_spin.pack(side="left", padx=4)
         ttk.Label(ar, text="分钟自动点亮（0 = 不自动；远程时建议设个值防失联）",
                   style="Hint.TLabel").pack(side="left")
+        self.state_lbl = ttk.Label(
+            self, style="Hint.TLabel",
+            text="屏幕状态：%s（以软件最后一次操作记录为准；物理电源键 / 系统自动熄屏不在此追踪）"
+                 % ("熄灭中" if cfg.get("screen_state") == "off" else "点亮中"))
+        self.state_lbl.pack(anchor="w", padx=10, pady=(4, 0))
         au = ttk.Frame(self, style="Surface.TFrame")
         au.pack(fill="x", padx=10, pady=(2, 0))
         self.tray_var = tk.BooleanVar(value=bool(cfg.get("tray_enabled", True)))
@@ -1527,6 +1542,11 @@ class ScreenPanel(ttk.LabelFrame):
         ttk.Checkbutton(au, text="开机自动启动（启动后直接进托盘；点 X 也是进托盘，退出在托盘菜单）",
                         variable=self.autostart_var,
                         command=app.toggle_autostart).pack(anchor="w")
+
+    def set_state(self, state):
+        self.state_lbl.config(
+            text="屏幕状态：%s（以软件最后一次操作记录为准；物理电源键 / 系统自动熄屏不在此追踪）"
+                 % ("熄灭中" if state == "off" else "点亮中"))
 
     def set_actions_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -1792,6 +1812,9 @@ class App:
         ok, errs = _as_ok_errs(result)
         if ok:
             self.status_var.set("已熄灭 %d 台显示器" % len(ok))
+            self.cfg["screen_state"] = "off"
+            save_config(self.cfg)
+            self.screen_panel.set_state("off")
         if errs:
             self.msg.showwarning("熄灭部分失败", "\n".join(
                 ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
@@ -1816,6 +1839,9 @@ class App:
         self._relight_pending = False
         if ok:
             self.status_var.set("已点亮 %d 台显示器" % len(ok))
+            self.cfg["screen_state"] = "on"
+            save_config(self.cfg)
+            self.screen_panel.set_state("on")
         if errs:
             self.msg.showwarning("点亮部分失败", "\n".join(
                 ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
@@ -1918,7 +1944,8 @@ class App:
                                           "亮" if x.get("screen") == "on" else "")
                            for x in slots)
         nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots])
-        text = "%s\n定时: %s\n下次 %s" % (APP_TITLE, brief, nxt)
+        st = "熄灭中" if self.cfg.get("screen_state") == "off" else "点亮中"
+        text = "%s\n定时: %s\n下次 %s\n屏幕: %s" % (APP_TITLE, brief, nxt, st)
         return text[:120]
 
     def _tray_update_tooltip(self):
@@ -2193,14 +2220,18 @@ def parse_screen_action(text):
 
 
 def cli_screen(action):
-    """熄灭/点亮选中的显示器（配置 monitors；空 = 全部）。"""
-    targets = load_config().get("monitors") or []
+    """熄灭/点亮选中的显示器（配置 monitors；空 = 全部），并记账屏幕状态。"""
+    cfg = load_config()
+    targets = cfg.get("monitors") or []
     if action == "off":
         ok, errs = screen_off_many(targets)
         _out("已熄灭 %d 台显示器" % len(ok) if ok else "熄灭失败")
     else:
         ok, errs = screen_wake_many(targets)
         _out("已点亮 %d 台显示器" % len(ok) if ok else "点亮失败")
+    if ok:
+        cfg["screen_state"] = action
+        save_config(cfg)
     for i, e in errs:
         _out("显示器 %d：%s" % (i, e))
     if errs and not ok:
@@ -2218,6 +2249,11 @@ def main():
             cli_apply_schedule()
             return
         if cmd == "--screen" and len(args) >= 2:
+            arg = args[1].strip().lower()
+            if arg == "status":
+                st = load_config().get("screen_state", "on")
+                _out("屏幕状态（软件操作记录）: %s" % ("熄灭中" if st == "off" else "点亮中"))
+                return
             action = parse_screen_action(args[1])
             if action is None:
                 _out("--screen 参数需为 off 或 on")
