@@ -1,5 +1,7 @@
 # MonitorBrightness · 显示器亮度定时调节
 
+[![Release](https://img.shields.io/github/v/release/Simiely/MonitorBrightness)(https://github.com/Simiely/MonitorBrightness/releases/latest)][![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)![exe](https://img.shields.io/badge/download-单文件%20exe-8A2BE2)
+
 > Windows 外接显示器亮度调节小工具：走 **DDC/CI 硬件协议**真正调背光（非软件滤镜），
 > 既能手动即时调节，也能按时间点自动调节——定时写入 Windows 任务计划程序，**无需常驻后台**。
 

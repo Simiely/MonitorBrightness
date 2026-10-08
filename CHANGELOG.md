@@ -3,6 +3,16 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.1] - 2026-10-08
+
+### 变更（仓库信息维护；程序行为与 1.4.0 完全一致）
+
+- 新增 **LICENSE**（MIT）
+- 新增 **.gitattributes**（行尾规范：仓库 LF，`*.bat`/`*.cmd` 强制 CRLF —— cmd 对 LF 的
+  goto/标签解析不可靠；图片与 exe 标记 binary）
+- README 顶部加 Release / License / Platform 徽章
+- GitHub 仓库元信息：补 topics、homepage（指向 releases/latest）、description 更新为多时间段口径
+
 ## [1.4.0] - 2026-10-08
 
 ### 新增（深色弹窗）

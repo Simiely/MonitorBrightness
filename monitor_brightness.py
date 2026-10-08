@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
