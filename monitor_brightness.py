@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover
     get_monitors = None
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -783,8 +783,14 @@ def query_task_status_local():
         block = _settings_block(txt)
         state = "Disabled" if _xml_flag(block, "Enabled") is False else "Ready"
         swa = _xml_flag(block, "StartWhenAvailable")
-        nxt = "" if name == TASK_CATCHUP else _next_run_text(_boundary_minutes_all(txt))
-        out.append("%s=%s|%s|SWA=%s" % (name, state, nxt, swa))
+        if name == TASK_CATCHUP:
+            out.append("%s=%s||SWA=%s" % (name, state, swa))
+        else:
+            bounds = _boundary_minutes_all(txt)
+            nxt = _next_run_text(bounds)
+            out.append("%s=%s|%s|SWA=%s|TRIG=%s"
+                       % (name, state, nxt, swa,
+                          ",".join(str(m) for m in sorted(bounds))))
     return "\n".join(out)
 
 
@@ -803,8 +809,13 @@ def query_task_status():
     return out if code == 0 else ""
 
 
-def _format_task_line(name, short, rest):
-    """把一条任务状态渲染成人读的一行；rest 为 None 表示这次查询没拿到它。"""
+def _format_task_line(name, short, rest, slots=None):
+    """把一条任务状态渲染成人读的文本；rest 为 None 表示这次查询没拿到它。
+
+    slots 为当前配置的档位列表 —— 有 TRIG 数据（本地 XML 快路径）时，
+    定时行会展开成系统里**实际注册**的触发时间清单，并与配置档位联显
+    （时间对不上的档会标注"当前配置中无此档"，方便发现配置与注册不同步）。
+    """
     if rest is None:
         return "%s：读取失败" % short
     if rest == "MISSING":
@@ -816,7 +827,26 @@ def _format_task_line(name, short, rest):
     if name == TASK_CATCHUP:
         # 登录触发没有"下次运行时间"，显示成校准时机更有意义
         return "%s：%s · 登录时校准 · %s" % (short, state, swa)
-    return "%s：%s · 下次 %s · %s" % (short, state, nxt or "—", swa)
+    head = "%s：%s · 下次 %s · %s" % (short, state, nxt or "—", swa)
+    trig = ""
+    for b in bits:
+        if b.startswith("TRIG="):
+            trig = b[5:]
+            break
+    if not trig or not slots:
+        return head
+    by_time = {x.get("time"): x for x in slots}
+    lines = [head]
+    for m in sorted(int(v) for v in trig.split(",") if v.strip().isdigit()):
+        hhmm = "%02d:%02d" % (m // 60, m % 60)
+        x = by_time.get(hhmm)
+        if x is None:
+            lines.append("   • %s（当前配置中无此档）" % hhmm)
+        else:
+            act = "（同时熄屏）" if x.get("screen") == "off" else \
+                  "（同时点亮）" if x.get("screen") == "on" else ""
+            lines.append("   • %s → %d%%%s" % (hhmm, x.get("level", 0), act))
+    return "\n".join(lines)
 
 
 def _as_ok_errs(result):
@@ -2050,8 +2080,12 @@ class App:
                 by_name[name] = rest
         lines = ["任务计划状态："]
         for name, short in TASK_SHORT.items():
-            lines.append(_format_task_line(name, short, by_name.get(name)))
+            lines.append(_format_task_line(name, short, by_name.get(name),
+                                           self.cfg.get("slots", [])))
         self.sch_panel.set_task_status("\n".join(lines))
+        # 触发器清单行数随档位数变化，让窗口高度自适应
+        self.root.update_idletasks()
+        self.root.geometry("")
         self._tray_update_tooltip()
 
 
@@ -2110,10 +2144,11 @@ _MUTEX_NAME = "MonitorBrightness_SingleInstance"
 _mutex_handle = None
 
 
-def acquire_single_instance():
+def acquire_single_instance(name=_MUTEX_NAME):
     """尝试获取单实例互斥体。返回 True=本进程是首个实例。
 
     已有实例时：尝试把它的主窗口恢复并置前，然后返回 False（调用方应退出）。
+    name 参数供测试注入专用互斥体名（默认用全局单实例名）。
     互斥体随进程退出自动释放（崩溃残留的 abandoned 状态不影响下次创建）。
     """
     global _mutex_handle
@@ -2122,7 +2157,7 @@ def acquire_single_instance():
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = wintypes.HANDLE
     k32.CreateMutexW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.LPCWSTR]
-    handle = k32.CreateMutexW(None, False, _MUTEX_NAME)
+    handle = k32.CreateMutexW(None, False, name)
     if ctypes.get_last_error() == 183:          # ERROR_ALREADY_EXISTS
         _activate_existing_window()
         if handle:
