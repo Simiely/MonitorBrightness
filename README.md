@@ -1,3 +1,8 @@
+> ⚠️ **已并入 [`Simiely/pc-tools`](https://github.com/Simiely/pc-tools)（`apps/MonitorBrightness`）**
+> 本仓库已**归档只读**，内容不再更新。后续维护请到 [pc-tools](https://github.com/Simiely/pc-tools)。
+
+---
+
 # MonitorBrightness · 显示器亮度定时调节
 
 [![Release](https://img.shields.io/github/v/release/Simiely/MonitorBrightness)(https://github.com/Simiely/MonitorBrightness/releases/latest)][![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)![exe](https://img.shields.io/badge/download-单文件%20exe-8A2BE2)
