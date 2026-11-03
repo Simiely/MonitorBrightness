@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>显示器亮度 · UI 设计稿</title>
+<style>
+  :root {
+    /* Apple 深色模式取色（近似 SF 系统色） */
+    --bg: #0e0e10;
+    --surface: #1c1c1e;
+    --surface-2: #242426;
+    --fill: rgba(120,120,128,0.20);
+    --fill-strong: rgba(120,120,128,0.32);
+    --separator: rgba(84,84,88,0.55);
+    --label: #f5f5f7;
+    --label-2: rgba(235,235,245,0.62);
+    --label-3: rgba(235,235,245,0.36);
+    --accent: #0a84ff;
+    --accent-press: #409cff;
+    --green: #32d74b;
+    --orange: #ff9f0a;
+    --radius-card: 14px;
+    --radius-ctl: 9px;
+  }
+
+  * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      radial-gradient(1200px 600px at 20% -10%, #1d2430 0%, transparent 60%),
+      radial-gradient(900px 500px at 90% 110%, #221c2b 0%, transparent 55%),
+      #0b0b0d;
+    font-family: -apple-system, "SF Pro Text", "Segoe UI Variable Text",
+                 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+    color: var(--label);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 48px 24px 96px;
+  }
+
+  /* ---------- 窗口 ---------- */
+  .window {
+    width: 460px;
+    background: var(--surface);
+    border-radius: 16px;
+    box-shadow: 0 24px 60px rgba(0,0,0,.55), 0 0 0 .5px rgba(255,255,255,.08);
+    overflow: hidden;
+  }
+
+  .titlebar {
+    display: flex;
+    align-items: center;
+    height: 46px;
+    padding: 0 14px 0 16px;
+    background: linear-gradient(#232325, #1e1e20);
+    border-bottom: .5px solid var(--separator);
+  }
+  .titlebar .title {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .01em;
+    color: var(--label);
+    flex: 1;
+  }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 9px;
+    border: 0;
+    border-radius: 7px;
+    background: var(--fill);
+    color: var(--label-2);
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background .15s ease, color .15s ease;
+  }
+  .icon-btn:hover { background: var(--fill-strong); color: var(--label); }
+  .icon-btn .glyph { font-size: 12px; line-height: 1; }
+
+  main { padding: 4px 0 6px; }
+
+  /* ---------- 分组标题（Apple 的 section header） ---------- */
+  .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--label-3);
+    margin: 18px 20px 8px;
+  }
+
+  /* ---------- 状态卡（本次重做的重点） ---------- */
+  .status-card {
+    margin: 16px 14px 0;
+    padding: 16px 16px 14px;
+    border-radius: var(--radius-card);
+    background: linear-gradient(180deg, #26262a, #202024);
+    box-shadow: inset 0 0 0 .5px rgba(255,255,255,.07);
+  }
+  .status-row { display: flex; align-items: center; gap: 10px; }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 4px rgba(50,215,75,.16);
+    transition: background .2s ease, box-shadow .2s ease;
+  }
+  .status-dot.off {
+    background: rgba(235,235,245,.30);
+    box-shadow: 0 0 0 4px rgba(235,235,245,.06);
+  }
+  .status-title { font-size: 17px; font-weight: 600; letter-spacing: .01em; }
+  .status-meta {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--label-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .status-hint {
+    margin: 6px 0 0 20px;
+    font-size: 12px;
+    color: var(--label-2);
+    min-height: 16px;
+  }
+
+  .btn-row { display: flex; gap: 10px; margin-top: 14px; }
+  .btn {
+    flex: 1;
+    height: 36px;
+    border: 0;
+    border-radius: var(--radius-ctl);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 590;
+    cursor: pointer;
+    transition: transform .08s ease, background .15s ease, color .15s ease;
+  }
+  .btn:active { transform: scale(.985); }
+  .btn.secondary { background: var(--fill); color: var(--label); }
+  .btn.secondary:hover { background: var(--fill-strong); }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-press); }
+  .btn:disabled {
+    background: rgba(120,120,128,.12);
+    color: rgba(235,235,245,.28);
+    cursor: default;
+    transform: none;
+  }
+  .btn.ghost.small { padding: 0 10px; font-size: 12px; }
+  .btn.ghost {
+    flex: 0 0 auto;
+    padding: 0 12px;
+    background: transparent;
+    box-shadow: inset 0 0 0 .5px var(--separator);
+    color: var(--label-2);
+    font-weight: 500;
+  }
+  .btn.ghost:hover { color: var(--label); background: var(--fill); }
+
+  /* ---------- 列表表单（inset grouped list） ---------- */
+  .group {
+    margin: 0 14px;
+    background: var(--surface-2);
+    border-radius: var(--radius-card);
+    box-shadow: inset 0 0 0 .5px rgba(255,255,255,.06);
+    overflow: hidden;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 6px 14px;
+    position: relative;
+  }
+  .row + .row::before {
+    content: "";
+    position: absolute;
+    left: 14px; right: 0; top: 0;
+    height: .5px;
+    background: var(--separator);
+  }
+  .row-main { flex: 1; min-width: 0; }
+  .row-title { font-size: 13px; color: var(--label); }
+  .row-sub { font-size: 11px; color: var(--label-3); margin-top: 2px; }
+  .row-meta { font-size: 12px; color: var(--label-2); font-variant-numeric: tabular-nums; }
+
+  /* 自绘勾选框（Apple 风格圆角方形） */
+  .check {
+    width: 18px; height: 18px; flex: 0 0 18px;
+    border-radius: 6px;
+    background: rgba(120,120,128,.28);
+    box-shadow: inset 0 0 0 .5px rgba(255,255,255,.14);
+    cursor: pointer;
+    position: relative;
+    transition: background .15s ease;
+  }
+  .check[aria-checked="true"] { background: var(--accent); box-shadow: none; }
+  .check[aria-checked="true"]::after {
+    content: "";
+    position: absolute; left: 5px; top: 2.5px;
+    width: 4px; height: 8px;
+    border: solid #fff; border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+
+  /* ---------- 亮度 ---------- */
+  .slider-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px 6px; }
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--pct, 75%), rgba(120,120,128,.30) var(--pct, 75%), rgba(120,120,128,.30) 100%);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,.5);
+    cursor: pointer;
+  }
+  .pct {
+    width: 44px; text-align: right;
+    font-size: 13px; font-variant-numeric: tabular-nums;
+    color: var(--label);
+  }
+
+  .segmented {
+    display: flex;
+    gap: 2px;
+    margin: 8px 14px 14px;
+    padding: 2px;
+    background: rgba(120,120,128,.16);
+    border-radius: 10px;
+  }
+  .segmented button {
+    flex: 1;
+    height: 30px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--label-2);
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s ease, color .15s ease;
+  }
+  .segmented button:hover { color: var(--label); }
+  .segmented button[aria-pressed="true"] {
+    background: rgba(120,120,128,.42);
+    color: var(--label);
+    box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+
+  /* ---------- 定时 ---------- */
+  .slot {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 16px;
+    position: relative;
+  }
+  .slot + .slot::before,
+  .slot:first-of-type::before {
+    content: "";
+    position: absolute;
+    left: 16px; right: 0; top: 0;
+    height: .5px;
+    background: var(--separator);
+  }
+  .slot time {
+    font-size: 14px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .01em;
+  }
+  .slot .lv { font-size: 12px; color: var(--label-2); font-variant-numeric: tabular-nums; }
+  .chip {
+    margin-left: auto;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--fill);
+    color: var(--label-2);
+  }
+  .chip.accent { background: rgba(10,132,255,.18); color: #6cb4ff; }
+  .chip.dim { color: var(--label-3); }
+
+  .footer-note {
+    margin: 10px 20px 0;
+    font-size: 11.5px;
+    color: var(--label-3);
+  }
+  .footer-note b { color: var(--label-2); font-weight: 600; }
+
+  /* ---------- 说明按钮（替代满屏备注） ---------- */
+  .help-bar {
+    display: flex;
+    justify-content: center;
+    padding: 18px 14px 20px;
+  }
+  .help-bar button {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 30px; padding: 0 14px;
+    border: 0; border-radius: 999px;
+    background: var(--fill);
+    color: var(--label-2);
+    font-family: inherit; font-size: 12px;
+    cursor: pointer;
+  }
+  .help-bar button:hover { background: var(--fill-strong); color: var(--label); }
+
+  /* ---------- 弹层 ---------- */
+  .scrim {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.55);
+    backdrop-filter: blur(6px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    z-index: 20;
+  }
+  .scrim.open { display: flex; }
+
+  .sheet {
+    width: 430px;
+    max-height: 78vh;
+    overflow: auto;
+    background: var(--surface);
+    border-radius: 16px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.6), 0 0 0 .5px rgba(255,255,255,.10);
+    padding: 20px 22px 18px;
+  }
+  .sheet h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+    font-weight: 650;
+  }
+  .sheet .lede { margin: 0 0 14px; font-size: 12px; color: var(--label-3); }
+  .sheet h3 {
+    margin: 16px 0 6px;
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--label-2);
+    letter-spacing: .02em;
+  }
+  .sheet p, .sheet li { font-size: 12.5px; line-height: 1.62; color: var(--label-2); margin: 0; }
+  .sheet ul { margin: 0; padding-left: 18px; }
+  .sheet li { margin-bottom: 3px; }
+  .sheet code {
+    font-family: "SF Mono", ui-monospace, Consolas, monospace;
+    font-size: 11.5px;
+    background: rgba(120,120,128,.22);
+    padding: 1px 5px;
+    border-radius: 5px;
+  }
+  .sheet .close {
+    margin-top: 18px;
+    width: 100%;
+    height: 36px;
+    border: 0;
+    border-radius: var(--radius-ctl);
+    background: var(--accent);
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .switch {
+    position: relative;
+    width: 42px; height: 25px; flex: 0 0 42px;
+    border: 0; padding: 0;
+    border-radius: 999px;
+    background: rgba(120,120,128,.32);
+    cursor: pointer;
+    transition: background .18s ease;
+  }
+  .switch::after {
+    content: "";
+    position: absolute; top: 2.5px; left: 2.5px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0,0,0,.45);
+    transition: transform .18s ease;
+  }
+  .switch[aria-checked="true"] { background: var(--green); }
+  .switch[aria-checked="true"]::after { transform: translateX(17px); }
+
+  .link-btn {
+    border: 0; background: transparent;
+    color: var(--accent);
+    font-family: inherit; font-size: 12px;
+    cursor: pointer; padding: 4px 2px;
+    flex: 0 0 auto;
+  }
+  .link-btn:hover { color: var(--accent-press); }
+
+  .status-dot.small { width: 8px; height: 8px; box-shadow: none; }
+  .status-dot.warn { background: var(--orange); }
+
+  .icon-btn + .icon-btn { margin-left: 6px; }
+
+  .num {
+    width: 58px;
+    height: 28px;
+    border: 0;
+    border-radius: 7px;
+    background: rgba(120,120,128,.22);
+    color: var(--label);
+    font-family: inherit;
+    font-size: 12.5px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    outline: none;
+  }
+  .num:focus { box-shadow: 0 0 0 2px rgba(10,132,255,.55); }
+  .unit { font-size: 12px; color: var(--label-3); margin-left: 6px; }
+
+  .kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 6px;
+    background: var(--fill);
+    box-shadow: inset 0 0 0 .5px var(--separator);
+    font-size: 11px;
+    color: var(--label-2);
+  }
+</style>
+</head>
+<body>
+
+<div class="window">
+  <header class="titlebar">
+    <div class="title">显示器亮度</div>
+    <button class="icon-btn" id="settingsTop">
+      <span class="glyph">⚙</span><span>设置</span>
+    </button>
+    <button class="icon-btn" id="helpTop">
+      <span class="glyph">?</span><span>说明</span>
+    </button>
+  </header>
+
+  <main>
+    <!-- ===== 状态 + 主动作 ===== -->
+    <section class="status-card">
+      <div class="status-row">
+        <span class="status-dot" id="dot"></span>
+        <span class="status-title" id="statusTitle">屏幕亮着</span>
+        <span class="status-meta" id="statusMeta">15:11 点亮</span>
+      </div>
+      <div class="status-hint" id="statusHint">动一下鼠标或键盘即可唤醒</div>
+      <div class="btn-row">
+        <button class="btn secondary" id="offBtn">熄灭屏幕</button>
+        <button class="btn primary" id="onBtn">点亮屏幕</button>
+        <button class="btn ghost" id="probeBtn">检测</button>
+      </div>
+    </section>
+
+    <!-- ===== 显示器 ===== -->
+    <div class="section-label">显示器</div>
+    <div class="group" id="monitors">
+      <div class="row">
+        <span class="check" role="checkbox" aria-checked="true" tabindex="0"></span>
+        <div class="row-main">
+          <div class="row-title">Legion R27qe Gen2</div>
+          <div class="row-sub">2560 × 1440 · 主显示器 · DISPLAY2</div>
+        </div>
+      </div>
+      <div class="row">
+        <span class="check" role="checkbox" aria-checked="true" tabindex="0"></span>
+        <div class="row-main">
+          <div class="row-title">Legion R27qe Gen2</div>
+          <div class="row-sub">2560 × 1440 · 副显示器 · DISPLAY1</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 亮度 ===== -->
+    <div class="section-label">亮度</div>
+    <div class="group">
+      <div class="slider-row">
+        <input type="range" id="brightness" min="0" max="100" value="75">
+        <span class="pct" id="pct">75%</span>
+      </div>
+      <div class="segmented" id="presets">
+        <button data-v="0">0%</button>
+        <button data-v="75" aria-pressed="true">75%</button>
+        <button data-v="100">100%</button>
+      </div>
+    </div>
+
+    <!-- ===== 定时 ===== -->
+    <div class="section-label">定时</div>
+    <div class="group">
+      <div class="row">
+        <span class="check" role="checkbox" aria-checked="true" tabindex="0"></span>
+        <div class="row-main">
+          <div class="row-title">启用每日定时</div>
+        </div>
+        <span class="row-meta">4 档</span>
+      </div>
+      <div class="slot">
+        <time>08:30</time><span class="lv">80%</span>
+        <span class="chip accent">同时点亮</span>
+      </div>
+      <div class="slot">
+        <time>12:00</time><span class="lv">0%</span>
+        <span class="chip dim">不变</span>
+      </div>
+      <div class="slot">
+        <time>13:30</time><span class="lv">80%</span>
+        <span class="chip dim">不变</span>
+      </div>
+      <div class="slot">
+        <time>21:00</time><span class="lv">0%</span>
+        <span class="chip accent">同时熄灭</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><div class="row-title" style="color:var(--accent)">添加时间段</div></div>
+        <span class="row-meta" style="color:var(--label-3)">+</span>
+      </div>
+
+      <!-- 任务计划的实测结果显示在这里（原来埋在底部的四行状态） -->
+      <div class="row" id="taskRow">
+        <span class="status-dot small" id="taskDot"></span>
+        <div class="row-main">
+          <div class="row-title" id="taskTitle">任务计划已注册</div>
+          <div class="row-sub" id="taskSub">5 个触发点 · 补跑已开 · 登录校准已注册</div>
+        </div>
+        <span class="row-meta" id="taskNext">下次 今天 21:00</span>
+        <button class="link-btn" id="taskRefresh">检测</button>
+      </div>
+    </div>
+
+    <!-- ===== 说明入口（替代原来的满屏备注） ===== -->
+    <div class="help-bar">
+      <button id="helpBottom"><span>?</span><span>说明</span></button>
+    </div>
+  </main>
+</div>
+
+<!-- ===== 说明弹层 ===== -->
+<div class="scrim" id="scrim">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>说明</h2>
+    <p class="lede">常用设置都在主界面；这里放"平时不需要看"的信息。</p>
+
+    <h3>屏幕亮着 / 已熄灭</h3>
+    <ul>
+      <li>状态以<b>本程序的记录</b>为准：程序熄灭后，动键鼠会让系统自动唤醒，状态会跟着变。</li>
+      <li>DDC 回读只作参考 —— 这块面板在待机时仍会回报"已开机"，不可信。</li>
+      <li>物理电源键、Windows 自己的自动熄屏不在追踪范围内。</li>
+    </ul>
+
+    <h3>熄灭方式</h3>
+    <ul>
+      <li><b>系统级</b>（默认）：整组一起灭，一定唤得回来；但任何键鼠输入都会点亮。</li>
+      <li><b>DDC 单屏待机</b>：输入不会点亮，适合<b>远程操作时防窥</b>；唤醒靠
+        「电源模式 → 写亮度 → 输出重驱动 → 切信号源」逐级尝试，个别面板仍可能唤不回。</li>
+    </ul>
+
+    <h3>唤醒阶梯</h3>
+    <p>点亮时依次尝试，任何一级成功即停：<code>0xD6=1</code> → 写回亮度 →
+      <code>SC_MONITORPOWER 2→-1</code> → 切信号源。</p>
+
+    <h3>配置位置</h3>
+    <p><code>%APPDATA%\MonitorBrightness\config.json</code></p>
+
+    <h3>排查</h3>
+    <ul>
+      <li><code>--probe</code>：打印每台屏的亮灭结论</li>
+      <li><code>--diag</code>：枚举结果、能力串、<code>0xD6/0x60/0x10</code> 回读</li>
+    </ul>
+
+    <button class="close" id="closeSheet">好</button>
+  </div>
+</div>
+
+
+<!-- ===== 设置弹层（托盘 / 自启 / 热键 / 熄屏高级项都收在这里） ===== -->
+<div class="scrim" id="settingsScrim">
+  <div class="sheet" role="dialog" aria-modal="true" style="width:450px">
+    <h2>设置</h2>
+    <p class="lede">不常用的开关都在这里，主界面只留日常操作。</p>
+
+    <h3>窗口</h3>
+    <div class="group" style="margin:0;background:rgba(120,120,128,.10);box-shadow:none">
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">系统托盘图标</div>
+          <div class="row-sub">在右下角常驻，右键可熄/亮屏、切换定时</div>
+        </div>
+        <button class="switch" aria-checked="true" role="switch"></button>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">关闭窗口时最小化到托盘</div>
+          <div class="row-sub">关掉则点 × 直接退出程序</div>
+        </div>
+        <button class="switch" aria-checked="true" role="switch"></button>
+      </div>
+    </div>
+
+    <h3>启动与快捷键</h3>
+    <div class="group" style="margin:0;background:rgba(120,120,128,.10);box-shadow:none">
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">开机自动启动</div>
+          <div class="row-sub">启动后直接进托盘</div>
+        </div>
+        <button class="switch" aria-checked="false" role="switch"></button>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">全局热键</div>
+          <div class="row-sub" id="hotkeySub">熄灭 <span class="kbd">Ctrl Alt Shift O</span>　点亮 <span class="kbd">Ctrl Alt Shift P</span></div>
+        </div>
+        <button class="switch" aria-checked="false" role="switch"></button>
+      </div>
+    </div>
+
+    <h3>熄屏</h3>
+    <div class="group" style="margin:0;background:rgba(120,120,128,.10);box-shadow:none">
+      <div class="row" style="display:block;padding-top:10px;padding-bottom:10px">
+        <div class="row-title" style="margin-bottom:8px">熄灭方式</div>
+        <div class="segmented" style="margin:0">
+          <button aria-pressed="true">系统级</button>
+          <button>DDC 单屏待机</button>
+        </div>
+        <div class="row-sub" style="margin-top:8px">
+          系统级：整组熄灭，一定唤得回；键鼠会点亮。<br>
+          DDC：键鼠不点亮（适合远程防窥），个别面板唤不回，切换时会再确认一次。
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">熄灭后自动点亮</div>
+          <div class="row-sub">防止远程时把自己关在门外</div>
+        </div>
+        <input class="num" type="number" value="0" min="0" max="120">
+        <span class="unit">分钟</span>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">点亮时允许切信号源</div>
+          <div class="row-sub">最后一招；DP+HDMI 双线时可能切到空口</div>
+        </div>
+        <button class="switch" aria-checked="true" role="switch"></button>
+      </div>
+    </div>
+
+    <h3>关于</h3>
+    <div class="group" style="margin:0;background:rgba(120,120,128,.10);box-shadow:none">
+      <div class="row">
+        <div class="row-main"><div class="row-title">版本</div></div>
+        <span class="row-meta">v1.7.1</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><div class="row-title">配置文件</div></div>
+        <span class="row-meta" style="font-size:11px">%APPDATA%\MonitorBrightness</span>
+      </div>
+    </div>
+
+    <button class="close" id="closeSettings">完成</button>
+  </div>
+</div>
+
+<script>
+  const slider = document.getElementById('brightness');
+  const pct = document.getElementById('pct');
+  const presets = document.getElementById('presets');
+
+  // ---- 状态切换演示 ----
+  const dot = document.getElementById('dot');
+  const title = document.getElementById('statusTitle');
+  const meta = document.getElementById('statusMeta');
+  const hint = document.getElementById('statusHint');
+  const offBtn = document.getElementById('offBtn');
+  const onBtn = document.getElementById('onBtn');
+  let on = true;
+
+  function render() {
+    dot.classList.toggle('off', !on);
+    title.textContent = on ? '屏幕亮着' : '屏幕已熄灭';
+    meta.textContent = on ? '15:11 点亮' : '15:42 熄灭';
+    hint.textContent = on
+      ? '当前 ' + slider.value + '% · 2 台显示器'
+      : '键鼠输入不会点亮它；点「点亮屏幕」恢复';
+    // 只让"当前可执行"的那个动作成为主按钮，另一个置灰 ——
+    // 状态与可用动作同时表达，不用读文字也一眼看懂
+    offBtn.className = 'btn ' + (on ? 'primary' : 'secondary');
+    onBtn.className = 'btn ' + (on ? 'secondary' : 'primary');
+    offBtn.disabled = !on;
+    onBtn.disabled = on;
+  }
+
+  offBtn.addEventListener('click', () => { on = false; render(); });
+  onBtn.addEventListener('click', () => { on = true; render(); });
+  render();
+
+  // ---- 亮度 ----
+  function setPct(v) {
+    slider.value = v;
+    pct.textContent = v + '%';
+    slider.style.setProperty('--pct', v + '%');
+    [...presets.children].forEach(b => {
+      b.setAttribute('aria-pressed', String(Number(b.dataset.v) === Number(v)));
+    });
+    if (on) render();
+  }
+  slider.addEventListener('input', e => setPct(e.target.value));
+  presets.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (b) setPct(b.dataset.v);
+  });
+  setPct(75);
+
+  // ---- 检测按钮（模拟一次只读探测） ----
+  const probeBtn = document.getElementById('probeBtn');
+  probeBtn.addEventListener('click', () => {
+    probeBtn.textContent = '检测中…';
+    setTimeout(() => {
+      probeBtn.textContent = on ? '检测：亮着' : '检测：已熄灭';
+      setTimeout(() => { probeBtn.textContent = '检测'; }, 1500);
+    }, 420);
+  });
+
+  // ---- 勾选框 ----
+  document.querySelectorAll('.check').forEach(el => {
+    const toggle = () => el.setAttribute('aria-checked',
+      el.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    el.addEventListener('click', toggle);
+    el.addEventListener('keydown', e => {
+      if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); }
+    });
+  });
+
+  // ---- 说明弹层 ----
+  const scrim = document.getElementById('scrim');
+  const openSheet = () => scrim.classList.add('open');
+  const closeSheet = () => scrim.classList.remove('open');
+  document.getElementById('helpTop').addEventListener('click', openSheet);
+  document.getElementById('helpBottom').addEventListener('click', openSheet);
+  document.getElementById('closeSheet').addEventListener('click', closeSheet);
+  scrim.addEventListener('click', e => { if (e.target === scrim) closeSheet(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
+
+  // ---- 设置弹层 ----
+  const settingsScrim = document.getElementById('settingsScrim');
+  const openSettings = () => settingsScrim.classList.add('open');
+  const closeSettings = () => settingsScrim.classList.remove('open');
+  document.getElementById('settingsTop').addEventListener('click', openSettings);
+  document.getElementById('closeSettings').addEventListener('click', closeSettings);
+  settingsScrim.addEventListener('click', e => {
+    if (e.target === settingsScrim) closeSettings();
+  });
+
+  // 开关类控件：点击切换
+  document.querySelectorAll('.switch').forEach(el => {
+    el.addEventListener('click', () => {
+      el.setAttribute('aria-checked',
+        el.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+  });
+
+  // 熄屏方式分段控件（设置里）
+  document.querySelectorAll('#settingsScrim .segmented button').forEach(b => {
+    b.addEventListener('click', () => {
+      [...b.parentElement.children].forEach(x => x.setAttribute('aria-pressed', 'false'));
+      b.setAttribute('aria-pressed', 'true');
+    });
+  });
+
+  // ---- 任务计划"检测"（模拟一次读取） ----
+  const taskRefresh = document.getElementById('taskRefresh');
+  const taskDot = document.getElementById('taskDot');
+  const taskTitle = document.getElementById('taskTitle');
+  const taskSub = document.getElementById('taskSub');
+  const taskNext = document.getElementById('taskNext');
+  taskRefresh.addEventListener('click', () => {
+    taskRefresh.textContent = '检测中…';
+    taskDot.classList.add('warn');
+    setTimeout(() => {
+      taskRefresh.textContent = '检测';
+      taskDot.classList.remove('warn');
+      taskTitle.textContent = '任务计划已注册';
+      taskSub.textContent = '5 个触发点 · 补跑已开 · 登录校准已注册';
+      taskNext.textContent = '下次 今天 21:00';
+    }, 550);
+  });
+
+  if (location.hash === '#sheet') openSheet();
+  if (location.hash === '#settings') openSettings();   // 便于直接截图/分享说明页
+</script>
+</body>
+</html>

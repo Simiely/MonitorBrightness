@@ -1,19 +1,92 @@
 # AGENTS.md · 项目规则
 
-> 📌 **文档基线**：2026-10-08（v1.2.1：S1/S2 重构 + 全量后台化 + 型号名并行/缓存）
+> 📌 **文档基线**：2026-11-03（v1.7.0：自带 dxva2 后端 + 快捷预设 + 亮灭探测 + 分级唤醒）
 > **更新文档/代码后，请更新此行**（日期 + 新 commit hash），并在 CHANGELOG 追加版本
 
 ## 技术栈
 
 - **Python 3.10+**（打包用**完整版**，**必须含 tkinter**）
 - GUI：**tkinter**（内置，主用）/ **PySide6**（可选变体，体积大）
-- 显示器控制：**`monitorcontrol`**（Windows 走 DDC/CI，VCP 特性码 `0x10` 亮度）
+- 显示器控制：**Windows `dxva2` 原生 DDC/CI**（VCP `0x10` 亮度 / `0x60` 输入源 /
+  `0xD6` 电源模式）。v1.7.0 起**不再使用 `monitorcontrol`**（它在 Python 3.14 上枚举会崩，
+  且与自己的枚举各排一次序）
 - 打包：**PyInstaller** `--onefile --windowed`
 - 定时：Windows **任务计划程序**，v1.1.0 起改用 **PowerShell `Register-ScheduledTask`**
   （**不再用 `schtasks.exe`**，原因见下方关键坑）
 
 ## 关键坑（越具体越好）
 
+- **别给 tkinter 控件赋 `self._w`** → 那是控件路径（`Misc._w`），覆盖后再建子控件会
+  `TypeError: unsupported operand type(s) for +: 'int' and 'str'`。存宽度用 `_width`。
+- **Toplevel 弹层必须被持有引用** → 只 `SettingsSheet(self)` 不存变量，对象被 GC 时
+  窗口连同内容一起消失，表现是"点了设置没反应"。用 `self._sheet = ...` 持有。
+- **弹层尺寸要在内容搭完后设** → 基类构造时 body 是空的，`winfo_reqheight()` 只有 144，
+  被 `resizable(False)` 锁死后内容被裁掉。子类最后调 `show()`。
+- **控件必须在目标父容器内创建** → 先把 Switch 建在卡片上、再 `row.pack(...)`，
+  它会跑到卡片别处（pack 只认自己的 master）。写成 `row(..., builder=lambda p: ...)`。
+- **打包环境变量必须是"真 unset"** → `TCL_LIBRARY=`（空字符串）会让 PyInstaller 把
+  tkinter 判成 missing，产出 `No module named 'tkinter'` 的废 exe；必须
+  `env -u TCL_LIBRARY -u TK_LIBRARY`。若 shell 里 `env -u` 失效（别名的 py 会静默退出、
+  stdout 丢失），就在 Python 进程内 `os.environ.pop(...)` 后调
+  `PyInstaller.__main__.run(...)`（项目里留有 _build.py 模板）。
+- **UI 流程测试的调度陷阱会复发** → 同一晚踩了两次（链式 after + 顶层 after 双调度，
+  后跑的覆盖前一步结果，制造"按钮没反应"假象）。写测试先检查调度入口唯一。
+- **Tk Canvas 圆角没有抗锯齿（Windows）** → CustomTkinter 官方文档确认只有 macOS
+  有。要设计稿级的圆角只能 Pillow 4x 超采样 + LANCZOS 缩小成带 alpha 的
+  PhotoImage 贴 Canvas（Tk 8.6+ 支持图片 alpha）；`smooth=True` 多边形救不了。
+  PhotoImage 必须全局持引用，渲染按参数缓存。
+- **异步流程测试只允许一个调度入口** → 测试脚本里"链式 after(1000, next) +
+  顶层 after(N, step)"会把每步跑两遍，结果互相覆盖，制造出"滑块下发错值/预设被吞"
+  的假阴性（排查半天发现代码完全正确）。写 UI 流程测试时只用一种调度方式。
+- **截图核验用 PrintWindow** → 屏幕抓取会被别的窗口挡住，抓到别人的界面（踩过两次）；
+  用 `PrintWindow(hwnd, hdc, 2)` 抓窗口自身内容才可靠。
+- **🔴 绝不能拿用户真机屏幕做"熄灭"类破坏性测试** → v1.7.0 我就这么干了一次：
+  写 `0xD6=2` 验证唤醒逻辑，结果面板黑了、所有软件手段都救不回来，
+  用户只能自己按物理电源键。**要验熄灭/点亮，只能在打桩层面验命令下发**
+  （monkeypatch `screen_off_system` / `_write_vcp` 看调用序列），
+  真机测试交给用户，或者先问一句。
+- **`0xD6=2`（待机）不能用来熄灭** → 本机实测：写完回读仍是 `1`、亮度照样可读，
+  但背光真的灭了；随后 `0xD6=1` + 写亮度 + `0x60` 切源（4 秒往返 + 补发）**全部无效**。
+  现在熄灭走系统级 `SC_MONITORPOWER`（2 熄灭 / -1 点亮），恢复由 Windows 负责。
+  `screen_off_method=ddc` 只是保留的高级选项。
+- **能力串里的数值是不带 0x 的十六进制** → 本机实测 `60(11 12 0F)` 是
+  HDMI-1 / HDMI-2 / DP-1。按十进制解析会得到 `11/12/0` 这种不存在的口，
+  拿它去切信号源 = 把画面切进黑洞。`_caps_inputs()` 用 `int(tok, 16)`。
+- **「点亮」绝不能只有一招** → v1.6.x 唯一的唤醒手段是 `0x60` 切信号源，
+  且"另一个口"写死成 `4`（DVI-2）。现代显示器没有 DVI-2，切过去即无信号、
+  面板进省电，切回来能不能醒取决于链路重训练 → 换电脑后"有时点不亮"。
+  默认路径现在是**系统级 `SC_MONITORPOWER`**（不碰 DDC）；`ddc` 高级方式下才走
+  `0xD6=1` → 写回亮度 → 系统输入注入 → 按能力串选口切信号源（可关）。
+- **一台屏插两根线会被枚举成两个输出** → DP+HDMI 同时接，Windows 为每个输出建一个
+  HMONITOR。此时切信号源可能切到没驱动的空口；且"熄 A、点 B"的错位会放大。
+  所以：序号用设备名锚点解析；系统级熄灭天然没有这个问题。
+- **`EnumDisplayMonitors` 顺序不保证稳定** → 只存下标会出现"熄的是这块、开机后点的是
+  那块"。配置同时存 `monitor_ids`（`DISPLAY1/2`），执行前用 `resolve_monitors()` 重算。
+- **`GetPhysicalMonitorsFromHMONITOR` 拿到的句柄必须 `DestroyPhysicalMonitor`** →
+  旧版只取不还，反复操作会耗尽句柄，表现为"越用越不灵"。**注意：任何调用
+  `enumerate_targets()` 的分支都必须有配对的 `release_targets()`**（v1.7.1 走查时
+  就在 `resolve_monitors`/`selection_payload` 里抓到两处漏释放）。
+- **ctypes 必须显式声明签名** → 64 位下 `HANDLE` 不声明会按 C int 截断；数组参数用
+  `c_void_p` + `byref` 传，否则新版 Python 的严格检查会抛
+  `expected LP_PHYSICAL_MONITOR instance`（`monitorcontrol` 4.2.0 就是这么挂的）。
+- **写 VCP 前必须查能力串，未声明的值绝不盲写** → 微软 `SetVCPFeature` 文档原话：
+  "Many monitors don't fully implement that standard; so your use of these commands
+  might result in undefined monitor behavior."；ddcutil 文档也说明 I2C 层只确认
+  "包收到了"，不确认"执行了"。本机面板 `D6(01 04 05)` 不含 02（待机），
+  v1.7.0 盲写 02 → 背光灭且软件唤不回。现在 `screen_off_many()` 用
+  `_caps_power()` 过滤，读不到就跳过。
+- **"亮了但黑屏"按 GPU-面板握手失败处理** → 公开排查一致给出同一套恢复手段：
+  切一次显示模式 / 让输出重新上电 / 重置驱动。所以唤醒序列里有一级
+  `_output_recycle()`（`SC_MONITORPOWER 2 → -1`），只在屏幕本来就黑时执行。
+- **`0xD6` 回读会撒谎（连待机也会）** → v1.7.0 现场取证：写 `0xD6=2` 待机后，
+  回读仍是 `1`、`0x10` 亮度照样读得到。**绝不能拿回读当"点亮成功"的判据**，
+  否则就是"程序说成功、屏幕黑着"（与 v1.5.0 事故同源）。界面只把回读当"证据"，
+  真实亮灭交给「检测亮灭」+ 眼睛。
+- **文本控件 `wraplength` 必须小于窗口宽度** → 依据行一开始设 560、窗口只有 504，
+  文字顶到右边界被切掉（"看不出结果"的一半原因）。改 450 才完整换行。
+- **"屏幕亮没亮"不能只看 DDC** → `0xD6` 会撒谎；系统级熄灭下真正可靠的判据是
+  「熄灭时刻的 tick」vs「`GetLastInputInfo` 的 idle」：熄灭后出现过输入就说明已被唤醒。
+  结论行只给人话，原始回读降级为依据行。
 - **拼 PowerShell 脚本一律用换行，不能 `'; '.join`** → `if (...) {...}; else {...}` / `{;`
   都是**语法错误**（实测：「无法将"else"项识别为 cmdlet」），整段解析失败、退出码非 0。
   统一走 `_ps_script(lines)`。**这是"任务计划状态：读取失败"的根因。**
@@ -58,8 +131,9 @@
 - **DDC/CI 前提** → 显示器 OSD 必须开启 DDC/CI，且 HDMI/DP/DVI 直连；否则枚举不到显示器。
 - **计划任务里的程序路径** → 打包态用自身 exe；**源码态必须把脚本路径带上**
   （`sys.executable` 是 `python.exe` 而非目标程序）。见 `task_target()`。
-- **`monitorcontrol` 的 Monitor 没有 `model` 属性** → 型号要从 `get_vcp_capabilities()['model']` 取，
-  且**实测约 3 秒/台**，必须放后台线程，不能和亮度读取串行。
+- **型号只能从 MCCS 能力串里取** → `dxva2.GetCapabilitiesStringLength` +
+  `CapabilitiesRequestAndCapabilitiesReply`，正则取 `model(...)`；
+  **实测约 3 秒/台**，必须放后台线程，不能和亮度读取串行。
 - **tkinter 不是线程安全的** → 后台线程里调 `root.after()` 会抛
   `RuntimeError: main thread is not in main loop`。统一走「后台线程 → `queue` → 主线程轮询」。
 - **深色勾选框别自己造** → `tk.Checkbutton` 的 `selectcolor` 会让"未勾选也带色"；
@@ -82,7 +156,9 @@
 
 ```bash
 python monitor_brightness.py                    # 运行 GUI
-python monitor_brightness.py --list             # 列出显示器
+python monitor_brightness.py --list             # 列出显示器（含当前输入源）
+python monitor_brightness.py --probe            # 实测每台显示器的亮灭（只读）
+python monitor_brightness.py --diag             # 只读诊断报告（排查点不亮）
 python monitor_brightness.py --selftest         # 打印档位判定自检表（不碰显示器）
 python monitor_brightness.py --apply-schedule   # 按当前时间套用档位
 python monitor_brightness.py --set 0,1 50       # 命令行设亮度（all 也可）

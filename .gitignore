@@ -8,8 +8,10 @@ venv/
 # PyInstaller 构建产物
 build/
 build_tk/
+build_tmp/
 dist/
 dist_tk/
+dist_v*/
 *.spec
 
 # 编辑器 / Obsidian

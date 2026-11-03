@@ -9,9 +9,11 @@
   - 定时任务不依赖常驻进程：到点由系统调用本程序的命令行模式执行
   - 支持命令行模式:
       MonitorBrightness.exe --set <序号|all|0,1> <亮度>   立即调整
-      MonitorBrightness.exe --apply-schedule              按「当前时间」判定白天/晚上并下发
+      MonitorBrightness.exe --apply-schedule              按「当前时间」判定档位并下发
       MonitorBrightness.exe --list                        列出显示器
-      MonitorBrightness.exe --screen off|on               熄灭 / 点亮选中的显示器
+      MonitorBrightness.exe --probe                       实测每台显示器的亮灭
+      MonitorBrightness.exe --diag                        只读诊断报告（排查点不亮）
+      MonitorBrightness.exe --screen off|on|status        熄灭 / 点亮选中的显示器
       MonitorBrightness.exe --selftest                    自检（打印时间分档判定结果）
 
 v1.1.0 相比 v1.0.0：
@@ -26,6 +28,7 @@ v1.1.0 相比 v1.0.0：
 import sys
 import os
 import re
+import math
 import json
 import queue
 import threading
@@ -36,7 +39,8 @@ from ctypes import wintypes
 from datetime import datetime, timezone
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+import tkinter.font as tkfont
+from tkinter import ttk
 
 # 托盘（可选依赖）：缺 pystray 时 GUI 照常工作，仅没有托盘/最小化到托盘能力
 try:
@@ -47,13 +51,11 @@ except Exception:
     _TrayIcon = _TrayMenu = _TrayItem = None
     TRAY_OK = False
 
-try:
-    from monitorcontrol import get_monitors
-except Exception:  # pragma: no cover
-    get_monitors = None
+# v1.7.0 起不再需要 monitorcontrol：DDC/CI 直接走 dxva2（见「二、显示器枚举与亮度控制」）。
+# 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.8.5"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -90,6 +92,27 @@ DARK = {
 }
 FONT_UI = ("Microsoft YaHei UI", 9)
 
+# 新版界面配色（Apple 深色模式近似值）：卡片比窗口底色亮一档，
+# 文字分三级（主 / 次 / 弱），强调色只出现在主按钮与可点文本上。
+UI = {
+    "bg": "#0f0f11",
+    "card": "#1c1c1e",
+    "card_alt": "#242426",
+    "fill": "#2a2a2d",
+    "fill_hover": "#343438",
+    "fill_off": "#3a3a3d",
+    "seg_on": "#48484c",
+    "sep": "#2f2f31",
+    "text": "#f2f2f4",
+    "text2": "#a1a1a6",
+    "text3": "#6c6c70",
+    "accent": "#0a84ff",
+    "accent_hover": "#3d9bff",
+    "accent_soft": "#1d3a5c",
+    "green": "#32d74b",
+    "orange": "#ff9f0a",
+}
+
 
 # ============================================================
 # 一、配置读写（设置项的唯一声明表在此，其余全部由它派生）
@@ -104,8 +127,19 @@ DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': ''}, {'time': '21:00',
 SCREEN_ACTIONS = (("", "不变"), ("off", "熄灭"), ("on", "点亮"))
 SCREEN_VALUE_BY_LABEL = {label: value for value, label in SCREEN_ACTIONS}
 SCREEN_LABEL_BY_VALUE = {value: label for value, label in SCREEN_ACTIONS}
+
+# 熄灭方式：system = 系统级整组熄灭（默认，一定唤得回来）
+#           ddc    = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，仅作高级选项）
+OFF_METHODS = ("system", "ddc")
+OFF_METHOD_LABEL = {"system": "系统级", "ddc": "单屏待机"}
 SETTINGS = (
     {"key": "monitors", "kind": "indices", "default": []},
+    # 设备名锚点（如 ['DISPLAY1','DISPLAY2']），与 monitors 同序对应。
+    # 为什么不只用下标：EnumDisplayMonitors 的顺序会随显卡驱动/接线变化而重排，
+    # 只存下标就会出现"熄的是这块屏、点的是那块屏"（另一台电脑点亮失效的形态之一）。
+    {"key": "monitor_ids", "kind": "ids", "default": []},
+    # 快捷预设：三个按钮的亮度值，用户可改（0/75/100 是出厂默认）
+    {"key": "presets", "kind": "levels", "default": [0, 75, 100]},
     {"key": "slots", "kind": "slots", "default": DEFAULT_SLOTS},
     {"key": "enabled", "kind": "flag", "default": False},
     {"key": "catch_up_on_logon", "kind": "flag", "default": True},
@@ -113,9 +147,23 @@ SETTINGS = (
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
     {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
     {"key": "screen_state", "kind": "screenstate", "default": "on"},      # 屏幕状态记账（软件最后一次操作）
+    # 记账时间点（"MM-DD HH:MM"）：结论行要能说清"什么时候熄的/亮的"
+    {"key": "screen_state_at", "kind": "stamp", "default": ""},
+    # 熄灭那一刻的系统 tick（毫秒）。用来判断"熄灭之后有没有过键鼠输入"——有输入
+    # 就说明系统已经把屏幕唤醒了（见 _screen_woke_by_input）。重启后 tick 失效，忽略。
+    {"key": "screen_off_tick", "kind": "int", "default": 0},
+    # 熄灭方式：system = Windows 系统级整组熄灭（默认，一定唤得回来）
+    #           ddc    = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，慎用）
+    {"key": "screen_off_method", "kind": "choice",
+     "values": ("system", "ddc"), "default": "ddc"},
+    # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
+    {"key": "wake_switch_input", "kind": "flag", "default": True},
+    # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
+    # 用户在界面里选择"DDC 单屏待机"并确认风险后才会置 True。
+    {"key": "ddc_allow_undeclared", "kind": "flag", "default": False},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 def coerce_setting(key, value):
     """按声明表把值规整到合法域；非法/缺失一律回落默认值。"""
@@ -134,10 +182,73 @@ def coerce_setting(key, value):
         return bool(value)
     if kind == "slots":
         return _coerce_slots(value)
+    if kind == "levels":
+        return _coerce_levels(value, spec["default"])
+    if kind == "ids":
+        return _coerce_ids(value)
+    if kind == "choice":
+        return value if value in spec.get("values", ()) else spec["default"]
+    if kind == "stamp":
+        # 只接受我们自己写的 "MM-DD HH:MM" 形状；其他一律当没有
+        text = str(value or "").strip()
+        return text if _valid_stamp(text) else ""
+    if kind == "int":
+        try:
+            return max(0, int(value))
+        except Exception:
+            return spec["default"]
     if kind == "screenstate":
         # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
         return value if value in ("on", "off") else spec["default"]
     return normalize_indices(value)
+
+
+def _coerce_levels(value, fallback):
+    """把预设亮度规整成与默认值**等长**的 0-100 整数列表。
+
+    长度以默认值为准（当前 3 个）：多截断、少用默认值补齐，
+    这样界面永远有固定个数的按钮，不会因配置残缺而少画一个。
+    """
+    want = len(fallback)
+    out = []
+    for item in _as_iterable(value):
+        if len(out) >= want:
+            break
+        try:
+            out.append(max(0, min(100, int(float(item)))))
+        except Exception:
+            continue
+    while len(out) < want:
+        out.append(fallback[len(out)])
+    return out[:want]
+
+
+def _coerce_ids(value):
+    """设备名锚点：去空、去重、保持顺序（如 ['DISPLAY1','DISPLAY2']）。"""
+    out = []
+    for item in _as_iterable(value):
+        name = str(item).strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _valid_hhmm(text):
+    """'HH:MM' 合法性（时间分档、时间段编辑共用）。"""
+    try:
+        h, m = str(text).strip().split(":")
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+    except Exception:
+        return False
+
+
+def _valid_stamp(text):
+    """记账时间点形状：'MM-DD HH:MM'（自己写的，只认这一种）。"""
+    return bool(re.match(r"^\d{2}-\d{2} \d{2}:\d{2}$", text or ""))
+
+
+def stamp_now():
+    return datetime.now().strftime("%m-%d %H:%M")
 
 
 def _coerce_slots(value):
@@ -198,6 +309,10 @@ def load_config():
                 # v1 -> v2 迁移：旧配置只有 "monitor": 0
                 if "monitors" not in raw and "monitor" in raw:
                     raw = dict(raw, monitors=[raw["monitor"]])
+                # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）
+                for _dev, _caps in (raw.get("caps") or {}).items():
+                    if isinstance(_caps, str) and _caps:
+                        _CAPS_CACHE.setdefault(_dev, _caps)
                 for key in SETTING_BY_KEY:
                     if key in raw:
                         cfg[key] = coerce_setting(key, raw[key])
@@ -211,6 +326,8 @@ def save_config(cfg):
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
+        if _CAPS_CACHE:
+            payload["caps"] = dict(_CAPS_CACHE)
         payload["version"] = CONFIG_VERSION
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -266,7 +383,17 @@ def clamp_level(value):
 
 
 # ============================================================
-# 二、亮度控制（DDC/CI）
+# 二、显示器枚举与亮度控制（DDC/CI，dxva2 内置后端）
+# ------------------------------------------------------------
+# v1.7.0 起不再依赖 monitorcontrol，原因有三（都是实测，不是猜的）：
+#   1. monitorcontrol 4.2.0 在 Python 3.14 上枚举直接抛
+#      TypeError: expected LP_PHYSICAL_MONITOR instance —— 新版 ctypes 对
+#      "数组冒充指针"更严格，源码态根本列不出显示器；
+#   2. 它和 enum_displays() 各自枚举一遍，两套顺序一旦不同，就会出现
+#      "熄的是这块、点的是那块"——正是"换电脑后有时点不亮"的形态之一；
+#   3. 只需要它 capabilities 里的 model 字段，为这个背一个会崩的依赖不值。
+# 现在全程序只有 enumerate_targets() 一个枚举源：界面标签、亮度读写、熄屏点亮、
+# 状态探测全部按它的下标走，序号天然一致。
 # ============================================================
 NO_MONITOR_MSG = (
     "未检测到支持 DDC/CI 的显示器。\n请确认：\n"
@@ -274,69 +401,273 @@ NO_MONITOR_MSG = (
     "2. 使用 HDMI / DP / DVI 直连（避免 KVM / USB 转接）"
 )
 
+# VCP 特性码
+VCP_BRIGHTNESS = 0x10
+VCP_INPUT_SOURCE = 0x60
+VCP_POWER_MODE = 0xD6
 
-def list_monitors():
-    if get_monitors is None:
-        return []
-    try:
-        return list(get_monitors())
-    except Exception:
-        return []
+# 0xD6 电源模式取值（MCCS 标准）
+POWER_ON = 1
+POWER_STANDBY = 2
+POWER_SUSPEND = 3
+POWER_SOFT_OFF = 4
+POWER_OFF = 5
+POWER_LABEL = {1: "开", 2: "待机", 3: "挂起", 4: "软关", 5: "硬关"}
+
+# 0x60 输入源取值（只列常见项，其余照原样显示数字）
+INPUT_LABEL = {1: "模拟1", 2: "模拟2", 3: "DVI-1", 4: "DVI-2", 5: "复合1",
+               6: "复合2", 15: "DP-1", 16: "DP-2", 17: "HDMI-1", 18: "HDMI-2",
+               19: "HDMI-3"}
 
 
-def enum_displays():
-    """用 Win32 枚举显示设备，返回 [(设备名, 宽, 高, 是否主屏), ...]。
+class PHYSICAL_MONITOR(ctypes.Structure):
+    """dxva2 的 PHYSICAL_MONITOR：一个物理显示器句柄 + 描述文字。"""
+    _fields_ = [("hPhysicalMonitor", wintypes.HANDLE),
+                ("szPhysicalMonitorDescription", wintypes.WCHAR * 128)]
 
-    顺序与 monitorcontrol 内部一致（它也是走 EnumDisplayMonitors + 逐个取物理显示器），
-    所以可以直接按下标贴到显示器列表上，用来区分同型号的屏幕。
+
+_DXVA2_READY = False
+
+
+def _dxva2():
+    """返回已声明好函数签名的 dxva2（只声明一次）。
+
+    为什么必须显式声明：
+      - 64 位下 HANDLE 不声明会被按 C int 截断，句柄高位丢失后表现为
+        "偶尔某块屏调不动"，且现象随启动顺序变化，极难复现；
+      - 数组参数统一用 c_void_p + byref 传，绕开新版 ctypes 对
+        "数组冒充 POINTER" 的严格检查（monitorcontrol 4.2.0 就栽在这）。
     """
-    if not sys.platform.startswith("win"):
-        return []
+    global _DXVA2_READY
+    lib = ctypes.windll.dxva2
+    if _DXVA2_READY:
+        return lib
     try:
-        import ctypes
-        from ctypes import wintypes
+        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
+            wintypes.HMONITOR, ctypes.POINTER(wintypes.DWORD)]
+        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+        lib.GetPhysicalMonitorsFromHMONITOR.argtypes = [
+            wintypes.HMONITOR, wintypes.DWORD, ctypes.c_void_p]
+        lib.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+        lib.GetVCPFeatureAndVCPFeatureReply.argtypes = [
+            wintypes.HANDLE, wintypes.BYTE, ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+        lib.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
+        lib.SetVCPFeature.argtypes = [wintypes.HANDLE, wintypes.BYTE, wintypes.DWORD]
+        lib.SetVCPFeature.restype = wintypes.BOOL
+        lib.DestroyPhysicalMonitor.argtypes = [wintypes.HANDLE]
+        lib.DestroyPhysicalMonitor.restype = wintypes.BOOL
+        lib.GetCapabilitiesStringLength.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        lib.GetCapabilitiesStringLength.restype = wintypes.BOOL
+        lib.CapabilitiesRequestAndCapabilitiesReply.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        lib.CapabilitiesRequestAndCapabilitiesReply.restype = wintypes.BOOL
+    except Exception:
+        pass
+    _DXVA2_READY = True
+    return lib
+
+
+def _read_vcp(handle, code):
+    """读一个 VCP 特性，返回 (当前值, 最大值)；失败返回 None。"""
+    try:
+        cur, mx = wintypes.DWORD(), wintypes.DWORD()
+        if _dxva2().GetVCPFeatureAndVCPFeatureReply(
+                handle, wintypes.BYTE(code), None,
+                ctypes.byref(cur), ctypes.byref(mx)):
+            return cur.value, mx.value
+    except Exception:
+        pass
+    return None
+
+
+def _write_vcp(handle, code, value):
+    """写一个 VCP 特性，返回是否成功。"""
+    try:
+        return bool(_dxva2().SetVCPFeature(handle, wintypes.BYTE(code),
+                                           wintypes.DWORD(int(value))))
+    except Exception:
+        return False
+
+
+def enumerate_targets():
+    """枚举显示器 —— 全程序唯一的枚举源。
+
+    返回 list[dict]，顺序即 EnumDisplayMonitors 顺序（界面行号 = 下标 = index）：
+      {index, dev, w, h, primary, handle, desc}
+
+    ⚠️ 一台物理屏同时插了 DP 和 HDMI 两条线时，Windows 会为**每个输出**各建一个
+    HMONITOR，这里就会出现两条指向同一块面板的记录。此时"点亮"必须跳过已经亮着的
+    那条，否则会把面板的信号源切到 Windows 没在驱动的那个空口上 → 黑屏。
+    """
+    if os.name != "nt":
+        return []
+    hmons = []
+    try:
+        user32 = ctypes.windll.user32
 
         class MONITORINFOEXW(ctypes.Structure):
             _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
                         ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
                         ("szDevice", wintypes.WCHAR * 32)]
 
-        out = []
-
         def _cb(hmon, hdc, lprect, lparam):
             mi = MONITORINFOEXW()
             mi.cbSize = ctypes.sizeof(mi)
-            if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-                rc = mi.rcMonitor
-                name = str(mi.szDevice).split("\\")[-1] or str(mi.szDevice)
-                out.append((name, rc.right - rc.left, rc.bottom - rc.top,
-                            bool(mi.dwFlags & 1)))
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                hmons.append((hmon, mi))
             return 1
 
-        proc = ctypes.WINFUNCTYPE(
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
-        ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(_cb), None)
-        return out
+        proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
+        user32.EnumDisplayMonitors(None, None, proc(_cb), None)
     except Exception:
         return []
 
+    targets = []
+    lib = _dxva2()
+    for hmon, mi in hmons:
+        rc = mi.rcMonitor
+        base = {"dev": str(mi.szDevice).split("\\")[-1] or str(mi.szDevice),
+                "w": rc.right - rc.left, "h": rc.bottom - rc.top,
+                "primary": bool(mi.dwFlags & 1)}
+        try:
+            count = wintypes.DWORD()
+            if not lib.GetNumberOfPhysicalMonitorsFromHMONITOR(
+                    hmon, ctypes.byref(count)):
+                continue
+            arr = (PHYSICAL_MONITOR * max(1, count.value))()
+            if not lib.GetPhysicalMonitorsFromHMONITOR(
+                    hmon, count.value, ctypes.byref(arr)):
+                continue
+            for p in list(arr)[:count.value]:
+                item = dict(base)
+                item["handle"] = p.hPhysicalMonitor
+                item["desc"] = str(p.szPhysicalMonitorDescription)
+                item["index"] = len(targets)
+                targets.append(item)
+        except Exception:
+            continue
+    return targets
 
-def monitor_model(monitor):
-    """从 MCCS 能力串里取显示器型号（如 'Legion R27qe Gen2'）。取不到就返回 None。"""
+
+def release_targets(targets):
+    """释放 enumerate_targets() 拿到的物理句柄。
+
+    旧版从不释放：反复操作会一点点吃掉 DDC 句柄，长跑后表现为"越用越不灵"。
+    """
+    lib = _dxva2()
+    for t in targets or []:
+        try:
+            lib.DestroyPhysicalMonitor(t["handle"])
+        except Exception:
+            pass
+
+
+def _select(targets, indices):
+    """按序号挑目标，返回 (选中列表, [(越界序号, 错误), ...])。空 indices = 全部。"""
+    if not indices:
+        return list(targets), []
+    known = {t["index"] for t in targets}
+    picked = [t for t in targets if t["index"] in indices]
+    return picked, [(i, "序号超出范围") for i in indices if i not in known]
+
+
+def _capabilities(handle):
+    """读 MCCS 能力串（实测约 3 秒/台，必须放后台线程）。失败返回 ""。"""
     try:
-        with monitor:
-            caps = monitor.get_vcp_capabilities()
-        if isinstance(caps, dict):
-            model = caps.get("model")
-            if model:
-                return str(model).strip()
+        lib = _dxva2()
+        n = wintypes.DWORD()
+        if not lib.GetCapabilitiesStringLength(handle, ctypes.byref(n)) or not n.value:
+            return ""
+        buf = ctypes.create_string_buffer(n.value + 1)
+        if not lib.CapabilitiesRequestAndCapabilitiesReply(handle, buf, n.value):
+            return ""
+        return buf.value.decode("ascii", "replace")
     except Exception:
-        pass
-    return None
+        return ""
 
 
-def monitor_label(index, monitor, info=None, model=None):
+# 能力串缓存：dev 名 -> 能力串。能力串是面板的静态固件属性（实测 3.1s/台），
+# 每次熄灭前都重读一遍曾让 DDC 熄灭耗时 6.3s/2 台 —— 缓存后只剩真正的写入
+# (~62ms/台)。随配置持久化（load_config 播种 / save_config 写回），
+# 换显示器后首次仍会实测刷新。
+_CAPS_CACHE = {}
+
+
+def _capabilities_cached(handle, dev):
+    """优先读缓存的能力串；dev 为空或缓存未命中时实读（读到了就缓存）。"""
+    if dev:
+        got = _CAPS_CACHE.get(dev)
+        if got:
+            return got
+    caps = _capabilities(handle)
+    if caps and dev:
+        _CAPS_CACHE[dev] = caps
+    return caps
+
+
+def _caps_model(caps):
+    """从能力串里取型号（纯解析，不发 DDC 请求）。"""
+    m = re.search(r"model\(([^)]*)\)", caps or "", re.I)
+    return (m.group(1).strip() if m else "") or None
+
+
+def _caps_inputs(caps):
+    """从能力串里取 0x60 声明支持的输入源列表（纯解析）。
+
+    ⚠️ 能力串里的数值是**不带 0x 的十六进制**。本机实测 `60(11 12 0F)`
+    = HDMI-1(17) / HDMI-2(18) / DP-1(15)；按十进制解析会得到 11/12/0 这种
+    根本不存在的口，拿它去切信号源就是把画面切进黑洞。
+    """
+    m = re.search(r"\b60\(([^)]*)\)", caps or "")
+    if not m:
+        return []
+    out = []
+    for tok in m.group(1).split():
+        try:
+            code = int(tok, 16)
+        except Exception:
+            continue
+        if 1 <= code <= 19:          # MCCS 0x60 的有效取值区间
+            out.append(code)
+    return out
+
+
+def _caps_power(caps):
+    """能力串里 0xD6 声明的电源模式取值（十六进制，如本机的 [1, 4, 5]）。
+
+    ⚠️ 只能当"提示"用（ddcutil 文档原话：capabilities string 经常是错的），
+    但**未声明的值绝不盲写**：MS Learn 的 SetVCPFeature 文档明确写着
+    "Many monitors don't fully implement that standard; so your use of these
+    commands might result in undefined monitor behavior"。
+    本机面板声明 D6(01 04 05) 而**不含 02（待机）**——v1.7.0 那次"屏幕黑了
+    唤不回来"的事故，就是盲写 02 落进未定义状态造成的。
+    """
+    m = re.search(r"\bD6\(([^)]*)\)", caps or "", re.I)
+    if not m:
+        return []
+    out = []
+    for tok in m.group(1).split():
+        try:
+            code = int(tok, 16)
+        except Exception:
+            continue
+        if 1 <= code <= 5:              # MCCS 0xD6 只有 01~05
+            out.append(code)
+    return out
+
+
+def monitor_model(handle, dev=None):
+    """从能力串里取型号（如 'Legion R27qe Gen2'）。取不到返回 None。
+
+    传 dev 走缓存；不传则实读（保持旧语义）。
+    """
+    return _caps_model(_capabilities_cached(handle, dev))
+
+
+def monitor_label(index, info=None, model=None):
     """显示器列表里那一行的文字。model 需要 DDC 往返，由后台线程补齐。"""
     parts = []
     if model:
@@ -351,127 +682,491 @@ def monitor_label(index, monitor, info=None, model=None):
     return "%d: %s" % (index, " · ".join(parts))
 
 
+# 设备名 -> 0x10 的上限（多数是 100，少数 255）。按设备名缓存，避免每次写都多跑一趟 DDC。
+_MAX_LUM = {}
+
+
+def _luminance_max(t):
+    if t["dev"] not in _MAX_LUM:
+        got = _read_vcp(t["handle"], VCP_BRIGHTNESS)
+        _MAX_LUM[t["dev"]] = got[1] if got and got[1] else 100
+    return _MAX_LUM[t["dev"]]
+
+
+def _raw_from_percent(t, level):
+    """把 0-100 的亮度换算成该屏 0x10 的原始值（上限不是 100 的屏必须换算）。"""
+    mx = _luminance_max(t)
+    return level if mx == 100 else int(round(level * mx / 100.0))
+
+
 def set_brightness_many(indices, value):
-    """批量设亮度。indices 为空 → 全部显示器。返回 (成功的序号列表, [(序号, 错误), ...])。"""
-    monitors = list_monitors()
-    if not monitors:
+    """批量设亮度。indices 为空 → 全部显示器。返回 (成功序号, [(序号, 错误), ...])。"""
+    targets = enumerate_targets()
+    if not targets:
         raise RuntimeError(NO_MONITOR_MSG)
-    targets = list(indices) if indices else list(range(len(monitors)))
     level = clamp_level(value)
     ok, errs = [], []
-    for i in targets:
-        if i < 0 or i >= len(monitors):
-            errs.append((i, "序号超出范围"))
-            continue
-        try:
-            with monitors[i] as m:
-                m.set_luminance(level)
-            ok.append(i)
-        except Exception as e:
-            errs.append((i, str(e)))
+    try:
+        picked, bad = _select(targets, indices)
+        errs.extend(bad)
+        for t in picked:
+            if _write_vcp(t["handle"], VCP_BRIGHTNESS, _raw_from_percent(t, level)):
+                ok.append(t["index"])
+            else:
+                errs.append((t["index"], "写入失败（显示器未响应 DDC/CI）"))
+    finally:
+        release_targets(targets)
     return ok, errs
 
 
 def get_brightness_many(indices):
     """批量读亮度。返回 ({序号: 亮度 or None}, [(序号, 错误), ...])。"""
-    monitors = list_monitors()
-    if not monitors:
+    targets = enumerate_targets()
+    if not targets:
         raise RuntimeError(NO_MONITOR_MSG)
-    targets = list(indices) if indices else list(range(len(monitors)))
     values, errs = {}, []
-    for i in targets:
-        if i < 0 or i >= len(monitors):
-            errs.append((i, "序号超出范围"))
-            continue
-        try:
-            with monitors[i] as m:
-                values[i] = m.get_luminance()
-        except Exception as e:
-            values[i] = None
-            errs.append((i, str(e)))
+    try:
+        picked, bad = _select(targets, indices)
+        errs.extend(bad)
+        for t in picked:
+            got = _read_vcp(t["handle"], VCP_BRIGHTNESS)
+            if got is None:
+                values[t["index"]] = None
+                errs.append((t["index"], "读取失败"))
+                continue
+            cur, mx = got
+            values[t["index"]] = int(round(cur * 100.0 / mx)) if mx else cur
+    finally:
+        release_targets(targets)
     return values, errs
 
 
-# ---- 熄屏 / 点亮（S6）----------------------------------------------------
-# ⚠️ 硬件红线（本机 Legion R27qe x2 实测事故）：0xD6=4/5（软关/硬关）后面板进入
-# 固件级熄灭，DDC 点亮/驱动重启/拓扑重握手/信号源切换全部唤不醒，只有物理电源键能救；
-# 且 0xD6 回读值与面板实际状态不符。故熄灭只用 2（待机），点亮只用信号源切换（0x60）。
+# ---- 亮灭状态探测 ---------------------------------------------------------
+def probe_states(indices=None):
+    """探测每台显示器"现在亮着还是灭着"，并把判断依据一起带回去。
 
-def _physical_handles():
-    """枚举物理显示器句柄（DXVA2）。顺序与 list_monitors() 一致（同为 EnumDisplayMonitors）。"""
-    dxva2 = ctypes.windll.dxva2
-    user32 = ctypes.windll.user32
-    cb_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
-                                 ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    判据（全部是 DDC/CI 只读命令，不写任何寄存器）：
+      1) 0xD6 电源模式：1=开；2/3/4/5=待机/挂起/软关/硬关；读不到=无回读；
+      2) 0x10 亮度是否可读：能读说明面板还有供电、AUX/I2C 通道还在；
+    ⚠️ 本机 v1.5.0 事故证明：0xD6 回读在某些机型上与面板事实不符（寄存器值≠面板
+       实际状态），所以这里只把它当"证据"之一，界面会把依据一并写明，不假装能
+       100% 确定。完全读不到的屏标 unknown，而不是猜成"灭"。
 
-    class _PHYS(ctypes.Structure):
-        _fields_ = [("handle", wintypes.HANDLE), ("desc", wintypes.WCHAR * 128)]
-
+    返回 [{index, dev, power, brightness, state(on/off/unknown), why}]。
+    """
+    targets = enumerate_targets()
+    if not targets:
+        raise RuntimeError(NO_MONITOR_MSG)
     out = []
-
-    def _cb(hmon, hdc, lprect, lparam):
-        count = wintypes.DWORD()
-        if dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(count)):
-            arr = (_PHYS * count.value)()
-            if dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, count.value, arr):
-                out.extend(p.handle for p in arr)
-        return True
-
-    user32.EnumDisplayMonitors(None, None, cb_type(_cb), 0)
+    try:
+        picked, _bad = _select(targets, indices)
+        for t in picked:
+            pr = _read_vcp(t["handle"], VCP_POWER_MODE)
+            power = pr[0] if pr else None
+            br = _read_vcp(t["handle"], VCP_BRIGHTNESS)
+            bright = (int(round(br[0] * 100.0 / br[1])) if br[1] else br[0]) if br else None
+            if power == POWER_ON:
+                state, why = "on", "0xD6=1 开"
+            elif power in POWER_LABEL:
+                state, why = "off", "0xD6=%d %s" % (power, POWER_LABEL[power])
+            elif bright is not None:
+                state, why = "on", "亮度可读"
+            else:
+                state, why = "unknown", "DDC 无回读"
+            out.append({"index": t["index"], "dev": t["dev"], "power": power,
+                        "brightness": bright, "state": state, "why": why})
+    finally:
+        release_targets(targets)
     return out
 
 
-def screen_off_many(indices):
-    """批量熄灭（0xD6=2 待机）。indices 空 -> 全部。返回 (成功序号, [(序号, 错误), ...])。"""
-    handles = _physical_handles()
-    if not handles:
-        raise RuntimeError(NO_MONITOR_MSG)
-    targets = list(indices) if indices else list(range(len(handles)))
-    ok, errs = [], []
-    for i in targets:
-        if i < 0 or i >= len(handles):
-            errs.append((i, "序号超出范围"))
-            continue
-        if ctypes.windll.dxva2.SetVCPFeature(handles[i], wintypes.BYTE(0xD6), wintypes.DWORD(2)):
-            ok.append(i)
-        else:
-            errs.append((i, "SetVCPFeature 失败"))
-    return ok, errs
+def _idle_seconds():
+    """距最后一次键鼠输入的秒数；取不到返回 None。
 
-
-def screen_wake_many(indices):
-    """批量点亮（0x60 信号源：切到另一输入口 3 秒再切回）。
-
-    本机实测：0xD6 写回点亮不生效（回读还是假的 on），信号源切换是唯一
-    被单变量验证可靠的软件唤醒路径（端到端 2/2 成功）。
+    系统级熄灭后，屏幕是被"输入"唤醒的，所以这个数字能解释
+    "记账说熄灭、屏幕却亮着"的情况（人一动鼠标就亮了，记账还没更新）。
     """
-    handles = _physical_handles()
-    if not handles:
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    info = LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        now = ctypes.windll.kernel32.GetTickCount()
+        return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return None
+
+
+def _human_gap(seconds):
+    """秒数 -> '3 秒前 / 12 分钟前 / 2 小时前'。"""
+    if seconds < 60:
+        return "%d 秒前" % int(seconds)
+    if seconds < 3600:
+        return "%d 分钟前" % int(seconds // 60)
+    return "%d 小时前" % int(seconds // 3600)
+
+
+def _tick_ms():
+    """系统启动以来的毫秒数（GetTickCount）。取不到返回 0。"""
+    try:
+        return int(ctypes.windll.kernel32.GetTickCount())
+    except Exception:
+        return 0
+
+
+def mark_screen_state(cfg, state):
+    """屏幕状态记账：状态 + 时间点 + （熄灭时）tick。
+
+    tick 是"熄灭之后有没有输入过"的判据来源，见 _screen_woke_by_input。
+    """
+    cfg["screen_state"] = state
+    cfg["screen_state_at"] = stamp_now()
+    cfg["screen_off_tick"] = _tick_ms() if state == "off" else 0
+
+
+def _screen_woke_by_input(cfg):
+    """系统级熄灭之后，只要出现过键鼠输入，屏幕就已经被 Windows 唤醒了。
+
+    判据：`熄灭至今的时长` 明显大于 `当前 idle`，说明期间 idle 被重置过 = 有过输入。
+    （熄灭那一刻的 idle 约等于 0——点按钮本身就是输入，所以留 0.8 秒余量。）
+    只对 system 方式成立：DDC 待机不会因为输入而醒来。
+    """
+    if cfg.get("screen_off_method") == "ddc" or cfg.get("screen_state") != "off":
+        return False
+    off_tick = cfg.get("screen_off_tick") or 0
+    if not off_tick:
+        return False
+    try:
+        now = ctypes.windll.kernel32.GetTickCount()
+    except Exception:
+        return False
+    if off_tick > now:                 # 中间重启过，tick 失效
+        return False
+    idle = _idle_seconds()
+    if idle is None:
+        return False
+    return idle * 1000 + 800 < (now - off_tick)
+
+
+def screen_verdict(cfg, probes=None):
+    """给出"屏幕现在是亮还是灭"的**一句话结论** + 一行依据。
+
+    判据优先级（越靠前越硬）：
+      1) `_screen_woke_by_input()`：熄灭后出现过输入 → 屏幕已被系统唤醒（结论：亮）；
+      2) 软件记账：我们熄灭后再没有输入 → 仍然是灭的；
+      3) DDC 回读：只作为一行证据展示 —— `0xD6` 会撒谎（实测待机时仍报 1），
+         之前把它直接当结论，才会出现"明明黑着却显示亮"。
+    返回 {"state": "on"/"off"/"unknown", "text": "...", "detail": "..."}。
+    """
+    at = (cfg.get("screen_state_at") or "").strip()
+    woke = _screen_woke_by_input(cfg)
+    state = "on" if woke else cfg.get("screen_state", "on")
+    idle = _idle_seconds()
+
+    if state == "off":
+        text = "屏幕：熄灭中" + ("（%s 熄灭）" % at if at else "")
+        tail = "点「点亮显示器」或动一下鼠标/键盘即可恢复"
+    elif woke:
+        text = "屏幕：亮着" + ("（%s 熄灭后被键鼠输入唤醒）" % at if at else
+                              "（熄灭后收到键鼠输入，已自动唤醒）")
+        tail = "系统级熄灭由 Windows 恢复，输入即亮"
+    elif state == "on":
+        text = "屏幕：亮着" + ("（%s 点亮）" % at if at else "")
+        tail = "物理电源键、Windows 自动熄屏不在追踪范围内"
+    else:
+        text, tail = "屏幕：状态未知", ""
+
+    if probes is None:
+        try:
+            probes = probe_states()
+        except Exception:
+            probes = []
+    bits = ["记账为主"]
+    if probes:
+        # 结论行要人话；原始寄存器值留给 --probe / --diag
+        bits.append("DDC 回读 %s（会撒谎，仅参考）"
+                    % "、".join("%d=%s" % (p["index"],
+                                          {"on": "开", "off": "灭"}.get(p["state"], "未知"))
+                                for p in probes))
+    else:
+        bits.append("DDC 无回读")
+    if idle is not None:
+        bits.append("上次输入 %s" % ("刚发生" if idle < 2 else _human_gap(idle)))
+    detail = "依据：" + " · ".join(bits) + ("｜" + tail if tail else "")
+    return {"state": state, "text": text, "detail": detail, "woke_by_input": woke}
+
+
+# ---- 熄屏 / 点亮 ----------------------------------------------------------
+# ⚠️ 硬件红线，两条，都有本机实测事故背书：
+# 1) **绝不用 `0xD6=4/5`（软关/硬关）** —— 面板进固件级熄灭，DDC 点亮 / 驱动重启 /
+#    拓扑重握手 / 信号源切换全部唤不醒，只有物理电源键能救。
+# 2) **v1.7.0 现场事故：`0xD6=2`（待机）也不该用来熄灭** ——
+#    本机写 `0xD6=2` 后：回读仍是 `1`、亮度照样读得到，但面板背光真的灭了；
+#    随后 `0xD6=1`、写亮度、`0x60` 切源（4 秒往返 + 补发）全部救不回来，
+#    最后靠物理电源键恢复。结论：**"熄灭"容易，"点亮"却不由软件决定**。
+#
+# 所以 v1.7.1 起，熄灭改走 Windows 系统级：
+#     SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)
+#   - 恢复由系统负责（`SC_MONITORPOWER -1` 一定亮回来），不依赖面板固件；
+#   - 代价是只能整组熄灭，不能只灭其中几台 —— 对防窥场景没有区别。
+#   DDC 待机方式保留为高级选项（`screen_off_method=ddc`），默认关闭。
+SC_MONITORPOWER = 0xF170
+SC_OFF = 2          # 关闭显示器（比 1 低功耗更彻底，系统仍能恢复）
+SC_ON = -1          # 点亮显示器
+_WM_SYSCOMMAND = 0x0112
+_HWND_BROADCAST = 0xFFFF
+
+# 唤醒分级：DDC 方式下的顺序，从"最标准、最不可能把屏搞黑"的一招开始。
+# 为什么不再一上来就切信号源（v1.6.x 的做法）：
+#   旧代码把"切到另一个输入"写死成 4（DVI-2）。现代显示器基本没有 DVI-2，
+#   切过去等于切到无信号口 → 面板进省电，再切回来能不能醒取决于链路重训练，
+#   于是表现为"有时行、有时不行"。若这台屏还同时插了 DP+HDMI 两根线，
+#   切到 HDMI 正好切到 Windows 没在驱动的那个空口上，画面直接黑在空口。
+WAKE_STAGE_LABEL = {1: "电源模式", 2: "写亮度", 3: "系统输入", 4: "切信号源"}
+
+
+def _broadcast_monitor_power(flag):
+    """向系统广播"显示器电源"命令，返回是否下发成功。"""
+    try:
+        return bool(ctypes.windll.user32.SendMessageTimeoutW(
+            _HWND_BROADCAST, _WM_SYSCOMMAND, SC_MONITORPOWER, flag, 0, 2000, None))
+    except Exception:
+        return False
+
+
+def screen_off_system():
+    """系统级熄灭全部显示器（可恢复）。"""
+    return _broadcast_monitor_power(SC_OFF)
+
+
+def screen_on_system():
+    """系统级点亮，并补一次输入事件（Windows 有时不主动重发画面）。"""
+    ok = _broadcast_monitor_power(SC_ON)
+    _nudge_user_input()
+    return ok
+
+
+def _nudge_user_input():
+    """喂一次真实的用户输入事件。
+
+    Windows 有时在收到点亮命令后仍不重发画面（它仍认为显示器处于关闭状态），
+    一次微小的鼠标移动就能把它踢回"有显示"。移 1 像素再移回来，肉眼无感。
+    """
+    try:
+        u = ctypes.windll.user32
+        u.mouse_event(0x0001, 1, 0, 0, 0)      # MOUSEEVENTF_MOVE
+        u.mouse_event(0x0001, -1, 0, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _switch_input_roundtrip(t):
+    """切到"另一个真实支持的输入源"，等 2 秒再切回来。返回两端是否都下发成功。
+
+    选源规则（顺序即优先级）：
+      1) 能力串里 0x60 声明支持的口（真实存在的口）；
+      2) 其中只留 DP/HDMI（15~19）—— 模拟/DVI/复合口切过去基本等于无信号；
+      3) 优先挑"与当前口异类"的：当前在 DP 就先试 HDMI，反之亦然，
+         因为双线接法下另一根线通常是另一种口，切过去有极大概率真的有信号。
+    **不再用旧版的 4（DVI-2）**：那是多数显示器根本没接的口，切过去即黑屏。
+    """
+    h = t["handle"]
+    got = _read_vcp(h, VCP_INPUT_SOURCE)
+    if not got:
+        return False
+    cur = got[0]
+    declared = [c for c in _caps_inputs(_capabilities_cached(h, t.get("dev")))
+                if 15 <= c <= 19]
+    cand = [c for c in (declared or [15, 16, 17, 18, 19]) if c != cur]
+    if not cand:
+        return False
+    cur_is_dp = 15 <= cur <= 16
+    cand.sort(key=lambda c: (cur_is_dp == (15 <= c <= 16), c))
+    if not _write_vcp(h, VCP_INPUT_SOURCE, cand[0]):
+        return False
+    time.sleep(2)
+    return _write_vcp(h, VCP_INPUT_SOURCE, cur)
+
+
+def _wake_one(t, allow_switch=True, expect_off=True):
+    """分级唤醒单台显示器。返回 (命令是否都下发成功, 走到第几级, 说明)。
+
+    ⚠️ **不用 `0xD6` 回读判断"醒了没有"**（v1.7.0 现场取证）：
+    本机写入 `0xD6=2` 待机之后，回读仍是 `1`、`0x10` 亮度也照样读得到。
+    拿它当判据就会出现"程序说点亮成功、屏幕其实黑着"——和 v1.5.0 熄屏事故同源。
+    所以这里只保证"该发的命令都发到位"，真实亮灭交给「检测亮灭」+ 眼睛。
+
+    顺序按"危害从小到大"，前三步都不碰信号源：
+      1 `0xD6=1` 电源模式=开（标准唤醒命令，无害）
+      2 写回当前亮度（部分固件靠收到 VCP 写入才醒）
+      3 **让系统把显示输出关一次再打开**（SC_MONITORPOWER 2→-1）+ 输入注入。
+        依据：显示器"亮着却黑屏"的公开排查一致指向 GPU 与面板握手失败，
+        标准恢复手段就是切一次显示模式 / 让输出重新上电。此时屏幕本来就是黑的，
+        重驱动不会造成额外闪烁。
+      4 切信号源（唯一可能把屏切到空口的一招：受 allow_switch 控制，
+        并且只在"软件确实熄过这块屏"时才做，避免给亮着的屏白闪 2 秒）
+    """
+    h = t["handle"]
+    wrote = False
+    stage = 0
+
+    if _write_vcp(h, VCP_POWER_MODE, POWER_ON):
+        wrote, stage = True, 1
+        time.sleep(0.35)
+
+    cur = _read_vcp(h, VCP_BRIGHTNESS)
+    if cur and _write_vcp(h, VCP_BRIGHTNESS, cur[0]):
+        wrote, stage = True, 2
+        time.sleep(0.35)
+
+    if not wrote:
+        # 两个最基本的写都不通，后面切信号源也不会通，早点收工别让用户干等
+        return False, 0, "显示器未响应 DDC/CI（电源 / 亮度写入均失败）"
+
+    output_recycled = False
+    if not expect_off:
+        _nudge_user_input()          # 屏幕本来就亮着：只喂输入，别去动输出
+    else:
+        output_recycled = _output_recycle()
+        _nudge_user_input()
+    stage = max(stage, 3)
+    time.sleep(0.35)
+
+    if not allow_switch:
+        return wrote, stage, "已下发电源/亮度/输出重驱动（切信号源已禁用）"
+    if not expect_off:
+        return wrote, stage, "已下发电源/亮度/系统输入（未熄过屏，跳过切信号源）"
+    if not _switch_input_roundtrip(t):
+        note = "切信号源失败（前几级已下发）"
+        if output_recycled:
+            note += "，输出已重新驱动过"
+        return wrote, stage, note
+    return wrote, 4, "已下发电源/亮度/输出重驱动/信号源切换"
+
+
+def _output_recycle():
+    """把显示输出关一次再打开，强制 GPU 与面板重新握手。
+
+    返回是否两次下发都成功。依据见 _wake_one 第 3 步的说明。
+    """
+    off_ok = _broadcast_monitor_power(SC_OFF)
+    time.sleep(0.8)
+    on_ok = _broadcast_monitor_power(SC_ON)
+    return off_ok and on_ok
+
+
+def screen_off_many(indices, allow_undeclared=False):
+    """批量熄灭（DDC 待机 0xD6=2）。indices 空 -> 全部。
+
+    ⚠️ 先查面板能力串：**没声明支持 02（待机）的一律跳过**，不做"写写看"。
+    依据：MS Learn 的 SetVCPFeature 文档明确警告盲写未实现的 MCCS 值会导致
+    "undefined monitor behavior"；本机面板正是不支持 02 却被盲写，
+    结果进入了 DDC 能读、背光却唤不回来的状态。
+    """
+    targets = enumerate_targets()
+    if not targets:
         raise RuntimeError(NO_MONITOR_MSG)
-    targets = list(indices) if indices else list(range(len(handles)))
-    dxva2 = ctypes.windll.dxva2
     ok, errs = [], []
-    for i in targets:
-        if i < 0 or i >= len(handles):
-            errs.append((i, "序号超出范围"))
-            continue
-        h = handles[i]
-        cur, mx = wintypes.DWORD(), wintypes.DWORD()
-        if not dxva2.GetVCPFeatureAndVCPFeatureReply(h, wintypes.BYTE(0x60), None,
-                                                     ctypes.byref(cur), ctypes.byref(mx)):
-            errs.append((i, "读信号源失败"))
-            continue
-        cur = cur.value
-        other = 17 if cur != 17 else 4
-        if not dxva2.SetVCPFeature(h, wintypes.BYTE(0x60), wintypes.DWORD(other)):
-            errs.append((i, "切换信号源失败"))
-            continue
-        time.sleep(3)
-        if not dxva2.SetVCPFeature(h, wintypes.BYTE(0x60), wintypes.DWORD(cur)):
-            errs.append((i, "切回信号源失败"))
-            continue
-        ok.append(i)
+    try:
+        picked, bad = _select(targets, indices)
+        errs.extend(bad)
+        for t in picked:
+            declared = _caps_power(_capabilities_cached(t["handle"], t["dev"]))
+            if POWER_STANDBY not in declared and not allow_undeclared:
+                errs.append((t["index"], "面板未声明支持待机(0xD6=2)%s，已跳过"
+                             "（要强制启用请重选「单屏待机」并确认风险）"
+                             % ("，只支持 %s" % "/".join(str(v) for v in declared)
+                                if declared else "（能力串也读不到）")))
+                continue
+            if _write_vcp(t["handle"], VCP_POWER_MODE, POWER_STANDBY):
+                ok.append(t["index"])
+            else:
+                errs.append((t["index"], "SetVCPFeature 失败"))
+    finally:
+        release_targets(targets)
     return ok, errs
+
+
+def screen_wake_many(indices, allow_switch=True, expect_off=True):
+    """批量点亮（分级唤醒，并行执行）。indices 空 -> 全部。
+
+    并行是因为每台要 0.6~6 秒，两台串行就翻倍；不同显示器的 DDC 句柄互相独立，
+    并行写是安全的（型号名读取早就这么干了）。
+    allow_switch=False 关掉"切信号源"这最后一招（双线接法可避免切到空口）。
+    expect_off=False 表示"屏幕可能本来就亮着"，此时先探测、亮着就跳过。
+    返回 (成功序号, [(序号, 错误), ...])，错误文案带走到第几级。
+    """
+    targets = enumerate_targets()
+    if not targets:
+        raise RuntimeError(NO_MONITOR_MSG)
+    picked, bad = _select(targets, indices)
+    results = {}
+
+    def work(t):
+        try:
+            results[t["index"]] = _wake_one(t, allow_switch, expect_off)
+        except Exception as e:
+            results[t["index"]] = (False, 0, str(e))
+
+    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(30)
+
+    ok, errs = [], list(bad)
+    try:
+        for t in picked:
+            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
+            if done:
+                ok.append(t["index"])
+            else:
+                errs.append((t["index"], "第 %d 级（%s）：%s"
+                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
+    finally:
+        release_targets(targets)
+    return ok, errs
+
+
+# ---- 对外统一入口：按配置的熄灭方式分派 -----------------------------------
+def _monitor_count():
+    """当前显示器台数（只为报数，句柄立刻还掉）。"""
+    targets = enumerate_targets()
+    try:
+        return len(targets)
+    finally:
+        release_targets(targets)
+
+
+def _system_ok_targets(indices):
+    """系统级动作没有"每台"的概念，用动作前选中的序号充数（空 = 全部）。"""
+    return normalize_indices(indices) or list(range(_monitor_count()))
+
+
+def screen_off_cfg(cfg, indices):
+    """熄灭显示器。system（默认）= 整组系统级；ddc = 逐台 0xD6=2（可能唤不回）。
+
+    返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状，
+    这样界面与 CLI 不用关心底层是哪种方式。
+    """
+    if cfg.get("screen_off_method") == "ddc":
+        return screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
+    if not screen_off_system():
+        return [], [(-1, "系统级熄灭下发失败")]
+    return _system_ok_targets(indices), []
+
+
+def screen_on_cfg(cfg, indices):
+    """点亮显示器。system（默认）= 系统级点亮；ddc = 分级 DDC 唤醒。"""
+    if cfg.get("screen_off_method") == "ddc":
+        return screen_wake_many(indices, **wake_options(cfg))
+    if not screen_on_system():
+        return [], [(-1, "系统级点亮下发失败")]
+    return _system_ok_targets(indices), []
 
 
 # ============================================================
@@ -542,6 +1237,55 @@ def current_level(cfg=None, now=None):
     return active_slot(_slot_minutes(cfg), _minutes(now))[1]
 
 
+def resolve_monitors(cfg):
+    """把"用户选过的显示器"解析成**当前**的下标列表。
+
+    配置里存两份：monitors（下标）+ monitor_ids（设备名，如 DISPLAY1）。
+    设备名由输出口决定、同一次会话内稳定；下标却会随显卡驱动与接线重排。
+    只存下标就会出现"熄的是这块、开机后点的是那块"——这是换电脑/换线后
+    点亮失效最典型的一种形态，所以解析时优先认设备名。
+
+    返回 [] 表示"全部显示器"（与界面上"一个都不勾 = 全部"一致）。
+    """
+    ids = cfg.get("monitor_ids") or []
+    if ids:
+        targets = enumerate_targets()
+        try:
+            by_dev = {t["dev"]: t["index"] for t in targets}
+        finally:
+            release_targets(targets)      # 只借一瞬，别把句柄漏在这
+        hit = sorted({by_dev[d] for d in ids if d in by_dev})
+        if hit:
+            return hit
+    return normalize_indices(cfg.get("monitors"))
+
+
+def selection_payload(indices, targets=None):
+    """把界面勾选结果变成 (monitors, monitor_ids) 两份配置值。
+
+    下标给人看、也兼容旧配置；设备名给下次启动兜底。两者一起存才是稳的。
+    空选择 = 全部显示器，此时锚点也留空（否则"全部"会被锚死成当时那几台）。
+    """
+    idx = normalize_indices(indices)
+    if not idx:
+        return [], []
+    owned = targets is None
+    if owned:
+        targets = enumerate_targets()
+    try:
+        by_index = {t["index"]: t["dev"] for t in targets}
+        return idx, [by_index[i] for i in idx if i in by_index]
+    finally:
+        if owned:
+            release_targets(targets)
+
+
+def wake_options(cfg):
+    """唤醒策略的两个开关，CLI 与界面共用。"""
+    return {"allow_switch": bool(cfg.get("wake_switch_input", True)),
+            "expect_off": cfg.get("screen_state") != "on"}
+
+
 def apply_schedule(cfg=None):
     """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
 
@@ -554,17 +1298,18 @@ def apply_schedule(cfg=None):
     slot = active_slot_dict(cfg.get("slots", []), _minutes())
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
-    ok, errs = set_brightness_many(cfg.get("monitors"), level)
+    targets = resolve_monitors(cfg)
+    ok, errs = set_brightness_many(targets, level)
     if screen == "off":
-        sok, serrs = screen_off_many(cfg.get("monitors"))
+        sok, serrs = screen_off_cfg(cfg, targets)
     elif screen == "on":
-        sok, serrs = screen_wake_many(cfg.get("monitors"))
+        sok, serrs = screen_on_cfg(cfg, targets)
     else:
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
     if screen in ("off", "on") and ok:
-        cfg["screen_state"] = screen
+        mark_screen_state(cfg, screen)
         if internal:
             save_config(cfg)
     return level, screen, ok, errs
@@ -820,46 +1565,6 @@ def query_task_status():
     return out if code == 0 else ""
 
 
-def _format_task_line(name, short, rest, slots=None):
-    """把一条任务状态渲染成人读的文本；rest 为 None 表示这次查询没拿到它。
-
-    slots 为当前配置的档位列表 —— 有 TRIG 数据（本地 XML 快路径）时，
-    定时行会展开成系统里**实际注册**的触发时间清单，并与配置档位联显
-    （时间对不上的档会标注"当前配置中无此档"，方便发现配置与注册不同步）。
-    """
-    if rest is None:
-        return "%s：读取失败" % short
-    if rest == "MISSING":
-        return "%s：未注册" % short
-    bits = rest.split("|")
-    state = "已启用" if bits[0] == "Ready" else bits[0]
-    nxt = (bits[1] if len(bits) > 1 else "").strip()
-    swa = "补跑已开" if any("True" in b for b in bits[2:]) else "补跑未开"
-    if name == TASK_CATCHUP:
-        # 登录触发没有"下次运行时间"，显示成校准时机更有意义
-        return "%s：%s · 登录时校准 · %s" % (short, state, swa)
-    head = "%s：%s · 下次 %s · %s" % (short, state, nxt or "—", swa)
-    trig = ""
-    for b in bits:
-        if b.startswith("TRIG="):
-            trig = b[5:]
-            break
-    if not trig or not slots:
-        return head
-    by_time = {x.get("time"): x for x in slots}
-    lines = [head]
-    for m in sorted(int(v) for v in trig.split(",") if v.strip().isdigit()):
-        hhmm = "%02d:%02d" % (m // 60, m % 60)
-        x = by_time.get(hhmm)
-        if x is None:
-            lines.append("   • %s（当前配置中无此档）" % hhmm)
-        else:
-            act = "（同时熄屏）" if x.get("screen") == "off" else \
-                  "（同时点亮）" if x.get("screen") == "on" else ""
-            lines.append("   • %s → %d%%%s" % (hhmm, x.get("level", 0), act))
-    return "\n".join(lines)
-
-
 def _as_ok_errs(result):
     """把 run_bg 的结果统一成 (成功列表, 失败列表)。
 
@@ -913,6 +1618,8 @@ def apply_dark_theme(root):
     style.configure("TLabel", background=D["bg"], foreground=D["fg"])
     style.configure("Dim.TLabel", background=D["bg"], foreground=D["fg_dim"])
     style.configure("Hint.TLabel", background=D["surface"], foreground=D["fg_dim"])
+    # 结论行：surface 底 + 正常字色（比 Hint 更"显眼"，一眼能读到结果）
+    style.configure("Value.TLabel", background=D["surface"], foreground=D["fg"])
 
     style.configure("TLabelframe", background=D["surface"], bordercolor=D["border"],
                     relief="solid", borderwidth=1)
@@ -970,6 +1677,14 @@ def apply_dark_theme(root):
     # 滑块用中性灰；槽比背景略深一点点即可，不用高饱和色
     style.configure("TScale", background=D["slider"], troughcolor=D["field"],
                     bordercolor=D["border"], lightcolor=D["slider"], darkcolor=D["slider"])
+
+    # 滚动条（内容区超过屏幕高度时才出现）
+    style.configure("Vertical.TScrollbar", background=D["button"],
+                    troughcolor=D["bg"], bordercolor=D["bg"],
+                    arrowcolor=D["fg_dim"], lightcolor=D["button"],
+                    darkcolor=D["button"])
+    style.map("Vertical.TScrollbar",
+              background=[("active", D["button_hover"])])
 
     # 勾选框：换掉指示器元素（见 install_dark_tickbox 里的依据说明）
     install_dark_tickbox(style, root)
@@ -1084,13 +1799,96 @@ def cli_apply_schedule():
 
 
 def cli_list():
-    monitors = list_monitors()
-    if not monitors:
+    """列出显示器（含设备名 / 分辨率 / 主副屏 / 当前输入源）。"""
+    targets = enumerate_targets()
+    if not targets:
         _err(NO_MONITOR_MSG)
         sys.exit(1)
-    info = enum_displays()
-    for i, m in enumerate(monitors):
-        _out(monitor_label(i, m, info[i] if i < len(info) else None))
+    try:
+        for t in targets:
+            line = monitor_label(t["index"], (t["dev"], t["w"], t["h"], t["primary"]))
+            src = _read_vcp(t["handle"], VCP_INPUT_SOURCE)
+            if src:
+                line += " · %s" % INPUT_LABEL.get(src[0], "输入源 %d" % src[0])
+            _out(line)
+    finally:
+        release_targets(targets)
+    sys.exit(0)
+
+
+def cli_probe():
+    """打印"亮还是灭"的结论 + 每台的回读证据（只读 DDC，不写任何寄存器）。"""
+    cfg = load_config()
+    try:
+        states = probe_states()
+    except Exception as e:
+        _err(e)
+        sys.exit(1)
+    _out(screen_verdict(cfg, states)["text"])
+    for s in states:
+        _out("  显示器 %d（%s）：回读 %s — %s"
+             % (s["index"], s["dev"],
+                {"on": "亮", "off": "灭"}.get(s["state"], "未知"), s["why"]))
+    if states:
+        _out("  说明：0xD6 回读不可信（待机时仍报 1），结论以上面那行为准（软件记账）")
+    sys.exit(0)
+
+
+def cli_diag():
+    """打印一份只读诊断报告（给"另一台电脑上点不亮"取证用）。
+
+    刻意把"同一个物理屏被枚举成几个输出""现在每个输出的输入源是什么"
+    都打出来：DP+HDMI 双线接法下，这两项直接决定"点亮"会不会切到空口。
+    """
+    _out("MonitorBrightness v%s 诊断报告" % APP_VERSION)
+    _out("Python %s · 打包态=%s · 配置=%s"
+         % (sys.version.split()[0], bool(getattr(sys, "frozen", False)), CONFIG_FILE))
+    cfg = load_config()
+    _out("配置：presets=%s · 熄灭方式=%s · 记录屏幕状态=%s"
+         % (cfg.get("presets"), cfg.get("screen_off_method"), cfg.get("screen_state")))
+    _out("配置里的显示器选择：monitors=%s · monitor_ids=%s"
+         % (cfg.get("monitors"), cfg.get("monitor_ids")))
+
+    targets = enumerate_targets()
+    if not targets:
+        _out("")
+        _out(NO_MONITOR_MSG)
+        sys.exit(1)
+    try:
+        _out("")
+        _out("一、枚举结果（共 %d 个输出，即界面上的行数）" % len(targets))
+        for t in targets:
+            pow_ = _read_vcp(t["handle"], VCP_POWER_MODE)
+            src = _read_vcp(t["handle"], VCP_INPUT_SOURCE)
+            lum = _read_vcp(t["handle"], VCP_BRIGHTNESS)
+            caps = _capabilities(t["handle"])
+            _out("  [%d] %s  %d×%d  %s  desc=%r"
+                 % (t["index"], t["dev"], t["w"], t["h"],
+                    "主屏" if t["primary"] else "副屏", t["desc"]))
+            _out("      电源 0xD6=%s · 输入源 0x60=%s · 亮度 0x10=%s"
+                 % (pow_[0] if pow_ else "不可读", src[0] if src else "不可读",
+                    lum[0] if lum else "不可读"))
+            _out("      型号=%r · 支持输入源=%s · 支持电源值 0xD6=%s"
+                 % (_caps_model(caps), _caps_inputs(caps) or "读不到",
+                    _caps_power(caps) or "读不到"))
+
+        _out("")
+        _out("二、程序实际会操作的序号（按设备名锚点解析）")
+        _out("  resolve_monitors() -> %s" % (resolve_monitors(cfg) or "[]（= 全部）"))
+
+        _out("")
+        _out("三、亮灭判定")
+        for s in probe_states():
+            _out("  [%d] %s -> %s（%s）"
+                 % (s["index"], s["dev"],
+                    {"on": "亮", "off": "灭"}.get(s["state"], "未知"), s["why"]))
+
+        _out("")
+        _out("四、定时任务")
+        for line in (query_task_status() or "").splitlines():
+            _out("  " + line)
+    finally:
+        release_targets(targets)
     sys.exit(0)
 
 
@@ -1109,7 +1907,15 @@ def cli_selftest():
 
 
 # ============================================================
-# 七、图形界面（tkinter，深色）
+# 七、图形界面（tkinter · Apple 风格深色）
+# ------------------------------------------------------------
+# 设计取向（2026-11 改版，参照 Apple HIG 的 Clarity / Deference / Depth）：
+#   - 主界面只放日常操作：状态卡 + 显示器 + 亮度 + 定时；
+#   - 托盘 / 自启 / 热键 / 熄灭方式 / 预设数值 全部收进「设置」；
+#   - 解释性文案收进「说明」，界面上不再铺满灰色小字；
+#   - 分组用卡片 + 行分隔，动作按钮按"当前可执行"决定主次并置灰不可用项。
+# tkinter 没有圆角/模糊：圆角用 4 个角上的 Canvas 画四分之一圆补出来，
+# 弹层没有毛玻璃，用纯色遮罩代替 —— 其余结构 1:1 还原设计稿。
 # ============================================================
 # 自绘指示器图片的引用要留着，PhotoImage 被回收后控件就空白了
 _TICKBOX_IMAGES = []
@@ -1129,61 +1935,51 @@ def _raster_line(x0, y0, x1, y1, thick=2):
 
 
 def _tickbox_image(size, fill, border, mark=None, mark_color=None):
-    """生成一张勾选框指示器图片（纯代码绘制，不依赖外部图片文件）。"""
-    img = tk.PhotoImage(width=size, height=size)
-    img.put(fill, to=(0, 0, size, size))
-    img.put(border, to=(0, 0, size, 1))
-    img.put(border, to=(0, size - 1, size, size))
-    img.put(border, to=(0, 0, 1, size))
-    img.put(border, to=(size - 1, 0, size, size))
-    for (x, y) in (mark or ()):
-        if 0 <= x < size and 0 <= y < size:
-            img.put(mark_color, to=(x, y, x + 1, y + 1))
-    _TICKBOX_IMAGES.append(img)
-    return img
+    """抗锯齿圆角勾选框（Pillow 4x 渲染 + LANCZOS 缩小，四角透明）。
+
+    mark 传对勾折线的顶点序列 [(x, y), ...]（1x 坐标），用带 joint 的
+    宽线绘制，比逐像素 put 平滑得多。
+    """
+    img = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, size * 4 - 1, size * 4 - 1],
+                        radius=4 * 4, fill=_hex_rgba(fill))
+    if mark:
+        pts = [(x * 4, y * 4) for x, y in mark]
+        d.line(pts, fill=_hex_rgba(mark_color or "#ffffff"),
+               width=8, joint="curve")
+    out = img.resize((size, size), Image.LANCZOS)
+    ph = ImageTk.PhotoImage(out)
+    _TICKBOX_IMAGES.append(ph)
+    return ph
 
 
 def install_dark_tickbox(style, root=None):
-    """把 TCheckbutton 的指示器换成自绘图片，得到一个能正常显示的深色勾选框。
+    """把 TCheckbutton 的指示器换成自绘图片，得到深色下可辨认的勾选框。
 
-    为什么必须这么做（都有依据，不是猜的）：
-      - Tk 官方手册里 TCheckbutton 可配置的选项只有 background / foreground /
-        indicatorbackground / indicatorcolor / indicatormargin / indicatorrelief / padding；
-      - 本机 Tk 自带的 ttk/clamTheme.tcl 对勾选框**只开放 -indicatorbackground**
-        （默认值还是 #ffffff 白底），选中态那个图形是 C 层绘制的，
-        改 indicatorcolor 无效（像素实测：选中态没有任何白色像素），
-        深色底下几乎看不清勾没勾；
-      - 换 alt 主题能画出正常对勾，但它的指示器底色不吃深色配置。
-    → ttk 官方的正当做法（ttk::style 的 element_create / layout）是用自己的图片
-      替换 Checkbutton.indicator 元素。这样仍然是**真正的 ttk.Checkbutton**，
-      变量绑定、键盘空格、禁用态等行为都保留。
+    依据：本机 Tk 自带的 clamTheme 对勾选框只开放 -indicatorbackground，
+    选中态图形是 C 层画的，改 indicatorcolor 无效（实测无白色像素）。
+    正当做法是 ttk::style 的 element_create + layout 换掉 Checkbutton.indicator，
+    这样仍然是原生 ttk.Checkbutton，变量绑定/键盘空格/禁用态都保留。
     """
-    D = DARK
-    size = 14
-    img_off = _tickbox_image(size, D["field"], D["border"])
-    img_on = _tickbox_image(size, D["accent"], D["accent"],
-                            mark=_raster_line(3.5, 7.5, 6.0, 10.0) |
-                                 _raster_line(6.0, 10.0, 10.5, 4.5),
-                            mark_color=D["accent_fg"])
-    img_off_dim = _tickbox_image(size, D["surface"], D["border"])
-    img_on_dim = _tickbox_image(size, D["border"], D["border"],
-                                mark=_raster_line(3.5, 7.5, 6.0, 10.0) |
-                                     _raster_line(6.0, 10.0, 10.5, 4.5),
-                                mark_color=D["fg_dim"])
+    size = 15
+    img_off = _tickbox_image(size, UI["fill"], UI["fill"])
+    img_on = _tickbox_image(size, UI["accent"], UI["accent"],
+                            mark=((3.5, 7.5), (6.2, 10.8), (11.2, 4.5)),
+                            mark_color="#ffffff")
+    img_off_dim = _tickbox_image(size, UI["card"], UI["sep"])
 
     try:
         style.element_create("Dark.tickbox", "image", img_off,
                              ("selected", img_on),
-                             ("disabled", img_off_dim),
-                             ("selected", "disabled", img_on_dim))
+                             ("disabled", img_off_dim))
     except Exception:
-        pass   # 同一解释器里重复注册会报"已存在"，忽略即可
-    # 间距走文档里的 indicatormargin（左 上 右 下），不能给 Checkbutton.label 塞 padding
-    style.configure("TCheckbutton", background=D["surface"], foreground=D["fg"],
-                    indicatormargin=(1, 1, 8, 1), padding=2)
+        pass
+    style.configure("TCheckbutton", background=UI["card"], foreground=UI["text"],
+                    indicatormargin=(0, 0, 8, 0), padding=0)
     style.map("TCheckbutton",
-              background=[("active", D["surface"])],
-              foreground=[("disabled", D["fg_dim"])])
+              background=[("active", UI["card"])],
+              foreground=[("disabled", UI["text3"])])
     style.layout("TCheckbutton", [
         ("Checkbutton.padding", {"sticky": "nswe", "children": [
             ("Dark.tickbox", {"side": "left", "sticky": ""}),
@@ -1195,12 +1991,7 @@ def install_dark_tickbox(style, root=None):
 
 
 class DarkBox:
-    """深色模态消息框：messagebox 的替代品。
-
-    原因：messagebox 是 Windows 原生对话框，不吃 ttk 深色主题；
-    实测 SetPreferredAppMode(ForceDark) 只能暗标题栏、内容区仍为浅色（A/B 截图）。
-    模态模式（Toplevel + grab_set + wait_window）与 CustomTkinter 的对话框一致。
-    """
+    """深色模态消息框：messagebox 的替代品（原生对话框不吃深色主题）。"""
 
     _ICONS = {"info": ("\u2139", "#4a9eff"),
               "warn": ("\u26a0", "#e5c07b"),
@@ -1211,23 +2002,30 @@ class DarkBox:
 
     def _show(self, kind, title, message):
         dlg = tk.Toplevel(self.root)
+        dlg.withdraw()          # 防双屏跳位：定位完成前不显示
         dlg.title(title)
         dlg.resizable(False, False)
-        dlg.configure(background=DARK["surface"])
+        dlg.configure(background=UI["card"])
         apply_dark_titlebar(dlg)
         icon, color = self._ICONS[kind]
-        body = tk.Frame(dlg, background=DARK["surface"])
+        body = tk.Frame(dlg, background=UI["card"])
         body.pack(fill="both", expand=True, padx=20, pady=(18, 4))
-        tk.Label(body, text=icon, fg=color, bg=DARK["surface"],
+        tk.Label(body, text=icon, fg=color, bg=UI["card"],
                  font=("Segoe UI Symbol", 18)).pack(side="left", padx=(0, 14))
-        tk.Label(body, text=message, fg=DARK["fg"], bg=DARK["surface"],
+        tk.Label(body, text=message, fg=UI["text"], bg=UI["card"],
                  font=("Microsoft YaHei UI", 10), justify="left",
                  wraplength=400).pack(side="left")
-        btn = ttk.Button(dlg, text="确定", style="Accent.TButton", command=dlg.destroy)
-        btn.pack(pady=(6, 16))
-        btn.focus_set()
+        btn = Button(dlg, "确定", dlg.destroy, kind="primary", width=96,
+                     height=32, pad_bg=UI["card"])
+        btn.pack(pady=(8, 16))
         dlg.bind("<Return>", lambda e: dlg.destroy())
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self._center(dlg)
+        dlg.wait_visibility()
+        dlg.grab_set()
+        dlg.wait_window()
+
+    def _center(self, dlg):
         dlg.transient(self.root)
         dlg.update_idletasks()
         x = self.root.winfo_rootx() + max(0, (self.root.winfo_width()
@@ -1235,9 +2033,7 @@ class DarkBox:
         y = self.root.winfo_rooty() + max(0, (self.root.winfo_height()
                                               - dlg.winfo_height()) // 2)
         dlg.geometry("+%d+%d" % (x, y))
-        dlg.wait_visibility()
-        dlg.grab_set()
-        dlg.wait_window()
+        dlg.deiconify()
 
     def showinfo(self, title, message):
         self._show("info", title, message)
@@ -1248,28 +2044,682 @@ class DarkBox:
     def showerror(self, title, message):
         self._show("error", title, message)
 
+    def askyesno(self, title, message, yes="继续", no="取消"):
+        """是/否确认框（深色）。返回 True/False。"""
+        answer = {"ok": False}
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.configure(background=UI["card"])
+        apply_dark_titlebar(dlg)
+        body = tk.Frame(dlg, background=UI["card"])
+        body.pack(fill="both", expand=True, padx=20, pady=(18, 4))
+        tk.Label(body, text="\u26a0", fg="#e5c07b", bg=UI["card"],
+                 font=("Segoe UI Symbol", 18)).pack(side="left", padx=(0, 14))
+        tk.Label(body, text=message, fg=UI["text"], bg=UI["card"],
+                 font=("Microsoft YaHei UI", 10), justify="left",
+                 wraplength=420).pack(side="left")
+        btns = tk.Frame(dlg, background=UI["card"])
+        btns.pack(pady=(8, 16))
 
-class MonitorPanel(ttk.LabelFrame):
-    """显示器勾选区（View）：只管勾选行的创建与显示，业务在 App。"""
+        def _close(ok):
+            answer["ok"] = ok
+            dlg.destroy()
+
+        Button(btns, no, lambda: _close(False), kind="secondary", width=88,
+               height=32, pad_bg=UI["card"]).pack(side="left", padx=4)
+        Button(btns, yes, lambda: _close(True), kind="primary", width=96,
+               height=32, pad_bg=UI["card"]).pack(side="left", padx=4)
+        dlg.bind("<Escape>", lambda e: _close(False))
+        dlg.bind("<Return>", lambda e: _close(True))
+        self._center(dlg)
+        dlg.wait_visibility()
+        dlg.grab_set()
+        dlg.wait_window()
+        return answer["ok"]
+
+
+class ScrollArea(ttk.Frame):
+    """可滚动内容容器（Canvas + 内部 Frame + 滚动条）。
+
+    设置项一多窗口就会超过 1080p 的可用高度（实测 5 个档位时 1117px），
+    底部控件就点不到了。高度按屏幕封顶，超出才出现滚动条。
+    """
+
+    def __init__(self, root, bg, on_fit=None):
+        super().__init__(root)
+        self._on_fit = on_fit
+        # 标题栏 + 上下边距在部分 DPI 下不止 140px，留足余量避免窗口底边裁切
+        self._max_h = max(400, self.winfo_screenheight() - 180)
+        self.canvas = tk.Canvas(self, background=bg, highlightthickness=0, bd=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.body = tk.Frame(self.canvas, background=bg)
+        self._inner = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body.bind("<Configure>", self._on_body)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self.canvas.bind("<Enter>",
+                         lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
+        self.canvas.bind("<Leave>",
+                         lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_wheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_canvas(self, event):
+        self.canvas.itemconfigure(self._inner, width=event.width)
+
+    def _on_body(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        need = self.body.winfo_reqheight() > self._max_h
+        if need and not self.vbar.winfo_ismapped():
+            self.vbar.pack(side="right", fill="y")
+        elif not need and self.vbar.winfo_ismapped():
+            self.vbar.pack_forget()
+        self.canvas.configure(
+            width=self.body.winfo_reqwidth() + (16 if need else 0),
+            height=min(self.body.winfo_reqheight(), self._max_h))
+
+    def refresh(self):
+        self.body.update_idletasks()
+        self._on_body()
+        if self._on_fit is not None:
+            self._on_fit()
+
+
+def _ui_font(size, bold=False):
+    return ("Microsoft YaHei UI", size, "bold") if bold else ("Microsoft YaHei UI", size)
+
+
+# ---- 抗锯齿圆角渲染管线 ----------------------------------------------------
+# Tk Canvas 在 Windows 上没有抗锯齿（CustomTkinter 官方文档明说只有 macOS 有，
+# smooth=True 多边形只能改善曲率、消除不了锯齿）。所以所有圆角一律用 Pillow
+# 以 4 倍超采样渲染、LANCZOS 缩小，作为带透明通道的 PhotoImage 贴到 Canvas 上
+# —— Tk 8.6+ 的 Canvas 原生支持图片 alpha。已知坑只有两个，都已处理：
+# PhotoImage 必须持有引用（_AA_REFS），渲染结果按参数缓存避免重复开销。
+
+_AA_CACHE = {}
+_AA_REFS = []
+
+
+def _hex_rgba(color):
+    c = str(color).lstrip("#")
+    if len(c) == 3:
+        c = "".join(x * 2 for x in c)
+    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), 255)
+
+
+def _aa_rounded(w, h, radius, fill, outline=None, ow=0):
+    """抗锯齿圆角矩形 PhotoImage（4x 超采样 + LANCZOS 缩小，带缓存）。"""
+    key = ("r", int(w), int(h), int(radius), fill, outline, int(ow))
+    got = _AA_CACHE.get(key)
+    if got is not None:
+        return got
+    img = Image.new("RGBA", (max(1, int(w)) * 4, max(1, int(h)) * 4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([1, 1, max(1, int(w)) * 4 - 1, max(1, int(h)) * 4 - 1],
+                        radius=max(1, int(radius) * 4), fill=_hex_rgba(fill),
+                        outline=_hex_rgba(outline) if outline else None,
+                        width=int(ow) * 4 if outline else 0)
+    img = img.resize((max(1, int(w)), max(1, int(h))), Image.LANCZOS)
+    ph = ImageTk.PhotoImage(img)
+    _AA_CACHE[key] = ph
+    _AA_REFS.append(ph)
+    return ph
+
+
+def _aa_circle(dia, fill):
+    """抗锯齿圆形 PhotoImage（圆点 / 滑块手柄 / 开关圆钮共用）。"""
+    key = ("c", int(dia), fill)
+    got = _AA_CACHE.get(key)
+    if got is not None:
+        return got
+    img = Image.new("RGBA", (max(1, int(dia)) * 4, max(1, int(dia)) * 4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([1, 1, max(1, int(dia)) * 4 - 1, max(1, int(dia)) * 4 - 1],
+              fill=_hex_rgba(fill))
+    img = img.resize((max(1, int(dia)), max(1, int(dia))), Image.LANCZOS)
+    ph = ImageTk.PhotoImage(img)
+    _AA_CACHE[key] = ph
+    _AA_REFS.append(ph)
+    return ph
+
+
+from PIL import Image, ImageDraw, ImageTk  # noqa: E402  （延迟到 Tk 场景可用处）
+
+
+class Card(tk.Canvas):
+    """圆角卡片容器：Pillow 抗锯齿圆角背景 + 内部 Frame（create_window 承载内容）。
+
+    旧实现"四角盖小 Canvas 啃出圆角"没有抗锯齿，锯齿感和设计稿差距大。
+    现在整张卡片是一块 4x 超采样渲染的圆角贴图（四角透明，直接露出父容器
+    底色，不再需要 page_bg 参与抠角）。Canvas 不传播子控件尺寸，
+    宽高在这里按内部 Frame 的请求值显式设置。
+    """
+
+    R = 12
+
+    def __init__(self, parent, pad=14, bg=None, page_bg=None):
+        bg = bg or UI["card"]
+        page = page_bg or parent.cget("bg")  # 兼容旧签名；透明角自然露出
+        super().__init__(parent, bg=page, highlightthickness=0, bd=0)
+        self._bg = bg
+        self._pad = pad
+        self.inner = tk.Frame(self, bg=bg)
+        self._img = None
+        self._win = self.create_window(pad, pad, window=self.inner, anchor="nw")
+        self._painted = None   # (w, h) 已渲染尺寸；尺寸没变就绝不重画
+        self.inner.bind("<Configure>", lambda e: self._resize())
+        self.bind("<Configure>", lambda e: self._paint())
+
+    def _resize(self):
+        # 值没变就不 configure：configure 会再触发 <Configure>，
+        # 守卫不住就和 _paint 互相喂事件（布局抖动的来源）
+        w = self.inner.winfo_reqwidth() + self._pad * 2
+        h = self.inner.winfo_reqheight() + self._pad * 2
+        if (w, h) != (self.winfo_width(), self.winfo_height()):
+            self.configure(width=w, height=h)
+
+    def _paint(self):
+        w = max(self.winfo_width(), 2)
+        h = max(self.winfo_height(), 2)
+        if (w, h) == self._painted:
+            return
+        self._painted = (w, h)
+        ph = _aa_rounded(w, h, self.R, self._bg)
+        if self._img is None:
+            self._img = self.create_image(0, 0, anchor="nw", image=ph)
+        else:
+            self.itemconfig(self._img, image=ph)
+        self.tag_lower(self._img)
+        # 内容区随卡片宽度伸展（对应旧 Frame 时代 pack fill="x" 的行为）
+        self.itemconfig(self._win, width=max(1, int(w) - self._pad * 2))
+
+
+class Button(tk.Canvas):
+    """自绘按钮（圆角、三种语义、支持置灰）。tk.Button 做不出圆角和禁用配色。"""
+
+    def __init__(self, parent, text, command=None, kind="secondary",
+                 width=None, height=34, radius=9, pad_bg=None, font_size=10):
+        self._kind = kind
+        self._text = text
+        self._command = command
+        self._radius = radius
+        self._h = height
+        self._fs = font_size
+        self._bg = pad_bg or parent.cget("bg")
+        self._font = _ui_font(font_size, bold=(kind == "primary"))
+        self._enabled = True
+        self._hover = False
+        fm = tkfont.Font(font=self._font)
+        w = width or (fm.measure(text) + 30)
+        super().__init__(parent, width=w, height=height, bg=self._bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _colors(self):
+        k = self._kind
+        if not self._enabled:
+            return (UI["fill"], UI["text3"], "")
+        if k == "primary":
+            return (UI["accent_hover"] if self._hover else UI["accent"], "#ffffff", "")
+        if k == "ghost":
+            return (UI["fill"] if self._hover else UI["card"], UI["text2"], UI["sep"])
+        if k == "link":
+            return (self._bg, UI["accent"], "")
+        return (UI["fill_hover"] if self._hover else UI["fill"], UI["text"], "")
+
+    def _draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 2)
+        h = max(self.winfo_height(), 2)
+        fill, fg, outline = self._colors()
+        if self._kind == "link":
+            self.create_text(w / 2, h / 2, text=self._text, fill=fg, font=self._font)
+            return
+        ph = _aa_rounded(w, h, self._radius, fill, outline or None,
+                         1 if outline else 0)
+        self.create_image(0, 0, anchor="nw", image=ph)
+        self.create_text(w / 2, h / 2 + 0.5, text=self._text, fill=fg, font=self._font)
+
+    def _on_enter(self, _e):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._draw()
+
+    def _on_press(self, _e):
+        if not self._enabled:
+            return
+        self.configure(cursor="arrow")
+        self._pressed = True
+        self._draw()
+
+    def _on_release(self, _e):
+        self.configure(cursor="hand2")
+        if not self._enabled or not getattr(self, "_pressed", False):
+            return
+        self._pressed = False
+        if self._command:
+            self._command()
+
+    # ---- 外部接口 ----
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self._draw()
+
+    def set_text(self, text):
+        self._text = text
+        self._draw()
+
+    def set_kind(self, kind):
+        self._kind = kind
+        self._font = _ui_font(self._fs, bold=(kind == "primary"))
+        self._draw()
+
+    def text(self):
+        return self._text
+
+
+class Switch(tk.Canvas):
+    """Apple 风格开关（42×25 药丸 + 圆形滑块）。"""
+
+    W, H = 42, 25
+
+    def __init__(self, parent, value=False, command=None):
+        self._bg = parent.cget("bg")
+        super().__init__(parent, width=self.W, height=self.H, bg=self._bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._value = bool(value)
+        self._command = command
+        self.bind("<Button-1>", self._toggle)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        on = self._value
+        self.create_image(0, 0, anchor="nw",
+                          image=_aa_rounded(self.W, self.H, self.H / 2.0,
+                                            UI["green"] if on else UI["fill_off"]))
+        x = self.W - 12.5 if on else 12.5
+        self.create_image(x, self.H / 2.0,
+                          image=_aa_circle(20, "#ffffff"), anchor="c")
+
+    def _toggle(self, _e=None):
+        self._value = not self._value
+        self._draw()
+        if self._command:
+            self._command(self._value)
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = bool(value)
+        self._draw()
+
+
+class Slider(tk.Canvas):
+    """自绘滑块：细轨道 + 已填充段 + 圆形手柄，松手才回调（避免刷 DDC）。"""
+
+    def __init__(self, parent, value=50, command=None, on_move=None,
+                 height=26, pad_bg=None):
+        self._bg = pad_bg or parent.cget("bg")
+        super().__init__(parent, width=180, height=height, bg=self._bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._value = max(0, min(100, int(value)))
+        self._command = command
+        self._on_move = on_move
+        self._dragging = False
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _track(self):
+        w = max(self.winfo_width(), 2)
+        pad = 11
+        return pad, w - pad, 56.0
+
+    def _draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 2)
+        h = max(self.winfo_height(), 2)
+        x0, x1, _ = self._track()
+        cy = h / 2.0
+        self.create_image(x0, cy - 2, anchor="nw",
+                          image=_aa_rounded(x1 - x0, 4, 2, UI["fill"]))
+        kx = x0 + (x1 - x0) * self._value / 100.0
+        # 填充宽度量化到 4px：拖动时避免每个像素都生成一张新贴图
+        fw = max(0, int((kx - x0) / 4.0) * 4)
+        if fw > 1:
+            self.create_image(x0, cy - 2, anchor="nw",
+                              image=_aa_rounded(fw, 4, 2, UI["accent"]))
+        self.create_image(kx, cy, image=_aa_circle(16, "#ffffff"), anchor="c")
+
+    def _value_at(self, x):
+        x0, x1, _ = self._track()
+        return int(round(max(0, min(100, (x - x0) * 100.0 / max(1, x1 - x0)))))
+
+    def _on_press(self, e):
+        self._dragging = True
+        self._value = self._value_at(e.x)
+        self._draw()
+        if self._on_move:
+            self._on_move(self._value)
+
+    def _on_drag(self, e):
+        self._value = self._value_at(e.x)
+        self._draw()
+        if self._on_move:
+            self._on_move(self._value)
+
+    def _on_release(self, _e):
+        self._dragging = False
+        if self._command:
+            self._command(self._value)
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = max(0, min(100, int(value)))
+        self._draw()
+
+
+class Segmented(tk.Canvas):
+    """分段控件（互斥选择）。用整块 Canvas 画，避免 ttk 按钮的方角。"""
+
+    def __init__(self, parent, items, index=0, command=None, height=32):
+        self._bg = parent.cget("bg")
+        super().__init__(parent, height=height, bg=self._bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.items = list(items)
+        self.index = index
+        self._command = command
+        self._h = height
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 2)
+        h = self._h
+        self.create_image(0, 0, anchor="nw",
+                          image=_aa_rounded(w, h, 8, UI["fill"]))
+        n = max(len(self.items), 1)
+        seg = (w - 4) / float(n)
+        for i, label in enumerate(self.items):
+            x0 = 2 + i * seg
+            if i == self.index:
+                self.create_image(x0 + 1, 3, anchor="nw",
+                                  image=_aa_rounded(seg - 2, h - 6, 7, UI["seg_on"]))
+            fg = UI["text"] if i == self.index else UI["text2"]
+            self.create_text(x0 + seg / 2, h / 2, text=label, fill=fg,
+                             font=_ui_font(9, bold=(i == self.index)))
+
+    def _click(self, e):
+        w = max(self.winfo_width(), 2)
+        seg = (w - 4) / float(max(len(self.items), 1))
+        idx = int(max(0, min(len(self.items) - 1, (e.x - 2) // seg)))
+        if idx != self.index:
+            self.index = idx
+            self._draw()
+            if self._command:
+                self._command(idx)
+
+    def get(self):
+        return self.index
+
+    def set(self, index):
+        self.index = index
+        self._draw()
+
+
+class Label(tk.Label):
+    """统一字色/底色的文字控件（省掉到处传 bg 的噪音）。"""
+
+    def __init__(self, parent, text="", size=9, color=None, bold=False,
+                 bg=None, anchor="w", **kw):
+        super().__init__(parent, text=text,
+                         bg=bg or parent.cget("bg"),
+                         fg=color or UI["text"],
+                         font=_ui_font(size, bold), anchor=anchor, **kw)
+
+
+class SectionTitle(tk.Label):
+    def __init__(self, parent, text):
+        super().__init__(parent, text=text, bg=UI["bg"], fg=UI["text3"],
+                         font=_ui_font(8, bold=True), anchor="w")
+
+
+class Sheet(tk.Toplevel):
+    """深色模态弹层（设置 / 说明 / 编辑时间段共用）。
+
+    和 DarkBox 同一套做法：Toplevel + grab_set + wait_window；
+    区别是本类带标题区和滚动正文，适合放成组的内容。
+    """
+
+    def __init__(self, app, title, subtitle="", width=430):
+        super().__init__(app.root)
+        # 双屏实测：Toplevel 默认先在系统级联位置显示一帧，show() 里才挪到
+        # 主窗中心 —— 用户看到"弹窗先出现在别处再跳过来"。先藏起来，
+        # 定好几何尺寸再 deiconify，就只有一次出现。
+        self.withdraw()
+        self.app = app
+        self.title(title)
+        self.resizable(False, False)
+        self.configure(background=UI["card"])
+        apply_dark_titlebar(self)
+        self._width = width
+
+        head = tk.Frame(self, bg=UI["card"])
+        head.pack(fill="x", padx=20, pady=(16, 0))
+        Label(head, title, size=13, bold=True, bg=UI["card"]).pack(anchor="w")
+        if subtitle:
+            Label(head, subtitle, size=8, color=UI["text3"], bg=UI["card"],
+                  justify="left", wraplength=self._width - 40).pack(anchor="w", pady=(3, 0))
+
+        self.body = tk.Frame(self, bg=UI["card"])
+        self.body.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+
+        foot = tk.Frame(self, bg=UI["card"])
+        foot.pack(fill="x", padx=20, pady=(10, 16))
+        self.ok_btn = Button(foot, "完成", self.close, kind="primary",
+                             height=34, pad_bg=UI["card"])
+        self.ok_btn.pack(fill="x")
+
+        self.bind("<Escape>", lambda e: self.close())
+        self.transient(app.root)
+
+    def show(self):
+        """内容搭完后再定尺寸并弹出。
+
+        必须由子类在 **最后** 调用：基类构造时 body 还是空的，
+        那时量出来只有 144px 高（实测），窗口会被 resizable(False) 锁死。
+        """
+        self.update_idletasks()
+        w = max(self.winfo_reqwidth(), self._width)
+        h = self.winfo_reqheight()
+        x = self.app.root.winfo_rootx() + max(
+            0, (self.app.root.winfo_width() - w) // 2)
+        y = self.app.root.winfo_rooty() + max(
+            0, (self.app.root.winfo_height() - h) // 2)
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.deiconify()
+        self.wait_visibility()
+        self.grab_set()
+
+    def close(self):
+        self.grab_release()
+        self.destroy()
+
+    def section(self, text):
+        SectionTitle(self.body, text).pack(anchor="w", pady=(14, 6))
+        card = Card(self.body, pad=0, bg=UI["card_alt"], page_bg=UI["card"])
+        card.pack(fill="x")
+        return card.inner
+
+    def row(self, parent, title, sub="", right_text=None, builder=None):
+        """一行：标题（+副标题）在左，右侧放文字或控件，底部一条分隔线。
+
+        ⚠️ 控件必须通过 builder 在**本行内**创建：先建好再 pack 到别的父容器会
+        报 "can't pack inside"，或悄悄跑到卡片其它位置（实测踩过）。
+        """
+        # 用父容器的底色，卡片（card_alt）里才不会出现一块深色补丁
+        pbg = parent.cget("bg")
+        row = tk.Frame(parent, bg=pbg)
+        row.pack(fill="x")
+        right = tk.Frame(row, bg=pbg)
+        right.pack(side="right", padx=(8, 14))
+        left = tk.Frame(row, bg=pbg)
+        left.pack(side="left", fill="x", expand=True, padx=(14, 0), pady=9)
+        Label(left, title, size=9, bg=pbg).pack(anchor="w")
+        if sub:
+            Label(left, sub, size=8, color=UI["text3"], bg=pbg,
+                  justify="left", wraplength=self._width - 170).pack(anchor="w", pady=(1, 0))
+        if right_text is not None:
+            Label(right, right_text, size=8, color=UI["text3"],
+                  bg=pbg).pack(anchor="e")
+        if builder is not None:
+            builder(right)
+        sep = tk.Frame(parent, bg=UI["sep"], height=1)
+        sep.pack(fill="x", padx=14)
+        return row
+
+
+class StatusCard(Card):
+    """顶部状态卡：亮灭结论 + 一句上下文 + 三个动作。"""
 
     def __init__(self, app):
-        super().__init__(app.root, text=" 显示器（可多选） ")
+        super().__init__(app.body)
         self.app = app
-        self.pack(fill="x", padx=8, pady=4)
-        self.mon_vars = {}      # 序号 -> BooleanVar
-        self.mon_rows = {}      # 序号 -> Checkbutton（型号名到达时就地改文字）
-        self._suspend = False   # 重建期间挂起勾选回调
-        row = ttk.Frame(self, style="Surface.TFrame")
-        row.pack(fill="x", padx=8, pady=(8, 2))
-        self.mon_box = ttk.Frame(row, style="Surface.TFrame")
-        self.mon_box.pack(side="left", fill="both", expand=True)
-        btns = ttk.Frame(row, style="Surface.TFrame")
-        btns.pack(side="left", fill="y", padx=(8, 0))
-        ttk.Button(btns, text="刷新", command=app.refresh_monitors, width=8).pack(fill="x")
-        ttk.Button(btns, text="全选", command=app.select_all, width=8).pack(fill="x", pady=(4, 0))
-        ttk.Button(btns, text="全不选", command=app.select_none, width=8).pack(fill="x", pady=(4, 0))
-        ttk.Label(self, text="勾选要调节的显示器；一个都不勾 = 全部显示器",
-                  style="Hint.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
+        self._status_row = tk.Frame(self.inner, bg=UI["card"])
+        self._status_row.pack(fill="x")
+        row = self._status_row
+        self.dot = tk.Canvas(row, width=10, height=10, bg=UI["card"],
+                             highlightthickness=0, bd=0)
+        self.dot.pack(side="left")
+        self._dot_on = _aa_circle(10, UI["green"])
+        self._dot_off = _aa_circle(10, UI["fill_off"])
+        self._dot_item = self.dot.create_image(0, 0, anchor="nw",
+                                               image=self._dot_on)
+        self.title_lbl = Label(row, "屏幕亮着", size=13, bold=True, bg=UI["card"])
+        self.title_lbl.pack(side="left", padx=(9, 0))
+        self.meta_lbl = Label(row, "", size=8, color=UI["text3"], bg=UI["card"])
+        self.meta_lbl.pack(side="right")
+
+        self.hint_lbl = Label(self.inner, "", size=9, color=UI["text2"], bg=UI["card"])
+        self.hint_lbl.pack(fill="x", pady=(3, 12))
+
+        btns = tk.Frame(self.inner, bg=UI["card"])
+        btns.pack(fill="x")
+        self.off_btn = Button(btns, "熄灭屏幕", app.screen_off, kind="secondary",
+                              height=34, pad_bg=UI["card"])
+        self.off_btn.pack(side="left", fill="x", expand=True)
+        self.on_btn = Button(btns, "点亮屏幕", app.screen_on, kind="primary",
+                             height=34, pad_bg=UI["card"])
+        self.on_btn.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.probe_btn = Button(btns, "检测", app.probe_screens, kind="ghost",
+                                width=56, height=34, pad_bg=UI["card"])
+        self.probe_btn.pack(side="left", padx=(8, 0))
+
+        # 临时反馈（flash）与常驻提示（hint_default）共用提示行：
+        # 操作结果闪 3 秒后回到常驻内容，底部状态栏因此不再需要。
+        self._hint_default = ""
+        self._flash_until = 0.0
+        self._flash_after = None
+        self._unknown = False
+
+    def set_hint_default(self, text):
+        """常驻提示：检测后写一次；有临时消息在展示时不打断。"""
+        self._hint_default = text
+        if time.time() >= self._flash_until:
+            self.hint_lbl.config(text=text)
+
+    def flash(self, text, ms=3200):
+        """临时反馈：显示 ms 毫秒后自动回到常驻提示。"""
+        self._flash_until = time.time() + ms / 1000.0
+        if self._flash_after is not None:
+            try:
+                self.after_cancel(self._flash_after)
+            except Exception:
+                pass
+        self.hint_lbl.config(text=text)
+        self._flash_after = self.after(ms, self._restore_hint)
+
+    def _restore_hint(self):
+        self._flash_after = None
+        self.hint_lbl.config(text=self._hint_default)
+
+    def render(self, verdict):
+        state = verdict.get("state", "on")
+        # unknown = DDC 模式：回读不可信，不显示亮灭结论（用户明确要求）
+        self._unknown = state == "unknown"
+        on = state == "on"
+        if self._unknown:
+            # 单屏待机模式：不显示"亮着/熄灭"结论行（回读不可信，术语也留给说明）
+            self._status_row.pack_forget()
+        else:
+            if self._status_row.winfo_manager() != "pack":
+                self._status_row.pack(fill="x", before=self.hint_lbl)
+            self.dot.itemconfigure(self._dot_item,
+                                   image=self._dot_on if on else self._dot_off)
+            self.title_lbl.config(text="屏幕亮着" if on else "屏幕已熄灭")
+            self.meta_lbl.config(text=self.app.screen_time_text())
+        self.set_hint_default(verdict.get("hint", ""))
+        # 主按钮 = 当前可执行的那个动作，另一个置灰；状态未知时两个都可用
+        if self._unknown:
+            self.off_btn.set_kind("secondary")
+            self.on_btn.set_kind("secondary")
+            self.off_btn.set_enabled(True)
+            self.on_btn.set_enabled(True)
+        else:
+            self.off_btn.set_kind("primary" if on else "secondary")
+            self.on_btn.set_kind("secondary" if on else "primary")
+            self.off_btn.set_enabled(on)
+            self.on_btn.set_enabled(not on)
+
+    def set_actions_enabled(self, enabled):
+        if self._unknown:
+            self.off_btn.set_enabled(enabled)
+            self.on_btn.set_enabled(enabled)
+        else:
+            self.off_btn.set_enabled(enabled and self.off_btn._kind == "primary")
+            self.on_btn.set_enabled(enabled and self.on_btn._kind == "primary")
+        self.probe_btn.set_enabled(enabled)
+
+
+class MonitorPanel:
+    """显示器勾选列表（数据在 App，这里只负责渲染）。"""
+
+    def __init__(self, app):
+        self.app = app
+        head = tk.Frame(app.body, bg=UI["bg"])
+        head.pack(fill="x", padx=28, pady=(14, 6))
+        SectionTitle(head, "显示器").pack(side="left")
+        for text, cmd in (("刷新", app.refresh_monitors), ("全不选", app.select_none),
+                          ("全选", app.select_all)):
+            Button(head, text, cmd, kind="link", height=18, pad_bg=UI["bg"],
+                   font_size=8).pack(side="right", padx=(6, 0))
+        card = Card(app.body)
+        card.pack(fill="x", padx=14)
+        self.inner = card.inner
+        self.mon_vars = {}
+        self.mon_rows = {}
+        self._suspend = False
+        self._empty = Label(self.inner, "（未检测到支持 DDC/CI 的显示器）",
+                            size=8, color=UI["text3"])
+        self._empty.pack(anchor="w")
 
     def selected(self):
         return sorted(i for i, v in self.mon_vars.items() if v.get())
@@ -1283,323 +2733,651 @@ class MonitorPanel(ttk.LabelFrame):
             self._suspend = False
 
     def rebuild(self, keep):
-        """按 app.monitors / mon_info / mon_models 重建勾选行（挂起回调）。"""
         self._suspend = True
         try:
-            for w in self.mon_box.winfo_children():
+            for w in self.inner.winfo_children():
                 w.destroy()
             self.mon_vars, self.mon_rows = {}, {}
-            app = self.app
-            if not app.monitors:
-                ttk.Label(self.mon_box, text="（未检测到支持 DDC/CI 的显示器）",
-                          style="Hint.TLabel").pack(anchor="w")
+            if not self.app.monitors:
+                Label(self.inner, "（未检测到支持 DDC/CI 的显示器）",
+                      size=8, color=UI["text3"]).pack(anchor="w", pady=4)
                 return
-            for i in range(len(app.monitors)):
-                info = app.mon_info[i] if i < len(app.mon_info) else None
+            for i in range(len(self.app.monitors)):
+                row = tk.Frame(self.inner, bg=UI["card"])
+                row.pack(fill="x")
                 var = tk.BooleanVar(value=(i in keep))
-                var.trace_add("write", lambda *_: app.on_monitor_toggle())
+                var.trace_add("write", lambda *_: self.app.on_monitor_toggle())
                 self.mon_vars[i] = var
-                row = ttk.Checkbutton(self.mon_box, variable=var, text=monitor_label(
-                    i, app.monitors[i], info, app.mon_models.get(i)))
-                row.pack(anchor="w", pady=1)
+                chk = ttk.Checkbutton(row, variable=var, text="")
+                chk.pack(side="left", padx=(0, 8), pady=7)
+                txt = tk.Frame(row, bg=UI["card"])
+                txt.pack(side="left", fill="x", expand=True)
+                info = self.app.mon_info[i] if i < len(self.app.mon_info) else None
+                model = self.app.mon_models.get(i)
+                Label(txt, model or ("显示器 %d" % i), size=9, bg=UI["card"]).pack(anchor="w")
+                sub = ""
+                if info:
+                    sub = "%d × %d · %s · %s" % (
+                        info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
+                Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
                 self.mon_rows[i] = row
         finally:
             self._suspend = False
 
     def set_row_text(self, i, text):
         row = self.mon_rows.get(i)
-        if row is not None:
-            try:
-                row.config(text=text)
-            except Exception:
-                pass
+        if row is None:
+            return
+        labels = [w for w in row.winfo_children()[1].winfo_children()]
+        if labels:
+            labels[0].config(text=text)
 
 
-class BrightnessPanel(ttk.LabelFrame):
-    """亮度调节区（View）：滑块与"当前亮度"一行。"""
+class BrightnessPanel:
+    """亮度：滑块 + 预设分段。预设数值在「设置」里改。"""
 
-    def __init__(self, app, initial_level):
-        super().__init__(app.root, text=" 亮度调节（即时生效） ")
-        self.pack(fill="x", padx=8, pady=4)
-        self.cur_lbl = ttk.Label(self, text="当前亮度: --", style="Hint.TLabel")
-        self.cur_lbl.pack(anchor="w", padx=10, pady=(8, 0))
-        srow = ttk.Frame(self, style="Surface.TFrame")
-        srow.pack(fill="x", padx=10, pady=6)
-        self.slider = ttk.Scale(srow, from_=0, to=100, orient="horizontal",
-                                command=self._on_slide)
-        self.slider.set(initial_level)
-        self.slider.pack(side="left", fill="x", expand=True)
-        self.level_lbl = ttk.Label(srow, text=str(initial_level), width=4,
-                                   anchor="e", style="Hint.TLabel")
-        self.level_lbl.pack(side="left", padx=(8, 0))
-        brow = ttk.Frame(self, style="Surface.TFrame")
-        brow.pack(fill="x", padx=10, pady=(0, 8))
-        self.apply_btn = ttk.Button(brow, text="应用到选中显示器", style="Accent.TButton",
-                                    command=app.apply_now)
-        self.apply_btn.pack(side="left")
-        self.read_btn = ttk.Button(brow, text="读取当前亮度", command=app.read_current)
-        self.read_btn.pack(side="left", padx=6)
+    def __init__(self, app, initial_level, presets=None):
+        self.app = app
+        SectionTitle(app.body, "亮度").pack(anchor="w", padx=28, pady=(14, 6))
+        card = Card(app.body)
+        card.pack(fill="x", padx=14)
+        inner = card.inner
+        row = tk.Frame(inner, bg=UI["card"])
+        row.pack(fill="x")
+        # 松手即写回（Slider 的 command 在 release 时才触发）；拖动过程只刷新
+        # 数字，避免 DDC 被拖动期间连续刷写。
+        self.slider = Slider(row, value=initial_level, on_move=self._on_slide,
+                             command=self._on_release, pad_bg=UI["card"])
+        self.slider.pack(side="left", fill="x", expand=True, pady=(2, 0))
+        self.level_lbl = Label(row, "%d%%" % initial_level, size=9,
+                               color=UI["text2"], bg=UI["card"], anchor="e", width=5)
+        self.level_lbl.pack(side="left", padx=(10, 0))
+        self._preset_values = [clamp_level(v) for v in (presets or [0, 75, 100])]
+        idx = self._preset_values.index(initial_level) \
+            if initial_level in self._preset_values else -1
+        self.presets = Segmented(inner, ["%d%%" % v for v in self._preset_values],
+                                 index=idx, command=self._on_preset)
+        self.presets.pack(fill="x", pady=(10, 0))
 
-    def _on_slide(self, _=None):
-        try:
-            self.level_lbl.config(text=str(int(float(self.slider.get()))))
-        except Exception:
-            pass
+    def _on_slide(self, value=None):
+        v = self.slider.get() if value is None else value
+        self.level_lbl.config(text="%d%%" % clamp_level(v))
+
+    def _on_release(self, value=None):
+        self.app.apply_now()
+
+    def _on_preset(self, idx):
+        self.app.apply_preset(idx)
 
     def level(self):
         return clamp_level(self.slider.get())
 
-    def set_current(self, text):
-        self.cur_lbl.config(text=text)
+    def set_level(self, level):
+        level = clamp_level(level)
+        try:
+            self.slider.set(level)
+            self.level_lbl.config(text="%d%%" % level)
+        except Exception:
+            pass
+
+    def set_presets(self, presets):
+        self.presets.items = ["%d%%" % clamp_level(v) for v in (presets or [])]
+        self.presets._draw()
 
     def set_actions_enabled(self, enabled):
-        state = "normal" if enabled else "disabled"
-        for btn in (self.apply_btn, self.read_btn):
-            try:
-                btn.config(state=state)
-            except Exception:
-                pass
+        # 滑块误触由 App._busy 兜底；忙期间把预设点击禁掉即可
+        self.presets._command = self._on_preset if enabled else None
 
 
-class SchedulePanel(ttk.LabelFrame):
-    """定时调节区（View）：动态 N 行时间段（每行 时间+亮度+删除），底部「添加时间段」。"""
+class SlotEditor(Sheet):
+    """单个时间段的编辑弹层（时间 / 亮度 / 到点是否熄屏点亮）。"""
+
+    def __init__(self, app, slot, on_save, on_delete=None):
+        super().__init__(app, "时间段", "到点自动切到该亮度", width=380)
+        self._slot = dict(slot)
+        self._on_save = on_save
+        self._on_delete = on_delete
+
+        box = tk.Frame(self.body, bg=UI["card"])
+        box.pack(fill="x", pady=(4, 0))
+
+        Label(box, "时间", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
+        self.time_entry = ttk.Entry(box, width=8, justify="center")
+        self.time_entry.insert(0, slot.get("time", "12:00"))
+        self.time_entry.pack(anchor="w", pady=(4, 10))
+
+        Label(box, "亮度", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
+        self.level_spin = ttk.Spinbox(box, from_=0, to=100, width=6, justify="center")
+        self.level_spin.set(slot.get("level", 50))
+        self.level_spin.pack(anchor="w", pady=(4, 10))
+
+        Label(box, "到点时屏幕", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
+        labels = [lab for _v, lab in SCREEN_ACTIONS]
+        cur = SCREEN_LABEL_BY_VALUE.get(slot.get("screen", ""), "不变")
+        self.screen_seg = Segmented(box, labels, index=labels.index(cur))
+        self.screen_seg.pack(fill="x", pady=(4, 0))
+
+        if on_delete is not None:
+            del_btn = Button(box, "删除这个时间段", self._do_delete, kind="secondary",
+                             height=32, pad_bg=UI["card"])
+            del_btn.pack(fill="x", pady=(16, 0))
+
+        self.ok_btn.set_text("保存")
+        self.ok_btn._command = self._do_save
+        self.show()
+
+    def _do_save(self):
+        t = self.time_entry.get().strip()
+        if not _valid_hhmm(t):
+            self.app.msg.showerror("格式不对", "时间需要写成 HH:MM，例如 09:00。")
+            return
+        try:
+            lv = max(0, min(100, int(float(self.level_spin.get()))))
+        except Exception:
+            lv = 50
+        idx = self.screen_seg.get()
+        self._on_save({"time": t, "level": lv,
+                       "screen": SCREEN_VALUE_BY_LABEL.get(
+                           [lab for _v, lab in SCREEN_ACTIONS][idx], "")})
+        self.close()
+
+    def _do_delete(self):
+        self._on_delete()
+        self.close()
+
+
+class _SlotRow(Button):
+    """时间段行：在 Button 底色之上自绘 时间 / 亮度 / chip。
+
+    为什么是 Button 的子类：hover 时 Button._draw 会 delete("all") 重画底色，
+    旧版把行内容"额外"画上去，鼠标一扫文字就被抹掉（用户实测）。重写 _draw
+    让底色和内容同一次绘制，hover 重画天然完整。
+    """
+
+    def __init__(self, parent, slot, command, pad_bg):
+        self._slot = dict(slot)
+        self._dim = False
+        super().__init__(parent, "", command, kind="ghost",
+                         height=34, pad_bg=pad_bg)
+
+    def set_slot(self, slot):
+        self._slot = dict(slot)
+        self._draw()
+
+    def set_dim(self, dim):
+        """定时未启用时整行文字变暗。"""
+        self._dim = bool(dim)
+        self._draw()
+
+    def _draw(self):
+        Button._draw(self)          # 底色（含 hover 态）
+        cv = self
+        w = max(cv.winfo_width(), 2)
+        h = 34
+        slot = self._slot
+        t_fg = UI["text3"] if self._dim else UI["text"]
+        s_fg = UI["text3"] if self._dim else UI["text2"]
+        cv.create_text(14, h / 2, text=slot.get("time", "--:--"), anchor="w",
+                       fill=t_fg, font=_ui_font(11, bold=True))
+        cv.create_text(78, h / 2, text="%d%%" % clamp_level(slot.get("level", 0)),
+                       anchor="w", fill=s_fg, font=_ui_font(9))
+        act = slot.get("screen", "")
+        if act:
+            label = "同时熄灭" if act == "off" else "同时点亮"
+            fill = UI["accent_soft"]
+        else:
+            label, fill = "不变", UI["fill"]
+        tw = int(tkfont.Font(font=_ui_font(8)).measure(label)) + 16
+        cv.create_image(w - 14 - tw, 9, anchor="nw",
+                        image=_aa_rounded(tw, 16, 8, fill))
+        cv.create_text(w - 14 - tw / 2, 17, text=label, anchor="c",
+                       fill=UI["accent"] if act else UI["text3"],
+                       font=_ui_font(8))
+
+
+class SchedulePanel:
+    """定时：开关 + 时间段列表 + 任务计划实测状态。"""
 
     def __init__(self, app, cfg):
-        super().__init__(app.root, text=" 定时调节 ")
         self.app = app
-        self.pack(fill="x", padx=8, pady=4)
+        SectionTitle(app.body, "定时").pack(anchor="w", padx=26, pady=(14, 6))
+        card = Card(app.body)
+        card.pack(fill="x", padx=14)
+        self.inner = card.inner
+        self.slots = [dict(x) for x in cfg.get("slots", [])]
+        self._rows = []
+
+        head = tk.Frame(self.inner, bg=UI["card"])
+        head.pack(fill="x")
         self.enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)))
-        self.catchup_var = tk.BooleanVar(value=bool(cfg.get("catch_up_on_logon", True)))
-        self._rows = []          # [{"frame","entry","spin","del_btn"}]
-        ttk.Checkbutton(self, text="启用每日定时", variable=self.enabled_var,
-                        command=self.set_enabled_state).pack(anchor="w", padx=10, pady=(8, 2))
-        self.rows_box = ttk.Frame(self, style="Surface.TFrame")
-        self.rows_box.pack(fill="x", padx=10, pady=2)
-        hint = ttk.Frame(self, style="Surface.TFrame")
-        hint.pack(fill="x", padx=10)
-        self.add_btn = ttk.Button(hint, text="+ 添加时间段", width=12, command=self.add_row)
+        # 开关切换即保存/注册，不再需要「保存并启用定时」大按钮
+        self.enabled_switch = Switch(head, bool(cfg.get("enabled", False)),
+                                     self._on_toggle)
+        self.enabled_switch.pack(side="left")
+        Label(head, "启用每日定时", size=9, bg=UI["card"]).pack(
+            side="left", padx=(8, 0))
+        self.count_lbl = Label(head, "", size=8, color=UI["text3"], bg=UI["card"])
+        self.count_lbl.pack(side="right")
+
+        self.list_box = tk.Frame(self.inner, bg=UI["card"])
+        self.list_box.pack(fill="x", pady=(4, 0))
+
+        add = tk.Frame(self.inner, bg=UI["card"])
+        add.pack(fill="x", pady=(6, 0))
+        self.add_btn = Button(add, "＋ 添加时间段", self.add_row, kind="link",
+                              height=26, pad_bg=UI["card"])
         self.add_btn.pack(side="left")
-        ttk.Label(hint, text="同一时刻只能有一档；到点切换为该档亮度",
-                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
-        for x in cfg.get("slots", []):
-            self.add_row(x.get("time", "12:00"), x.get("level", 50),
-                         x.get("screen", ""))
-        self.catchup_chk = ttk.Checkbutton(
-            self, text="登录后自动校准（开机时已过切换点也能补上）", variable=self.catchup_var)
-        self.catchup_chk.pack(anchor="w", padx=10, pady=(4, 0))
-        r_btn = ttk.Frame(self, style="Surface.TFrame")
-        r_btn.pack(fill="x", padx=10, pady=(6, 4))
-        self.save_btn = ttk.Button(r_btn, text="保存并启用定时", style="Accent.TButton",
-                                   command=app.save_schedule)
-        self.save_btn.pack(side="left")
-        self.test_btn = ttk.Button(r_btn, text="测试当前档", command=app.test_current)
-        self.test_btn.pack(side="left", padx=4)
-        self.cancel_btn = ttk.Button(r_btn, text="取消定时", command=app.cancel_schedule)
-        self.cancel_btn.pack(side="left", padx=4)
-        # 状态区固定 4 行占位：异步结果回来时窗口高度才不会跳
-        self.task_lbl = ttk.Label(self, justify="left", style="Hint.TLabel", text=(
-            "任务计划状态：\n定时：读取中…\n登录校准：读取中…"))
-        self.task_lbl.pack(anchor="w", padx=10, pady=(0, 8))
-        self.set_enabled_state()
 
-    def _build_row(self, time_text, level_value, screen_value=""):
-        row = ttk.Frame(self.rows_box, style="Surface.TFrame")
-        row.pack(fill="x", pady=1)
-        entry = ttk.Entry(row, width=7, justify="center")
-        entry.insert(0, str(time_text))
-        entry.pack(side="left")
-        ttk.Label(row, text="亮度", style="Hint.TLabel").pack(side="left", padx=(8, 0))
-        spin = ttk.Spinbox(row, from_=0, to=100, width=5, justify="center")
-        spin.set(level_value)
-        spin.pack(side="left", padx=4)
-        ttk.Label(row, text="屏幕", style="Hint.TLabel").pack(side="left", padx=(8, 0))
-        combo = ttk.Combobox(row, values=[l for _v, l in SCREEN_ACTIONS],
-                             state="readonly", width=5)
-        combo.set(SCREEN_LABEL_BY_VALUE.get(screen_value, "不变"))
-        combo.pack(side="left", padx=4)
-        del_btn = ttk.Button(row, text="删除", width=6,
-                             command=lambda: self._del_row(row))
-        del_btn.pack(side="left", padx=6)
-        rec = {"frame": row, "entry": entry, "spin": spin, "combo": combo,
-               "del_btn": del_btn}
-        self._rows.append(rec)
-        return rec
+        # 任务计划实测状态：圆点 + 结论 + 细节 + 下次 + 检测
+        tk.Frame(self.inner, bg=UI["sep"], height=1).pack(fill="x", pady=(10, 0))
+        st = tk.Frame(self.inner, bg=UI["card"])
+        st.pack(fill="x", pady=(8, 0))
+        self.dot = tk.Canvas(st, width=8, height=8, bg=UI["card"],
+                             highlightthickness=0, bd=0)
+        self.dot.pack(side="left", pady=2)
+        self._dot_colors = {}
+        self._dot = self.dot.create_image(0, 0, anchor="nw",
+                                          image=_aa_circle(8, UI["text3"]))
+        self.task_title = Label(st, "任务计划：读取中…", size=9, bg=UI["card"])
+        self.task_title.pack(side="left", padx=(8, 0))
+        # 先放「检测」（贴最右），再放「下次」，顺序才对
+        self.probe_task_btn = Button(st, "检测", app.refresh_task_status,
+                                     kind="link", width=40, height=22,
+                                     pad_bg=UI["card"])
+        self.probe_task_btn.pack(side="right")
+        self.task_next = Label(st, "", size=8, color=UI["text3"], bg=UI["card"])
+        self.task_next.pack(side="right", padx=(0, 8))
+        self.task_sub = Label(self.inner, "", size=8, color=UI["text3"],
+                              bg=UI["card"], justify="left")
+        self.task_sub.pack(fill="x", pady=(2, 0))
 
-    def add_row(self, time_text="12:00", level_value=50, screen_value=""):
-        rec = self._build_row(time_text, level_value, screen_value)
-        self.set_enabled_state()
-        return rec
+        self.render()
 
-    def _del_row(self, row_widget):
-        if len(self._rows) <= 1:      # 至少保留一档
-            return
+    # ---- 渲染 ----
+    def render(self):
+        for w in self.list_box.winfo_children():
+            w.destroy()
+        self._rows = []
+        on = bool(self.enabled_var.get())
+        for slot in sorted(self.slots, key=lambda x: parse_hhmm(x.get("time"), (0, 0))):
+            self._rows.append(self._build_slot_row(slot))
+        self.count_lbl.config(text="%d 档" % len(self.slots))
         for r in self._rows:
-            if r["frame"] is row_widget:
-                row_widget.destroy()
-                self._rows.remove(r)
-                break
+            r.set_dim(not on)
+        self.add_btn.set_enabled(on)
 
-    def set_enabled_state(self):
-        state = "normal" if self.enabled_var.get() else "disabled"
-        widgets = [w for r in self._rows for w in (r["entry"], r["spin"], r["del_btn"])]
-        # 按钮在 __init__ 里晚于数据行创建，用 getattr 兜住"尚不存在"的阶段
-        widgets += [w for w in (getattr(self, n, None) for n in
-                                ("add_btn", "save_btn", "test_btn", "cancel_btn"))
-                    if w is not None]
-        for w in widgets:
-            try:
-                w.config(state=state)
-            except Exception:
-                pass
-
-    def set_enabled_flag(self, value):
+    def _on_toggle(self, value):
+        """开关切换 = 立即注册 / 注销任务计划（不再有单独的保存按钮）。"""
         self.enabled_var.set(bool(value))
-        self.set_enabled_state()
+        self.render()
+        self.app.schedule_toggled(bool(value))
 
+    def _build_slot_row(self, slot):
+        row = _SlotRow(self.list_box, slot, lambda s=slot: self._edit(s),
+                       pad_bg=UI["card"])
+        row.pack(fill="x")
+        return row
+
+    def _edit(self, slot):
+        def save(new):
+            self.slots = [s for s in self.slots if s is not slot]
+            if any(s.get("time") == new["time"] for s in self.slots):
+                self.app.msg.showerror("时间重复", "同一时刻 %s 只能有一档。" % new["time"])
+                self.slots.append(slot)
+                return
+            self.slots.append(new)
+            self.slots.sort(key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
+            self.render()
+
+        def delete():
+            if len(self.slots) <= 1:
+                self.app.msg.showinfo("提示", "至少保留一个时间段。")
+                return
+            self.slots = [s for s in self.slots if s is not slot]
+            self.render()
+
+        self._editor = SlotEditor(self.app, slot, save, delete)
+
+    def add_row(self):
+        used = {s.get("time") for s in self.slots}
+        t = "12:00"
+        while t in used:
+            hh, mm = parse_hhmm(t, (12, 0))
+            hh = (hh + 60) % (24 * 60)
+            t = "%02d:%02d" % (hh // 60, hh % 60)
+
+        def save(new):
+            if any(s.get("time") == new["time"] for s in self.slots):
+                self.app.msg.showerror("时间重复", "同一时刻 %s 只能有一档。" % new["time"])
+                return
+            self.slots.append(new)
+            self.slots.sort(key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
+            self.render()
+
+        self._editor = SlotEditor(self.app, {"time": t, "level": 50, "screen": ""}, save)
+
+    # ---- App 用到的接口 ----
     def schedule_enabled(self):
         return bool(self.enabled_var.get())
 
+    def set_enabled_flag(self, value):
+        self.enabled_var.set(bool(value))
+        self.render()
+
     def read_slots(self):
-        """读全部行 -> [{"time","level"}]（按时间排序）；非法/重复时间弹窗并返回 None。"""
-        out, seen = [], set()
-        for r in self._rows:
-            t = r["entry"].get().strip()
-            if not _valid_hhmm(t):
-                self.app.msg.showerror("格式不对",
-                                     "时间需要写成 HH:MM，例如 09:00。当前是：%s" % t)
-                return None
-            if t in seen:
-                self.app.msg.showerror("时间重复", "同一时刻 %s 只能有一档。" % t)
-                return None
-            seen.add(t)
-            try:
-                lv = max(0, min(100, int(float(r["spin"].get()))))
-            except Exception:
-                lv = 50
-            out.append({"time": t, "level": lv,
-                        "screen": SCREEN_VALUE_BY_LABEL.get(r["combo"].get(), "")})
-        if not out:
+        if not self.slots:
             self.app.msg.showinfo("提示", "至少保留一个时间段。")
             return None
-        return sorted(out, key=lambda x: parse_hhmm(x["time"], (0, 0)))
+        return sorted([dict(s) for s in self.slots],
+                      key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
 
-    def set_task_status(self, text):
-        self.task_lbl.config(text=text)
+    def set_task_status(self, info):
+        """info: {"state": registered|missing|error|loading, "next": "...",
+                  "detail": "...", "triggers": n, "mismatch": n}"""
+        state = info.get("state")
+        color = {"ok": UI["green"], "warn": UI["orange"],
+                 "error": UI["orange"]}.get(state, UI["text3"])
+        if color not in self._dot_colors:
+            self._dot_colors[color] = _aa_circle(8, color)
+        self.dot.itemconfigure(self._dot, image=self._dot_colors[color])
+        self.task_title.config(text=info.get("title", "任务计划"))
+        self.task_next.config(text=info.get("next", ""))
+        self.task_sub.config(text=info.get("detail", ""))
 
     def set_actions_enabled(self, enabled):
-        state = "normal" if enabled else "disabled"
-        widgets = [self.save_btn, self.test_btn, self.cancel_btn]
-        for r in self._rows:
-            widgets += [r["entry"], r["spin"], r["del_btn"]]
-        for w in widgets:
-            try:
-                w.config(state=state)
-            except Exception:
-                pass
+        self.add_btn.set_enabled(enabled and self.schedule_enabled())
+        self.probe_task_btn.set_enabled(enabled)
 
 
-class ScreenPanel(ttk.LabelFrame):
-    """熄屏/点亮区（View）：按钮、热键开关与自动点亮保险丝，业务在 App。"""
+class SettingsSheet(Sheet):
+    """设置：托盘 / 自启 / 热键 / 熄灭方式 / 预设 / 关于（都是"不常改"的东西）。"""
 
-    def __init__(self, app, cfg):
-        super().__init__(app.root, text=" 熄屏 / 点亮 / 托盘 ")
+    def __init__(self, app):
+        super().__init__(app, "设置", "不常用的开关都在这里，主界面只留日常操作", width=440)
         self.app = app
-        self.pack(fill="x", padx=8, pady=4)
-        row = ttk.Frame(self, style="Surface.TFrame")
-        row.pack(fill="x", padx=10, pady=(8, 2))
-        self.off_btn = ttk.Button(row, text="熄灭显示器", command=app.screen_off)
-        self.off_btn.pack(side="left")
-        self.on_btn = ttk.Button(row, text="点亮显示器", command=app.screen_on)
-        self.on_btn.pack(side="left", padx=6)
-        ttk.Label(row, text="点亮时信号源会自动切换一次（亮着的屏闪 3 秒，正常现象）",
-                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
-        hk = ttk.Frame(self, style="Surface.TFrame")
-        hk.pack(fill="x", padx=10)
-        self.hotkey_var = tk.BooleanVar(value=bool(cfg.get("screen_hotkeys", False)))
-        ttk.Checkbutton(hk, text="启用热键：Ctrl+Alt+Shift+O 熄灭 / P 点亮（需保持本程序运行）",
-                        variable=self.hotkey_var,
-                        command=app.toggle_screen_hotkeys).pack(anchor="w")
-        ar = ttk.Frame(self, style="Surface.TFrame")
-        ar.pack(fill="x", padx=10, pady=(2, 8))
-        ttk.Label(ar, text="熄灭后", style="Hint.TLabel").pack(side="left")
-        self.relight_spin = ttk.Spinbox(ar, from_=0, to=120, width=5, justify="center")
-        self.relight_spin.set(cfg.get("screen_auto_relight_min", 0))
-        self.relight_spin.pack(side="left", padx=4)
-        ttk.Label(ar, text="分钟自动点亮（0 = 不自动；远程时建议设个值防失联）",
-                  style="Hint.TLabel").pack(side="left")
-        self.state_lbl = ttk.Label(
-            self, style="Hint.TLabel",
-            text="屏幕状态：%s（以软件最后一次操作记录为准；物理电源键 / 系统自动熄屏不在此追踪）"
-                 % ("熄灭中" if cfg.get("screen_state") == "off" else "点亮中"))
-        self.state_lbl.pack(anchor="w", padx=10, pady=(4, 0))
-        au = ttk.Frame(self, style="Surface.TFrame")
-        au.pack(fill="x", padx=10, pady=(2, 0))
-        self.tray_var = tk.BooleanVar(value=bool(cfg.get("tray_enabled", True)))
-        ttk.Checkbutton(au, text="系统托盘图标（关闭后点 X 直接退出程序）",
-                        variable=self.tray_var,
-                        command=app.toggle_tray).pack(anchor="w")
-        self.autostart_var = tk.BooleanVar(value=get_autostart()[0])
-        ttk.Checkbutton(au, text="开机自动启动（启动后直接进托盘；点 X 也是进托盘，退出在托盘菜单）",
-                        variable=self.autostart_var,
-                        command=app.toggle_autostart).pack(anchor="w")
+        cfg = app.cfg
 
-    def set_state(self, state):
-        self.state_lbl.config(
-            text="屏幕状态：%s（以软件最后一次操作记录为准；物理电源键 / 系统自动熄屏不在此追踪）"
-                 % ("熄灭中" if state == "off" else "点亮中"))
+        win = self.section("窗口")
+        self.row(win, "系统托盘图标", "在右下角常驻，右键可熄/亮屏、切换定时",
+                 builder=lambda p: Switch(p, bool(cfg.get("tray_enabled", True)),
+                                          lambda v: app.apply_setting("tray_enabled", v)).pack())
+        self.row(win, "关闭窗口时最小化到托盘", "关掉则点 × 直接退出程序")
 
-    def set_actions_enabled(self, enabled):
-        state = "normal" if enabled else "disabled"
-        for btn in (self.off_btn, self.on_btn):
-            try:
-                btn.config(state=state)
-            except Exception:
-                pass
+        start = self.section("启动与快捷键")
+        self.row(start, "开机自动启动", "启动后直接进托盘",
+                 builder=lambda p: Switch(p, get_autostart()[0],
+                                          app.apply_autostart).pack())
+        self.row(start, "全局热键", "熄灭 Ctrl Alt Shift O　点亮 Ctrl Alt Shift P",
+                 builder=lambda p: Switch(p, bool(cfg.get("screen_hotkeys", False)),
+                                          lambda v: app.apply_setting("screen_hotkeys", v)).pack())
+
+        off = self.section("熄屏")
+        pbg = off.cget("bg")
+        wrap = tk.Frame(off, bg=pbg)
+        wrap.pack(fill="x", padx=14, pady=(10, 6))
+        Label(wrap, "熄灭方式", size=9, bg=pbg).pack(anchor="w")
+        mode = Segmented(wrap, [OFF_METHOD_LABEL[m] for m in OFF_METHODS],
+                         index=OFF_METHODS.index(cfg.get("screen_off_method", "system")),
+                         command=lambda i: app.apply_off_method(OFF_METHODS[i]))
+        mode.pack(fill="x", pady=(6, 0))
+        Label(wrap, "系统级：整组熄灭、一定唤得回，但键鼠会点亮。\n"
+                    "单屏待机：键鼠不点亮（远程防窥用），个别面板唤不回。",
+              size=8, color=UI["text3"], bg=pbg, justify="left").pack(anchor="w", pady=(6, 0))
+        tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
+
+        def _relight(p):
+            spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
+            spin.set(cfg.get("screen_auto_relight_min", 0))
+            spin.pack()
+            cb = lambda e: app.apply_setting(
+                "screen_auto_relight_min", _safe_int(spin.get(), 0))
+            spin.bind("<<Increment>>", cb)
+            spin.bind("<<Decrement>>", cb)
+            spin.bind("<FocusOut>", cb)
+
+        self.row(off, "熄灭后自动点亮", "0 = 不自动；远程时建议设个值", builder=_relight)
+
+        self.row(off, "点亮时允许切信号源", "最后一招；DP+HDMI 双线时可能切到空口",
+                 builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
+                                          lambda v: app.apply_setting("wake_switch_input", v)).pack())
+
+        pre = self.section("亮度预设")
+        pbg = pre.cget("bg")
+        prow = tk.Frame(pre, bg=pbg)
+        prow.pack(fill="x", padx=14, pady=9)
+        Label(prow, "三个快捷按钮的值", size=9, bg=pbg).pack(anchor="w")
+        spins = tk.Frame(prow, bg=pbg)
+        spins.pack(anchor="w", pady=(6, 0))
+        self.preset_spins = []
+        for v in cfg.get("presets", [0, 75, 100]):
+            sp = ttk.Spinbox(spins, from_=0, to=100, width=5, justify="center")
+            sp.set(v)
+            sp.pack(side="left", padx=(0, 8))
+            sp.bind("<FocusOut>", lambda e: app.apply_presets_from_settings())
+            self.preset_spins.append(sp)
+
+        about = self.section("关于")
+        self.row(about, "版本", "", right_text="v%s" % APP_VERSION)
+        self.row(about, "配置文件", "", right_text="%APPDATA%\\MonitorBrightness")
+        self.show()
+
+
+class HelpSheet(Sheet):
+    """说明：只放解释，不放开关（开关都在设置里）。"""
+
+    def __init__(self, app):
+        super().__init__(app, "说明", "常用设置都在主界面；这里放平时不需要看的信息", width=440)
+
+        def block(title, lines):
+            SectionTitle(self.body, title).pack(anchor="w", pady=(12, 4))
+            for line in lines:
+                Label(self.body, "· " + line, size=8, color=UI["text2"],
+                      bg=UI["card"], justify="left",
+                      wraplength=400).pack(anchor="w", pady=1)
+
+        block("屏幕亮着 / 已熄灭", [
+            "状态以本程序的记录为准：程序熄灭后，动键鼠会让系统自动唤醒。",
+            "DDC 回读只作参考 —— 面板待机时仍会回报“已开机”，不可信。",
+            "物理电源键、Windows 自动熄屏不在追踪范围内。",
+        ])
+        block("两种熄灭方式", [
+            "系统级（默认）：整组一起灭，一定唤得回；任何键鼠输入都会点亮。",
+            "DDC 单屏待机：键鼠不会点亮，适合远程操作时防窥；唤醒靠四级兜底，"
+            "个别面板仍可能唤不回。",
+        ])
+        block("唤醒阶梯", [
+            "0xD6=1 电源模式 → 写回亮度 → 输出重驱动（SC_MONITORPOWER 2→-1）"
+            " → 切信号源，任何一级成功即停。",
+        ])
+        block("排查命令", [
+            "--probe 打印每台屏的亮灭结论；--diag 打印枚举、能力串与寄存器回读。",
+        ])
+        self.show()
 
 
 class App:
-    """协调者（Presenter）：服务调用、异步编排与弹窗；界面细节都在三个 Panel 里。"""
+    """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
     def __init__(self, root, start_minimized=False):
         self.root = root
-        self.tray = None            # pystray.Icon（延迟创建，见 _create_tray）
+        self.tray = None
         root.title("%s v%s" % (APP_TITLE, APP_VERSION))
         root.resizable(False, False)
         apply_dark_theme(root)
 
         self.cfg = load_config()
         self.monitors = []
-        self.mon_info = []      # Win32 枚举信息，下标与 self.monitors 对齐
-        # 序号 -> 型号名；先吃上次缓存（毫秒级），DDC 后台刷新只补缺的
+        self.mon_info = []
         self.mon_models = {int(k): v for k, v in self.cfg.get("models", {}).items()}
-        self._read_queue = queue.Queue()   # 后台线程 → 主线程 的唯一通道
-        self._bg_tasks = 0                 # 在跑的后台任务数（归零就停轮询）
-        self._reading = False
-        self._read_pending = False
+        self._read_queue = queue.Queue()
+        self._bg_tasks = 0
         self._busy = False
         self._task_querying = False
-        self._hotkeys_on = False      # 热键监听线程运行中（保持轮询活着的条件之一）
-        self._relight_pending = False # 有定时自动点亮在等（同上）
-        self._hotkey_tid = None       # 热键线程 id（用于 PostThreadMessage 退出）
+        self._hotkeys_on = False
+        self._relight_pending = False
+        self._hotkey_tid = None
+        self._last_verdict = {"state": self.cfg.get("screen_state", "on"), "detail": ""}
         self.status_var = tk.StringVar(value="就绪")
-        self.msg = DarkBox(self.root)     # 深色弹窗（替代 messagebox）
+        self.msg = DarkBox(self.root)
+        self._sheet = None
+        self._editor = None
+        self._probing = False
+        self._brighting = False
+        self._fit_pending = False
+        self._fitted_h = -1
 
+        self.scroll = ScrollArea(root, UI["bg"], on_fit=self._fit_window)
+        self.scroll.pack(side="top", fill="both", expand=True)
+        self.body = self.scroll.body
+
+        # 顶部：右侧两个入口（标题由系统标题栏承担，避免重复）
+        top = tk.Frame(self.body, bg=UI["bg"])
+        top.pack(fill="x", padx=14, pady=(8, 0))
+        Button(top, "设置", self.open_settings, kind="ghost", width=52,
+               height=24, pad_bg=UI["bg"], font_size=8).pack(side="right")
+        Button(top, "说明", self.open_help, kind="ghost", width=52,
+               height=24, pad_bg=UI["bg"], font_size=8).pack(side="right", padx=(0, 6))
+
+        # 显示器选择在最上面，屏幕控制（状态卡）移到其下（用户要求）
         self.mon_panel = MonitorPanel(self)
-        self.bri_panel = BrightnessPanel(self, current_level(self.cfg))
+        self.status_card = StatusCard(self)
+        self.status_card.pack(fill="x", padx=14, pady=(8, 0))
+        self.bri_panel = BrightnessPanel(self, current_level(self.cfg),
+                                         self.cfg.get("presets"))
         self.sch_panel = SchedulePanel(self, self.cfg)
-        self.screen_panel = ScreenPanel(self, self.cfg)
+        # 底部留白：最后一张卡（定时）的下缘不贴窗口下边（用户要求 10px）
+        tk.Frame(self.body, bg=UI["bg"], height=10).pack(fill="x")
+
+        # 没有底部状态栏：status_var.set() 的消息统一走状态卡的临时反馈行
+        # （闪 3 秒回到常驻提示）。trace 必须在状态卡建好之后再挂。
+        self.status_var.trace_add(
+            "write", lambda *_: self.status_card.flash(self.status_var.get()))
+
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.cfg.get("screen_hotkeys"):
             self._start_hotkey_listener()
-        ttk.Label(self.root, textvariable=self.status_var, style="Dim.TLabel").pack(
-            anchor="w", padx=12, pady=(0, 8))
 
         self.refresh_monitors(silent=True)
-        self._refresh_task_status()
+        self.refresh_task_status()
+        self.probe_screens()
         if self.cfg.get("tray_enabled", True):
             self._create_tray()
         if start_minimized and self.tray is not None:
             self.root.withdraw()
+
+    def _fit_window(self):
+        """内容晚到（任务状态行/显示器行）后按请求尺寸重排窗口。
+
+        窗口 resizable(False) 时 WM 不会自动跟随内容增长，晚到的行会被
+        底边裁掉（用户实测）。两个护栏：
+        1) 防抖：合并 80ms 内的多次触发（探测/任务状态/渲染常常连环触发）；
+        2) 高度没变就跳过 geometry("")——整窗重排不便宜，且会闪。
+        超高部分仍由 ScrollArea 的封顶 + 滚动条兜底。
+        """
+        if self._fit_pending:
+            return
+        self._fit_pending = True
+        self.root.after(80, self._fit_window_now)
+
+    def _fit_window_now(self):
+        self._fit_pending = False
+        try:
+            self.root.update_idletasks()
+            need = self.scroll.body.winfo_reqheight()
+            if need == self._fitted_h:
+                return
+            self._fitted_h = need
+            self.root.geometry("")
+        except Exception:
+            pass
+
+    # ---------- 顶部入口 ----------
+    def open_settings(self):
+        try:
+            # 必须留一个引用：Toplevel 被 GC 时窗口会跟着消失（实测踩过）
+            self._sheet = SettingsSheet(self)
+        except Exception as e:
+            self.msg.showerror("打开设置失败", "%s: %s" % (type(e).__name__, e))
+
+    def open_help(self):
+        try:
+            self._sheet = HelpSheet(self)
+        except Exception as e:
+            self.msg.showerror("打开说明失败", "%s: %s" % (type(e).__name__, e))
+
+    # ---------- 设置项写回 ----------
+    def apply_setting(self, key, value):
+        """设置弹层里每个开关/输入框的统一出口：落配置并立即生效。"""
+        try:
+            if key == "tray_enabled":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                if value:
+                    self._create_tray()
+                    self.status_var.set("托盘图标已启用（点 × 进托盘）")
+                else:
+                    self._stop_tray()
+                    self.status_var.set("托盘图标已关闭（点 × 直接退出）")
+            elif key == "screen_hotkeys":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                if value:
+                    self._start_hotkey_listener()
+                else:
+                    self._stop_hotkey_listener()
+                    self.status_var.set("已停用熄屏热键")
+            elif key == "screen_auto_relight_min":
+                self.cfg[key] = max(0, min(120, int(value)))
+                save_config(self.cfg)
+            elif key == "wake_switch_input":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+            elif key == "presets":
+                self.cfg[key] = coerce_setting("presets", value)
+                save_config(self.cfg)
+                self.bri_panel.set_presets(self.cfg[key])
+        except Exception as e:
+            self.msg.showerror("保存设置失败", "%s: %s" % (type(e).__name__, e))
+
+    def apply_presets_from_settings(self):
+        """预设数值：从设置弹层里的三个输入框读回来（失焦时触发）。"""
+        sheet = None
+        for w in self.root.winfo_children():
+            if isinstance(w, SettingsSheet):
+                sheet = w
+        if sheet is None:
+            return
+        vals = [_safe_int(sp.get(), 50) for sp in sheet.preset_spins]
+        self.apply_setting("presets", vals)
+
+    def apply_autostart(self, enable):
+        exe, prefix = task_target()
+        cmd = ('"%s" %s--minimized' % (exe, prefix)).strip()
+        try:
+            set_autostart(bool(enable), cmd)
+            self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
+        except Exception as e:
+            self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
+
+    def apply_off_method(self, value):
+        if value == "ddc" and not self.cfg.get("ddc_allow_undeclared"):
+            if not self.msg.askyesno(
+                    "单屏待机：有风险",
+                    "这条路的「熄灭」用面板待机命令（0xD6=2），但：\n"
+                    "• 你的面板能力串只声明 01/04/05，没声明 02；\n"
+                    "• 微软文档警告盲写未实现的 MCCS 值会导致未定义行为；\n"
+                    "• 万一唤不回，只能按显示器电源键。\n\n"
+                    "点亮时会依次尝试：电源模式 → 写亮度 → 输出重驱动 → 切信号源。"):
+                return
+            self.cfg["ddc_allow_undeclared"] = True
+        self.cfg["screen_off_method"] = value
+        save_config(self.cfg)
+        if value == "ddc":
+            self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
+        else:
+            self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
+        # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
+        self.probe_screens()
 
     # ---------- 显示器勾选 ----------
     def select_all(self):
@@ -1614,32 +3392,34 @@ class App:
         return self.mon_panel.selected()
 
     def on_monitor_toggle(self):
-        """某一台被勾选/取消勾选 → 重读一次当前亮度（重建列表期间不触发）。"""
         if not self.mon_panel._suspend:
             self.read_current()
 
     def _restore_selection(self, prev):
-        """刷新后该勾选哪几台：优先沿用刷新前的勾选，其次配置里的，最后全勾。"""
         keep = [i for i in prev if i < len(self.monitors)]
         if not keep:
-            keep = [i for i in self.cfg.get("monitors", []) if i < len(self.monitors)]
+            keep = [i for i in resolve_monitors(self.cfg) if i < len(self.monitors)]
         return keep or list(range(len(self.monitors)))
 
     def refresh_monitors(self, silent=False):
         prev = self.selected_indices()
-        self.monitors = list_monitors()
-        self.mon_info = enum_displays()
+        targets = enumerate_targets()
+        try:
+            self.monitors = [{k: v for k, v in t.items() if k != "handle"}
+                             for t in targets]
+        finally:
+            release_targets(targets)
+        self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
         self.mon_panel.rebuild(self._restore_selection(prev))
         if not self.monitors:
-            self.bri_panel.set_current("当前亮度: --")
-            self.status_var.set("未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
+            self.status_var.set(
+                "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
             return
         if not silent:
             self.status_var.set("已刷新：检测到 %d 台显示器" % len(self.monitors))
         self.read_current()
 
     def _apply_models(self, models):
-        """型号名到达后就地改那一行文字，并写回缓存（下次启动秒出）。"""
         if isinstance(models, Exception):
             return
         changed = False
@@ -1647,9 +3427,7 @@ class App:
             if not name or self.mon_models.get(i) == name or i >= len(self.monitors):
                 continue
             self.mon_models[i] = name
-            info = self.mon_info[i] if i < len(self.mon_info) else None
-            self.mon_panel.set_row_text(
-                i, monitor_label(i, self.monitors[i], info, name))
+            self.mon_panel.set_row_text(i, name)
             changed = True
         if changed:
             self.cfg["models"] = {str(k): v for k, v in self.mon_models.items() if v}
@@ -1657,10 +3435,6 @@ class App:
 
     # ---------- 统一异步入口 ----------
     def run_bg(self, job, on_done=None, busy=False):
-        """全程序唯一的异步写法：job 在后台跑，返回值/异常交给 on_done 在主线程处理。
-
-        busy=True 期间禁用动作按钮，结束后自动恢复（防连点起一串线程）。
-        """
         if busy:
             self._busy = True
             self._set_actions_enabled(False)
@@ -1670,14 +3444,13 @@ class App:
             try:
                 result = job()
             except Exception as e:
-                result = e          # 异常也回主线程处理，不在后台静默吞掉
+                result = e
             self._read_queue.put(("done", (on_done, result, busy), None))
 
         threading.Thread(target=runner, daemon=True).start()
         self._poll_read_queue()
 
     def _poll_read_queue(self):
-        """主线程轮询：把后台结果搬回界面（界面只在这里被改）。"""
         while True:
             try:
                 kind, payload, _extra = self._read_queue.get_nowait()
@@ -1700,73 +3473,76 @@ class App:
                 on_done(result)
         if self._bg_tasks > 0 or self._hotkeys_on or self._relight_pending:
             self.root.after(150, self._poll_read_queue)
-        elif self._read_pending:
-            self._read_pending = False
-            self.root.after(50, self.read_current)
 
     def _set_actions_enabled(self, enabled):
+        self.status_card.set_actions_enabled(enabled)
         self.bri_panel.set_actions_enabled(enabled)
         self.sch_panel.set_actions_enabled(enabled)
-        self.screen_panel.set_actions_enabled(enabled)
 
-    # ---------- 亮度 ----------
+    # ---------- 亮度 / 探测 ----------
     def read_current(self):
-        """后台读亮度 + 补型号名（两者拆开：读亮度 ~0.13s，读型号 ~3s/台）。"""
-        if not self.monitors:
+        """轻量刷新：只读亮度（1 次 DDC 读/屏）。
+
+        ⚠️ 实测（2026-11-03）：合并"探测+读亮度"后这里变成 3 读/屏（371ms），
+        而本方法在每次应用亮度/切换勾选后都会自动执行，是"响应变慢"的主因。
+        自动刷新回归轻量路径；全量探测（probe_screens，371ms）只留给
+        「检测」按钮、启动和熄灭/点亮状态切换点。
+        """
+        self.refresh_brightness()
+        self._fetch_models()
+
+    def refresh_brightness(self):
+        """只读各屏亮度并更新提示行（不重判亮灭）。
+
+        用独立的 _brighting 标志：启动时 refresh_monitors 的轻量刷新如果
+        占着全量探测的 _probing，紧接着的 probe_screens() 会被守卫静默跳过，
+        状态卡就停在控件默认值上（实测踩过）。
+        """
+        if not self.monitors or self._brighting:
             return
-        if self._reading:
-            self._read_pending = True
-            return
+        self._brighting = True
         targets = self.selected_indices() or list(range(len(self.monitors)))
-        self._reading = True
-        self._read_pending = False
-        self.bri_panel.set_current("当前亮度: 读取中…")
 
         def job():
             try:
-                return get_brightness_many(targets)[0]
+                return {}, get_brightness_many(targets)[0]
             except Exception:
-                return {}
+                return {}, {}
 
-        def done(values):
-            self._reading = False
-            self._render_values(values, targets)
+        self.run_bg(job, self._render_states)
 
-        self.run_bg(job, done)
-
+    def _fetch_models(self):
+        """显示器型号缓存没有的补一次（写入行标题与配置）。"""
+        targets = self.selected_indices() or list(range(len(self.monitors)))
         missing = [i for i in targets
                    if i not in self.mon_models and 0 <= i < len(self.monitors)]
-        if missing:
-            def job_models():
-                """每台一个线程并行读型号（不同显示器 = 不同设备句柄，安全）。"""
-                out = {}
+        if not missing:
+            return
 
-                def one(i):
-                    out[i] = monitor_model(self.monitors[i])
+        def job_models():
+            out = {}
+            targets_now = enumerate_targets()
+            try:
+                def one(t):
+                    out[t["index"]] = monitor_model(t["handle"], t.get("dev"))
 
-                ts = [threading.Thread(target=one, args=(i,)) for i in missing]
-                for t in ts:
-                    t.start()
-                for t in ts:
-                    t.join(15)
-                return {i: v for i, v in out.items() if v}
+                threads = [threading.Thread(target=one, args=(t,))
+                           for t in targets_now if t["index"] in missing]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join(20)
+            finally:
+                release_targets(targets_now)
+            return {i: v for i, v in out.items() if v}
 
-            self.run_bg(job_models, self._apply_models)
-
-    def _render_values(self, values, targets):
-        if values:
-            parts = ["显示器 %d = %s" % (i, "--" if values.get(i) is None else values.get(i))
-                     for i in targets]
-            self.bri_panel.set_current("当前亮度: " + " | ".join(parts))
-        else:
-            self.bri_panel.set_current("当前亮度: 读取失败")
+        self.run_bg(job_models, self._apply_models)
 
     def apply_now(self):
-        """后台下发亮度（DDC 逐台写实测 ~370ms，同步会冻界面）。"""
         if self._busy:
             return
         targets = self.selected_indices()
-        level = clamp_level(self.bri_panel.slider.get())
+        level = clamp_level(self.bri_panel.level())
         self.status_var.set("正在下发亮度 %d%% …" % level)
         self.run_bg(lambda: set_brightness_many(targets, level),
                     lambda r: self._finish_apply(r, level), busy=True)
@@ -1782,123 +3558,189 @@ class App:
             self.msg.showwarning("部分显示器失败", detail)
         self.read_current()
 
-    def test_current(self):
-        """把「按当前时刻判定出的档位亮度」试下发一次。"""
+    # ---------- 快捷预设 ----------
+    def apply_preset(self, i):
         if self._busy:
             return
-        level = current_level(self.cfg)
-        self.run_bg(lambda: set_brightness_many(self.selected_indices(), level),
-                    lambda r: self._finish_test(r, level), busy=True)
+        presets = self.cfg.get("presets") or []
+        if not (0 <= i < len(presets)):
+            return
+        level = clamp_level(presets[i])
+        self.bri_panel.set_level(level)
+        self.status_var.set("正在把全部显示器设为 %d%% …" % level)
+        self.run_bg(lambda: set_brightness_many([], level),
+                    lambda r: self._finish_preset(r, level), busy=True)
 
-    def _finish_test(self, result, level):
+    def _finish_preset(self, result, level):
         ok, errs = _as_ok_errs(result)
-        self.status_var.set("测试：当前档位亮度 %d%%，已下发 %d 台" % (level, len(ok)))
+        if ok:
+            self.status_var.set("全部显示器已设为 %d%%（%d 台）" % (level, len(ok)))
         if errs:
-            self.msg.showwarning("部分失败", "\n".join(
-                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
+            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
+            self.status_var.set("部分失败：" + detail.replace("\n", " "))
+            self.msg.showwarning("部分显示器失败", detail)
         self.read_current()
+
+    # ---------- 亮灭检测 ----------
+    def screen_time_text(self):
+        if self.cfg.get("screen_off_method") == "ddc":
+            return ""
+        at = (self.cfg.get("screen_state_at") or "").strip()
+        m = re.match(r"^\d{2}-\d{2} (\d{2}:\d{2})$", at)
+        short = m.group(1) if m else at
+        if self.cfg.get("screen_state") == "off":
+            return ("%s 熄灭" % short) if short else ""
+        return ("%s 点亮" % short) if short else ""
+
+    def probe_screens(self):
+        """「检测」：一次后台任务里同时读亮灭结论与当前亮度。"""
+        if not self.monitors or self._probing:
+            return
+        self._probing = True
+        targets = self.selected_indices() or list(range(len(self.monitors)))
+
+        def job():
+            states = probe_states()
+            try:
+                bright = get_brightness_many(targets)[0]
+            except Exception:
+                bright = {}
+            return states, bright
+
+        self.run_bg(job, self._render_states)
+
+    def _render_states(self, result):
+        self._probing = False
+        self._brighting = False
+        if isinstance(result, Exception):
+            self.status_var.set("检测失败：%s" % result)
+            return
+        states, bright = result
+        if not states:
+            # 轻量刷新（只读亮度）：不动亮灭结论，只更新提示行
+            if bright and self._last_verdict:
+                self._update_hint_brightness(bright)
+            return
+        v = screen_verdict(self.cfg, states)
+        if v.get("woke_by_input"):
+            mark_screen_state(self.cfg, "on")
+            save_config(self.cfg)
+        if v["state"] != "off":
+            vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
+            if vals and len(set(vals)) == 1:
+                hint = "当前 %d%% · %d 台显示器" % (vals[0], len(states))
+            elif vals:
+                hint = "当前 %s%% · %d 台显示器" % (
+                    "/".join(str(x) for x in vals), len(states))
+            else:
+                hint = "%d 台显示器 · 亮度可调" % len(states)
+        else:
+            hint = "键鼠输入不会点亮它；点「点亮屏幕」恢复"
+        self.status_card.render(self._status_payload(v["state"], hint))
+        self._last_verdict = v
+        self._fit_window()
+
+    def _update_hint_brightness(self, bright):
+        vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
+        if not vals:
+            return
+        if len(set(vals)) == 1:
+            b = "当前 %d%%" % vals[0]
+        else:
+            b = "当前 %s%%" % "/".join(str(x) for x in vals)
+        if self._last_verdict.get("state") == "off":
+            return  # 熄灭状态提示行不显示亮度
+        self.status_card.set_hint_default("%s · %d 台显示器" % (b, len(self.monitors)))
+
+    def _status_payload(self, state, hint):
+        """DDC 模式下回读不可信：不显示亮灭结论（用户明确要求）。"""
+        if self.cfg.get("screen_off_method") == "ddc":
+            return {"state": "unknown", "hint": hint}
+        return {"state": state, "hint": hint}
+
+    def _remember_selection(self):
+        idx, ids = selection_payload(self.selected_indices())
+        self.cfg["monitors"] = idx
+        self.cfg["monitor_ids"] = ids
 
     # ---------- 熄屏 / 点亮 ----------
     def screen_off(self):
-        """后台熄灭选中显示器（0xD6=2 待机；绝不用 4/5，见服务层硬件红线）。"""
         if self._busy:
             return
         targets = self.selected_indices()
         self.status_var.set("正在熄灭显示器…")
-        self.run_bg(lambda: screen_off_many(targets),
+        self.run_bg(lambda: screen_off_cfg(self.cfg, targets),
                     self._finish_screen_off, busy=True)
 
     def _finish_screen_off(self, result):
         ok, errs = _as_ok_errs(result)
         if ok:
-            self.status_var.set("已熄灭 %d 台显示器" % len(ok))
-            self.cfg["screen_state"] = "off"
+            mark_screen_state(self.cfg, "off")
+            self._remember_selection()
             save_config(self.cfg)
-            self.screen_panel.set_state("off")
+            self.status_var.set("已熄灭显示器")
+            self.status_card.render(self._status_payload(
+                "off", "键鼠输入不会点亮它；点「点亮屏幕」恢复"))
         if errs:
-            self.msg.showwarning("熄灭部分失败", "\n".join(
+            self.msg.showwarning("熄灭失败", "\n".join(
                 ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
         mins = self._auto_relight_minutes()
         if ok and mins > 0:
-            # 保险丝：N 分钟后自动点亮（经队列回主线程执行）
             self._relight_pending = True
             threading.Timer(mins * 60,
                             lambda: self._read_queue.put(("hotkey", "on", None))).start()
+        self.probe_screens()
 
     def screen_on(self):
-        """后台点亮（0x60 信号源切换，每台约 4 秒）。"""
         if self._busy:
             return
         targets = self.selected_indices()
-        self.status_var.set("正在点亮显示器（信号源切换，约 4 秒）…")
-        self.run_bg(lambda: screen_wake_many(targets),
+        self.status_var.set("正在点亮显示器…")
+        self.run_bg(lambda: screen_on_cfg(self.cfg, targets),
                     self._finish_screen_on, busy=True)
 
     def _finish_screen_on(self, result):
         ok, errs = _as_ok_errs(result)
         self._relight_pending = False
         if ok:
-            self.status_var.set("已点亮 %d 台显示器" % len(ok))
-            self.cfg["screen_state"] = "on"
+            mark_screen_state(self.cfg, "on")
+            self._remember_selection()
             save_config(self.cfg)
-            self.screen_panel.set_state("on")
+            self.status_var.set("已点亮显示器")
+            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
         if errs:
-            self.msg.showwarning("点亮部分失败", "\n".join(
-                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
+            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e
+                               for i, e in errs)
+            self.status_var.set("点亮失败：" + detail.replace("\n", " "))
+            tip = ("\n\n若这台屏是 DP+HDMI 同时接线，把「点亮时允许切信号源」关掉"
+                   "或改用「系统级」再试一次。"
+                   if self.cfg.get("screen_off_method") == "ddc" else "")
+            self.msg.showwarning("点亮失败", detail + tip)
+        self.probe_screens()
 
     def _auto_relight_minutes(self):
         try:
-            return max(0, min(120, int(float(self.screen_panel.relight_spin.get()))))
+            return max(0, min(120, int(self.cfg.get("screen_auto_relight_min", 0))))
         except Exception:
             return 0
 
-    def toggle_screen_hotkeys(self):
-        enabled = bool(self.screen_panel.hotkey_var.get())
-        self.cfg["screen_hotkeys"] = enabled
-        save_config(self.cfg)
-        if enabled:
-            self._start_hotkey_listener()
-        else:
-            self._stop_hotkey_listener()
-            self.status_var.set("已停用熄屏热键")
-
-    def toggle_tray(self):
-        enable = bool(self.screen_panel.tray_var.get())
-        self.cfg["tray_enabled"] = enable
-        save_config(self.cfg)
-        if enable:
-            self._create_tray()
-            self.status_var.set("托盘图标已启用（点 X 进托盘）")
-        else:
-            if self.tray is not None:
-                try:
-                    self.tray.stop()
-                except Exception:
-                    pass
-                self.tray = None
-            self.status_var.set("托盘图标已关闭（点 X 直接退出）")
-
-    def toggle_autostart(self):
-        enable = bool(self.screen_panel.autostart_var.get())
-        exe, prefix = task_target()
-        cmd = ('"%s" %s--minimized' % (exe, prefix)).strip()
-        try:
-            set_autostart(enable, cmd)
-            self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
-        except Exception as e:
-            self.screen_panel.autostart_var.set(not enable)
-            self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
+    def _stop_tray(self):
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
 
     def _start_hotkey_listener(self):
-        """常驻热键监听（可选功能）：RegisterHotKey + 消息循环，事件经队列回主线程。"""
         if self._hotkeys_on:
             return
         self._hotkeys_on = True
 
         def listener():
             user32 = ctypes.windll.user32
-            mods = 0x0001 | 0x0002 | 0x0004 | 0x4000     # ALT|CONTROL|SHIFT|NOREPEAT
-            ids = {1: ("off", 0x4F), 2: ("on", 0x50)}    # O / P
+            mods = 0x0001 | 0x0002 | 0x0004 | 0x4000
+            ids = {1: ("off", 0x4F), 2: ("on", 0x50)}
             for hid, (_act, vk) in ids.items():
                 if not user32.RegisterHotKey(None, hid, mods, vk):
                     self._hotkeys_on = False
@@ -1924,7 +3766,6 @@ class App:
 
     # ---------- 托盘 ----------
     def _tray_image(self):
-        """托盘图标（纯代码绘制：深色圆 + 亮度滑杆意象，不依赖外部资源）。"""
         from PIL import Image, ImageDraw
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
@@ -1935,7 +3776,6 @@ class App:
         return img
 
     def _tray_tooltip_text(self):
-        """托盘悬停文本：定时档位摘要 + 下次运行时间（超长截断到 120 字符）。"""
         if not self.cfg.get("enabled"):
             return "%s\n定时未启用" % APP_TITLE
         slots = self.cfg.get("slots", [])
@@ -1945,8 +3785,7 @@ class App:
                            for x in slots)
         nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots])
         st = "熄灭中" if self.cfg.get("screen_state") == "off" else "点亮中"
-        text = "%s\n定时: %s\n下次 %s\n屏幕: %s" % (APP_TITLE, brief, nxt, st)
-        return text[:120]
+        return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (APP_TITLE, brief, nxt, st))[:120]
 
     def _tray_update_tooltip(self):
         if self.tray is not None:
@@ -1957,9 +3796,6 @@ class App:
                 pass
 
     def _create_tray(self):
-        """创建托盘图标。pystray 必须与 tkinter 分线程运行（多来源一致的权威模式）：
-        图标跑在独立 daemon 线程；回调里操作 Tk 控件前先 root.after(0, ...) 投递，
-        否则 RuntimeError: main thread is not in main loop。"""
         if not TRAY_OK or self.tray is not None or not self.root.winfo_exists():
             return
         menu = _TrayMenu(
@@ -2001,21 +3837,15 @@ class App:
             self.sch_panel.set_enabled_flag(False)
             self.cfg["enabled"] = False
             return
-        self._refresh_task_status()
+        self.refresh_task_status()
         self.status_var.set("定时已启用")
 
     def _tray_quit(self):
-        if self.tray is not None:
-            try:
-                self.tray.stop()
-            except Exception:
-                pass
-            self.tray = None
+        self._stop_tray()
         self._stop_hotkey_listener()
         self.root.destroy()
 
     def _on_close(self):
-        """点 X = 最小化到托盘（退出走托盘菜单）；无托盘环境照旧退出。"""
         if self.tray is not None:
             self.root.withdraw()
             self.status_var.set("已最小化到托盘（右下角图标，右键可退出）")
@@ -2025,7 +3855,6 @@ class App:
 
     # ---------- 定时 ----------
     def save_schedule(self):
-        """整体包异常兜底：--windowed 没控制台，回调异常会无声消失。"""
         try:
             self._save_schedule_inner()
         except Exception as e:
@@ -2039,15 +3868,15 @@ class App:
         slots = self.sch_panel.read_slots()
         if slots is None:
             return
-        part = {"monitors": self.selected_indices(), "enabled": True,
-                "catch_up_on_logon": bool(self.sch_panel.catchup_var.get()),
+        idx, ids = selection_payload(self.selected_indices())
+        part = {"monitors": idx, "monitor_ids": ids, "enabled": True,
+                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True)),
                 "slots": slots}
         self.cfg.update(part)
         ok, msg = save_config(self.cfg)
         if not ok:
             self.msg.showerror("保存失败", msg)
             return
-        # 注册要冷启动一个子进程（实测 ~3s），必须放后台
         self.status_var.set("正在写入任务计划…")
         self.run_bg(lambda: register_tasks(self.cfg),
                     lambda r: self._finish_register(r, part), busy=True)
@@ -2059,8 +3888,12 @@ class App:
         if not ok:
             self.msg.showerror("注册任务失败", out or "未知错误")
             self.status_var.set("注册任务失败")
+            # 开关是"切换即注册"：注册失败要把开关拨回去，别让界面说谎
+            self.cfg["enabled"] = False
+            save_config(self.cfg)
+            self.sch_panel.set_enabled_flag(False)
             return
-        self._refresh_task_status()
+        self.refresh_task_status()
         self.status_var.set("定时已启用")
         self.msg.showinfo("定时已保存", _saved_summary(part, out))
 
@@ -2071,18 +3904,25 @@ class App:
         self.status_var.set("正在取消定时任务…")
         self.run_bg(unregister_tasks, self._finish_unregister, busy=True)
 
+    def schedule_toggled(self, on):
+        """面板上的「启用每日定时」开关：开 = 注册，关 = 注销。"""
+        if on:
+            self.save_schedule()
+        else:
+            self.cancel_schedule()
+
     def _finish_unregister(self, result):
         if isinstance(result, Exception):
             result = (False, str(result))
         ok, out = result
-        self._refresh_task_status()
+        self.refresh_task_status()
         self.status_var.set("已取消定时任务" if ok else "取消定时任务时出现问题：%s" % out)
 
-    def _refresh_task_status(self):
-        """后台查任务状态：快路径读本地 XML（~1ms），兜底冷启动子进程（~2.7s）。"""
+    def refresh_task_status(self):
         if self._task_querying:
             return
         self._task_querying = True
+        self.sch_panel.set_task_status({"state": "loading", "title": "任务计划：读取中…"})
 
         def job():
             try:
@@ -2096,35 +3936,68 @@ class App:
 
         self.run_bg(job, done)
 
+    # 兼容旧名（托盘/tray 里调用）
+    _refresh_task_status = refresh_task_status
+
     def _apply_task_status(self, text):
-        by_name = {}
-        for line in (text or "").splitlines():
-            line = line.strip()
-            if "=" not in line:
-                continue
-            name, rest = line.split("=", 1)
-            if name in TASK_SHORT:      # 过滤兜底路径错误文本里带 "=" 的行
-                by_name[name] = rest
-        lines = ["任务计划状态："]
-        for name, short in TASK_SHORT.items():
-            lines.append(_format_task_line(name, short, by_name.get(name),
-                                           self.cfg.get("slots", [])))
-        self.sch_panel.set_task_status("\n".join(lines))
-        # 触发器清单行数随档位数变化，让窗口高度自适应
-        self.root.update_idletasks()
-        self.root.geometry("")
+        info = task_summary(text, self.cfg.get("slots", []))
+        self.sch_panel.set_task_status(info)
+        self.scroll.refresh()
         self._tray_update_tooltip()
 
 
-def _valid_hhmm(text):
+def _safe_int(text, fallback=0):
     try:
-        h, m = str(text).strip().split(":")
-        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        return int(float(str(text).strip()))
     except Exception:
-        return False
+        return fallback
 
 
+def task_summary(text, slots):
+    """把 query_task_status() 的原始文本变成界面要的一份结论。
 
+    返回 {"state": ok|warn|error|loading, "title": ..., "next": ..., "detail": ...}
+    """
+    by_name = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if "=" in line:
+            name, rest = line.split("=", 1)
+            if name in TASK_SHORT:
+                by_name[name] = rest
+    sched = by_name.get(TASK_SCHEDULE)
+    catch = by_name.get(TASK_CATCHUP)
+    if sched is None:
+        return {"state": "error", "title": "任务计划：读不到状态",
+                "next": "", "detail": "点「检测」重试；仍失败请用 --diag 排查"}
+    if sched == "MISSING":
+        return {"state": "warn", "title": "任务计划：未注册",
+                "next": "", "detail": "打开「启用每日定时」开关即可注册"}
+
+    bits = sched.split("|")
+    state = "已启用" if bits[0] == "Ready" else bits[0]
+    nxt = (bits[1] if len(bits) > 1 else "").strip()
+    swa = "补跑已开" if any("True" in b for b in bits[2:]) else "补跑未开"
+    trig = ""
+    for b in bits:
+        if b.startswith("TRIG="):
+            trig = b[5:]
+    times = sorted(int(v) for v in trig.split(",") if v.strip().isdigit())
+    by_time = {x.get("time"): x for x in slots}
+    extra = [t for t in times
+             if "%02d:%02d" % (t // 60, t % 60) not in by_time]
+    detail = "%d 个触发点 · %s · 登录校准%s" % (
+        len(times) or len(slots), swa,
+        "已注册" if (catch and catch != "MISSING") else "未注册")
+    if extra:
+        detail += " · %d 个触发点不在当前配置" % len(extra)
+    return {"state": "ok" if state == "已启用" and swa == "补跑已开" else "warn",
+            "title": "任务计划：%s" % state,
+            "next": ("下次 %s" % nxt) if nxt else "",
+            "detail": detail}
+
+
+# ============================================================
 # 八、入口
 # ============================================================
 # ---- 开机自启动（HKCU Run 键，免管理员）------------------------------------
@@ -2220,17 +4093,17 @@ def parse_screen_action(text):
 
 
 def cli_screen(action):
-    """熄灭/点亮选中的显示器（配置 monitors；空 = 全部），并记账屏幕状态。"""
+    """熄灭/点亮选中的显示器（配置里的选择；空 = 全部），并记账屏幕状态。"""
     cfg = load_config()
-    targets = cfg.get("monitors") or []
+    targets = resolve_monitors(cfg)
     if action == "off":
-        ok, errs = screen_off_many(targets)
-        _out("已熄灭 %d 台显示器" % len(ok) if ok else "熄灭失败")
+        ok, errs = screen_off_cfg(cfg, targets)
+        _out("已熄灭显示器" if ok else "熄灭失败")
     else:
-        ok, errs = screen_wake_many(targets)
-        _out("已点亮 %d 台显示器" % len(ok) if ok else "点亮失败")
+        ok, errs = screen_on_cfg(cfg, targets)
+        _out("已点亮显示器" if ok else "点亮失败")
     if ok:
-        cfg["screen_state"] = action
+        mark_screen_state(cfg, action)
         save_config(cfg)
     for i, e in errs:
         _out("显示器 %d：%s" % (i, e))
@@ -2251,8 +4124,8 @@ def main():
         if cmd == "--screen" and len(args) >= 2:
             arg = args[1].strip().lower()
             if arg == "status":
-                st = load_config().get("screen_state", "on")
-                _out("屏幕状态（软件操作记录）: %s" % ("熄灭中" if st == "off" else "点亮中"))
+                # 与界面同一套结论（记账为主，附一行依据）
+                _out(screen_verdict(load_config())["text"])
                 return
             action = parse_screen_action(args[1])
             if action is None:
@@ -2263,6 +4136,12 @@ def main():
         if cmd == "--list":
             cli_list()
             return
+        if cmd == "--probe":
+            cli_probe()
+            return
+        if cmd == "--diag":
+            cli_diag()
+            return
         if cmd == "--selftest":
             cli_selftest()
             return
@@ -2271,8 +4150,6 @@ def main():
     root = tk.Tk()
     App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)
-    if get_monitors is None:
-        messagebox.showerror("缺少依赖", "monitorcontrol 未能加载，请重新安装本程序。")
     root.mainloop()
 
 
