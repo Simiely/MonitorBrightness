@@ -6,6 +6,7 @@
   - 启动补检判定（错过阈值、同日同档防重）
   - 计划任务参数拼装与落盘 XML 校验
   - 「添加时间段」点击后 300ms 内出现可见弹窗，并能在弹窗里完成一次添加（需要可用 Tk）
+  - v1.9.2 任务重建成功：300ms 内可见「确认」窗，点确认销毁；失败/启动自愈不弹
 """
 import glob
 import html
@@ -287,6 +288,7 @@ class AddButtonRegression(TempConfigCase):
         fake.slots_saved = []
         fake.refresh_task_status = lambda: None
         fake.schedule_toggled = lambda value: None
+        fake.apply_schedule = lambda: None
 
         def on_slots_changed(slots):
             fake.slots_saved = list(slots)
@@ -337,6 +339,158 @@ class AddButtonRegression(TempConfigCase):
         disk = mb.load_config()
         self.assertEqual(len(disk["slots"]), 2, "必须落盘")
         self.assertIn("07:15", [s["time"] for s in disk["slots"]])
+
+
+class RebuildNoticeRegression(TempConfigCase):
+    """v1.9.2：重建成功 → 300ms 内出现可见「确认」窗 → 点确认销毁。
+
+    失败路径不得弹成功窗（只走 showerror）；启动自动重建也不弹（状态/事件反馈）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import tkinter as tk
+        except Exception as e:               # pragma: no cover
+            self.skipTest("没有 tkinter：%s" % e)
+        try:
+            self.root = tk.Tk()
+            self.root.withdraw()
+        except Exception as e:               # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        super().tearDown()
+
+    def _fake(self):
+        import tkinter as tk
+
+        class Msg:
+            def __init__(self, root):
+                self.box = mb.DarkBox(root)
+                self.errors = []
+                self.notices = []
+
+            def showerror(self, title, message):
+                self.errors.append((title, message))
+
+            def showinfo(self, *a):
+                pass
+
+            def shownotice(self, title, message):
+                self.notices.append((title, message))
+                return self.box.shownotice(title, message)
+
+        class Panel:
+            def set_enabled_flag(self, value):
+                self.flag = bool(value)
+
+        class FakeApp:
+            pass
+
+        cfg = mb.default_config()
+        cfg["enabled"] = True
+        cfg["slots"] = mb._coerce_slots([
+            {"time": "08:30", "level": 80},
+            {"time": "21:00", "level": 0},
+        ])
+        fake = FakeApp()
+        fake.root = self.root
+        fake.msg = Msg(self.root)
+        fake.status_var = tk.StringVar()
+        fake.cfg = cfg
+        fake.sch_panel = Panel()
+        fake.refresh_task_status = lambda: None
+        fake._refresh_events = lambda: None
+        fake.run_bg = lambda *a, **k: None
+        fake._catch_up_worker = lambda: None
+        fake._finish_auto_checks = lambda result: None
+        fake._announce_rebuilt = lambda *a: mb.App._announce_rebuilt(fake, *a)
+        return fake, cfg
+
+    @staticmethod
+    def _walk(widget):
+        for child in widget.winfo_children():
+            yield child
+            for sub in RebuildNoticeRegression._walk(child):
+                yield sub
+
+    def _top_levels(self):
+        import tkinter as tk
+        return [w for w in self.root.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.winfo_exists()]
+
+    def _stale_xml(self):
+        return ('<Task><Actions><Exec><Command>D:\\old\\MonitorBrightness.exe</Command>'
+                '<Arguments>--apply-schedule</Arguments></Exec></Actions>'
+                '<Triggers><CalendarTrigger>'
+                '<StartBoundary>2026-11-04T09:15:00</StartBoundary>'
+                '</CalendarTrigger></Triggers>'
+                '<Settings><Enabled>true</Enabled>'
+                '<StartWhenAvailable>true</StartWhenAvailable></Settings></Task>')
+
+    def test_success_notice_visible_then_confirm_destroys(self):
+        fake, cfg = self._fake()
+        part = {"slots": cfg["slots"], "enabled": True, "catch_up_on_logon": True}
+        out = "TaskInfo=NEVER|0|2026-11-04 21:00|Ready\nCatchUpTask=Ready\nREGISTER_OK"
+
+        mb.App._finish_register(fake, (True, out), part, self._stale_xml())
+
+        dialog = None
+        deadline = time.time() + 0.3
+        while time.time() < deadline:
+            self.root.update()
+            tops = self._top_levels()
+            if tops:
+                dialog = tops[-1]
+                if dialog.winfo_ismapped() and dialog.winfo_width() > 0:
+                    break
+            time.sleep(0.01)
+        self.assertIsNotNone(dialog, "重建成功后 300ms 内没有创建确认 Toplevel")
+        self.assertTrue(dialog.winfo_ismapped(), "确认窗存在但不可见")
+        self.assertGreater(dialog.winfo_width(), 0, "确认窗宽度为 0")
+
+        labels = [w.cget("text") for w in self._walk(dialog)
+                  if isinstance(w, mb.tk.Label)]
+        text = "\n".join(str(x) for x in labels)
+        self.assertIn("2 档", text)
+        self.assertIn("08:30", text)
+        self.assertIn("下次运行：11-04 21:00", text)
+        self.assertIn("已更新任务路径/触发点", text, "路径+触发点都变了必须写明")
+
+        confirm = [w for w in self._walk(dialog)
+                   if isinstance(w, mb.Button) and w.text() == "确认"]
+        self.assertEqual(len(confirm), 1, "确认窗里必须只有一个「确认」按钮")
+        confirm[0]._command()                 # 等价于一次点击
+        self.root.update()
+        self.assertFalse(dialog.winfo_exists(), "点「确认」后弹窗必须销毁")
+        self.assertEqual(fake.msg.errors, [])
+
+    def test_failure_does_not_show_success_notice(self):
+        fake, cfg = self._fake()
+        part = {"slots": cfg["slots"], "enabled": True, "catch_up_on_logon": True}
+
+        mb.App._finish_register(fake, (False, "注册子进程退出码 1"), part, "")
+
+        self.root.update()
+        self.assertEqual(self._top_levels(), [], "失败时不能弹成功确认窗")
+        self.assertEqual(len(fake.msg.errors), 1)
+        self.assertFalse(cfg["enabled"], "注册失败要把开关拨回去")
+        self.assertFalse(fake.sch_panel.flag)
+
+    def test_startup_auto_rebuild_does_not_pop_notice(self):
+        fake, _cfg = self._fake()
+        mb.App._finish_auto_checks(fake, {
+            "task": (True, "计划任务已按当前程序重建（程序路径不一致），2 档，下次 11-04 21:00"),
+            "catchup": {"due": False},
+        })
+        self.root.update()
+        self.assertEqual(self._top_levels(), [], "启动自动重建成功不应弹窗")
+        self.assertIn("重建", fake.status_var.get())
 
 
 if __name__ == "__main__":

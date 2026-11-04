@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 启动补执行 / 补执行失败都落在这里，界面直接读它展示
@@ -1874,6 +1874,10 @@ def ensure_task_registration(cfg, force=False):
     ok, out = register_tasks(cfg)
     if ok:
         event = "计划任务已按当前程序重建（%s）" % (reason or "手动强制")
+        nxt = _task_info_next(out)
+        if nxt:
+            # 启动自检不弹窗（每次开机都弹会糊脸），但事件日志要给足细节
+            event += "，%d 档，下次 %s" % (len(cfg.get("slots", [])), _short_dt(nxt))
         _write_event_log(event)
         return True, event
     detail = (out or "").strip().splitlines()
@@ -2073,24 +2077,59 @@ def _runtime_fields(text):
     return ("", "", "", "")
 
 
-def _saved_summary(part, out):
-    """注册成功后的提示正文（抽成函数，让回调保持短小）。"""
-    lines = ["定时任务已写入 Windows 任务计划程序："]
-    lines += ["• %s → %d%%%s" % (x["time"], x["level"],
-              "（同时熄屏）" if x.get("screen") == "off" else
-              "（同时点亮）" if x.get("screen") == "on" else "")
-              for x in part.get("slots", [])]
-    if not part["catch_up_on_logon"]:
-        lines.append("• 登录后自动校准：未开启")
-    elif "CATCHUP=FAIL" in (out or ""):
-        reason = out.split("CATCHUP=FAIL", 1)[1].strip().splitlines()[0].strip()
-        lines.append("• 登录后自动校准：注册失败")
-        lines.append("  原因：%s" % reason)
+def _task_info_next(out):
+    """从 register_tasks 的 TaskInfo= 行取下次运行时间；没有返回 ""。"""
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("TaskInfo="):
+            bits = line[9:].split("|")
+            nxt = bits[2].strip() if len(bits) > 2 else ""
+            return "" if nxt in ("NONE", "MISSING", "NEVER") else nxt
+    return ""
+
+
+def _rebuild_changes(before_xml, cfg):
+    """重建前后任务定义差异：[] / ["任务路径"] / ["触发点"] / 两者。"""
+    if not before_xml:
+        return ["任务路径", "触发点"]         # 原本没有任务，路径+触发点都是新写的
+    command, arguments = _task_definition(before_xml)
+    exe, arg = _task_action(cfg)
+    changed = []
+    if not _same_path(command, exe) or arguments.strip() != arg.strip():
+        changed.append("任务路径")
+    old_bounds = sorted(set(_boundary_minutes_all(before_xml)))
+    new_bounds = sorted({parse_hhmm(s.get("time"), (0, 0))
+                         for s in cfg.get("slots", [])})
+    if old_bounds != new_bounds:
+        changed.append("触发点")
+    return changed
+
+
+def _rebuild_report(cfg, out, before_xml):
+    """重建成功后的确认正文：档位数量、下次运行、改了什么。"""
+    slots = sorted(cfg.get("slots", []),
+                   key=lambda s: parse_hhmm(s.get("time"), (0, 0)))
+    times = [s.get("time") for s in slots]
+    lines = ["任务计划已重建成功。", "",
+             "• 触发档位：%d 档" % len(slots)]
+    if times:
+        # 用空格分隔，Tk Label 只在空格处换行；顿号连写会整行被裁掉
+        lines.append("   " + "  ".join(times))
+    nxt = _task_info_next(out)
+    if not nxt:
+        minutes = sorted({parse_hhmm(t, (0, 0)) for t in times})
+        if minutes:
+            nxt = _next_run_text(minutes)
+    lines.append("• 下次运行：%s" % (_short_dt(nxt) if nxt
+                                    else "未取到（点「检测」刷新）"))
+    changed = _rebuild_changes(before_xml, cfg)
+    if changed:
+        lines.append("• 已更新%s" % "/".join(changed))
+    if cfg.get("catch_up_on_logon", True):
+        lines.append("• 登录后自动校准：%s"
+                     % ("注册失败" if "CATCHUP=FAIL" in (out or "") else "已注册"))
     else:
-        lines.append("• 登录后自动校准：已注册")
-    lines += ["",
-              "已开启「错过后尽快补跑」：电脑关机/睡眠错过时间点，开机后也会自动补上。",
-              "本程序无需常驻后台。"]
+        lines.append("• 登录后自动校准：未开启")
     return "\n".join(lines)
 
 
@@ -2558,6 +2597,37 @@ class DarkBox:
 
     def showerror(self, title, message):
         self._show("error", title, message)
+
+    def shownotice(self, title, message):
+        """成功提示（非阻塞）：自绘深色窗 + 单个「确认」按钮。
+
+        和 _show 的区别：不 wait_window，回调链不会被弹窗卡住；窗口仍是普通
+        Toplevel + 子控件（没有 UpdateLayeredWindow），子控件由 DWM 正常合成。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.withdraw()          # 防双屏跳位：定位完成前不显示
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.configure(background=UI["card"])
+        apply_dark_titlebar(dlg)
+        body = tk.Frame(dlg, background=UI["card"])
+        body.pack(fill="both", expand=True, padx=20, pady=(18, 4))
+        tk.Label(body, text="\u2713", fg=UI["green"], bg=UI["card"],
+                 font=("Segoe UI Symbol", 18)).pack(side="left", padx=(0, 14))
+        tk.Label(body, text=message, fg=UI["text"], bg=UI["card"],
+                 font=("Microsoft YaHei UI", 10), justify="left",
+                 wraplength=360).pack(side="left")
+        Button(dlg, "确认", dlg.destroy, kind="primary", width=96,
+               height=32, pad_bg=UI["card"]).pack(pady=(8, 16))
+        dlg.bind("<Return>", lambda e: dlg.destroy())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self._center(dlg)
+        dlg.lift()
+        try:
+            dlg.grab_set()      # 只拦输入，不阻塞事件循环
+        except Exception:
+            pass
+        return dlg
 
     def askyesno(self, title, message, yes="继续", no="取消"):
         """是/否确认框（深色）。返回 True/False。"""
@@ -3635,6 +3705,11 @@ class SchedulePanel:
                                      kind="link", width=40, height=22,
                                      pad_bg=UI["card"])
         self.probe_task_btn.pack(side="right")
+        # 显式重建入口：v1.9.2 之前只有改开关/改时间段才会写任务，
+        # 用户想"按现在配置再来一遍"时没有按钮可点。
+        self.apply_btn = Button(st, "应用", app.apply_schedule, kind="secondary",
+                                width=52, height=22, pad_bg=UI["card"])
+        self.apply_btn.pack(side="right", padx=(0, 6))
         self.task_next = Label(st, "", size=8, color=UI["text3"], bg=UI["card"])
         self.task_next.pack(side="right", padx=(0, 8))
         self.task_sub = Label(self.inner, "", size=8, color=UI["text3"],
@@ -3762,6 +3837,7 @@ class SchedulePanel:
         # 添加/编辑是本地操作，只受"正在执行"影响，不受定时开关影响
         self.add_btn.set_enabled(enabled)
         self.probe_task_btn.set_enabled(enabled)
+        self.apply_btn.set_enabled(enabled)
 
 
 class SettingsSheet(Sheet):
@@ -4635,6 +4711,8 @@ class App:
             return
         _task_ok, task_msg = result.get("task", (True, ""))
         cu = result.get("catchup") or {}
+        # 启动自愈成功时不弹「确认」窗：每次启动都可能发生（换 exe 路径后尤其），
+        # 开机即弹会糊脸；反馈走状态卡 + 事件日志（task_msg 已含档位数/下次运行）。
         if task_msg:
             self.status_var.set(task_msg)
         if cu.get("due"):
@@ -4716,10 +4794,52 @@ class App:
             self.msg.showerror("保存失败", msg)
             return
         self.status_var.set("正在写入任务计划…")
+        before_xml = _read_task_xml()          # 留一份重建前定义，用于比对变化
         self.run_bg(lambda: register_tasks(self.cfg),
-                    lambda r: self._finish_register(r, part), busy=True)
+                    lambda r: self._finish_register(r, part, before_xml), busy=True)
 
-    def _finish_register(self, result, part):
+    def apply_schedule(self):
+        """「应用」按钮：按当前面板内容强制重建任务计划（成功弹确认窗）。"""
+        if not self.sch_panel.schedule_enabled():
+            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
+            return
+        slots = self.sch_panel.read_slots()
+        if slots is None:
+            return
+        part = {"slots": slots, "enabled": True,
+                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True))}
+        self.cfg["slots"] = [dict(s) for s in slots]
+        ok, msg = save_config(self.cfg)
+        if not ok:
+            self.msg.showerror("保存失败", msg)
+            return
+        self.status_var.set("正在重建任务计划…")
+        before_xml = _read_task_xml()
+        self.run_bg(lambda: register_tasks(self.cfg),
+                    lambda r: self._finish_apply(r, part, before_xml), busy=True)
+
+    def _announce_rebuilt(self, part, out, before_xml, title):
+        """重建成功后的「确认」弹窗（失败路径绝不调用这里）。
+
+        run_bg 的完成回调本来就由 _poll_read_queue 在 Tk 线程执行；再 after(0)
+        一次是为了让弹窗与回调栈彻底分开，也满足"后台线程结果必须回 Tk 线程"。
+        """
+        message = _rebuild_report(part, out, before_xml)
+        self.root.after(0, lambda: self.msg.shownotice(title, message))
+
+    def _finish_apply(self, result, part, before_xml):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            self.msg.showerror("重建任务计划失败", out or "未知错误")
+            self.status_var.set("重建任务计划失败")
+            return
+        self.refresh_task_status()
+        self.status_var.set("任务计划已重建")
+        self._announce_rebuilt(part, out, before_xml, "任务计划已重建")
+
+    def _finish_register(self, result, part, before_xml=""):
         if isinstance(result, Exception):
             result = (False, str(result))
         ok, out = result
@@ -4733,7 +4853,7 @@ class App:
             return
         self.refresh_task_status()
         self.status_var.set("定时已启用")
-        self.msg.showinfo("定时已保存", _saved_summary(part, out))
+        self._announce_rebuilt(part, out, before_xml, "定时已保存")
         # 启用时如果今天这一档已经过去（例如 12:08 才启用 08:30），立即补一次
         self.run_bg(self._catch_up_worker, self._finish_auto_checks)
 
