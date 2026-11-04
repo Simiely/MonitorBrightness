@@ -1,6 +1,6 @@
 # AGENTS.md · 项目规则
 
-> 📌 **文档基线**：2026-11-03（v1.7.0：自带 dxva2 后端 + 快捷预设 + 亮灭探测 + 分级唤醒）
+> 📌 **文档基线**：2026-11-04（v1.9.0：定时任务启动自愈 + 启动补检 + 键入式时间控件）
 > **更新文档/代码后，请更新此行**（日期 + 新 commit hash），并在 CHANGELOG 追加版本
 
 ## 技术栈
@@ -129,6 +129,38 @@
   序号写错若退化成"全部"则会动到不该动的屏。CLI 用 `parse_level_arg()` / `parse_index_arg()`
   严格校验，不合法一律退出码 `2`。
 - **DDC/CI 前提** → 显示器 OSD 必须开启 DDC/CI，且 HDMI/DP/DVI 直连；否则枚举不到显示器。
+- **重建任务不要先删后建** → 旧实现 `Unregister + Register` 每次都会把 `LastRunTime`
+  重置成"从未运行"，用户看到的就是"定时从来没跑过"。v1.9.0 起优先 `Set-ScheduledTask`
+  原地更新，失败才回退卸载重注册。
+- **任务 action 会随 exe 目录过期** → 每版构建目录都在变（`dist_vXXX`），只靠"用户点应用"
+  重建必然滞后。启动时必须读 `C:\Windows\System32\Tasks\<任务名>` 比对
+  程序路径 / 参数 / 全部触发点 / `StartWhenAvailable`，不一致就静默重建。
+- **重建当天的过去档位不会触发** → `New-ScheduledTaskTrigger -Daily -At <过去时刻>` 的
+  `NextRunTime` 是明天；今天已过去的档位只能靠启动补检（`catch_up_decision`）兜底，
+  所以"重建"和"补执行"必须成对存在。
+- **补检只看今天的档位** → 早上 7 点开机不能把昨晚 21:00 的夜间档再套一遍；否则一开电脑
+  就熄屏。判定见 `catch_up_decision`（今天已到点的最后一档、错过 ≤12h、`last_fired` 防重）。
+- **`last_fired` 保存时可能与磁盘冲突** → 计划任务在后台写、GUI 手里是启动时的旧 cfg；
+  直接整文件覆盖会把"今天已执行"冲掉，下次启动又补一遍（若该档带熄屏，会二次熄屏）。
+  `save_config` 必须与磁盘记录取较新者。
+- **配置必须原子写** → `config.json` 被外部读取（任务/诊断）时不能出现半个文件；
+  用同目录 `mkstemp + os.replace`。读失败要留 `config.json.bad-*.json` 副本并提示，
+  不能静默回默认值（用户设置还在坏文件里）。
+- **能力串/亮度上限缓存必须带 EDID** → 输出口名（DISPLAY1/2）在换面板后不变，
+  只按 dev 缓存会把旧面板的上限/待机能力套到新面板。key 用 `DEV#EDID 短哈希`。
+- **唤醒用 `mouse_event` 会动真实光标** → v1.8.5 用移 1px 再移回来，仍是真实输入
+  （全屏游戏/远程协助可感知）。改用 `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`。
+- **线程超时后不能销毁它还在用的句柄** → `join(30)` 超时只代表"不等了"，不代表线程结束。
+  唤醒/型号线程改为"谁用谁销毁"（线程 finally 里 `DestroyPhysicalMonitor`），
+  调用方只释放没交给线程的句柄。
+- **默认 `ddc` + `ddc_allow_undeclared=False` 会让新装熄不掉屏** → 面板能力串不声明
+  `D6(01 04 05)`，`_caps_power` 全跳过，按钮像没反应。v1.9.0 默认改回 `system`。
+- **时间控件不要再用左右拖动** → 用户明确反馈不好用；现在是可键入 `HH:MM`
+  （兼容 `9:5` / 全角冒号 / `0905`）+ ▲▼ 15 分钟步进 + 常用预设。
+- **Pillow 必须守卫 import** → 它只服务 GUI 的圆角贴图；缺 Pillow 时 CLI 必须照常可用，
+  GUI 明确报错退出。README 的依赖表要与代码一致。
+- **GUI 启动前必须声明 DPI 感知** → 否则 125%/150% 下整窗被位图拉伸；
+  `ScrollArea` 限高要用当前屏 `rcWork`，不能用主屏全高（多屏会顶出工作区）。
 - **计划任务里的程序路径** → 打包态用自身 exe；**源码态必须把脚本路径带上**
   （`sys.executable` 是 `python.exe` 而非目标程序）。见 `task_target()`。
 - **型号只能从 MCCS 能力串里取** → `dxva2.GetCapabilitiesStringLength` +
@@ -161,7 +193,9 @@ python monitor_brightness.py --probe            # 实测每台显示器的亮灭
 python monitor_brightness.py --diag             # 只读诊断报告（排查点不亮）
 python monitor_brightness.py --selftest         # 打印档位判定自检表（不碰显示器）
 python monitor_brightness.py --apply-schedule   # 按当前时间套用档位
+python monitor_brightness.py --ensure-schedule  # 按当前配置/当前 exe 重建计划任务
 python monitor_brightness.py --set 0,1 50       # 命令行设亮度（all 也可）
+python -m unittest discover -s tests -v         # 不碰硬件的回归测试
 ```
 
 - 打包：见 [README](README.md)「从源码运行」

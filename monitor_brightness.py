@@ -30,7 +30,11 @@ import os
 import re
 import math
 import json
+import html
 import queue
+import shutil
+import hashlib
+import tempfile
 import threading
 import subprocess
 import time
@@ -41,6 +45,16 @@ from datetime import datetime, timezone
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
+
+# Pillow 只有 GUI 需要（抗锯齿圆角贴图）。**必须有守卫**：
+# 缺 Pillow 时 CLI（--set / --apply-schedule / --diag / --selftest）照常工作，
+# GUI 在 main() 里给一句明确报错后退出，不能因为 import 失败把整个程序拖死。
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    PIL_OK = True
+except Exception:
+    Image = ImageDraw = ImageTk = None
+    PIL_OK = False
 
 # 托盘（可选依赖）：缺 pystray 时 GUI 照常工作，仅没有托盘/最小化到托盘能力
 try:
@@ -55,9 +69,16 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.9.0"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# 事件日志：任务重建 / 启动补执行 / 补执行失败都落在这里，界面直接读它展示
+EVENTS_FILE = os.path.join(CONFIG_DIR, "events.log")
+
+# 启动补检的最大错过时长（分钟）。取 12 小时的理由：
+# 覆盖"前一晚关机、早上开机后才想起"的整个工作日；超过 12 小时的档位意图已经过期，
+# 往往下一档就在眼前，再补会把白天亮度硬套到夜里。
+CATCH_UP_LIMIT_MIN = 12 * 60
 
 TASK_SCHEDULE = "MonitorBrightness_Schedule"
 TASK_CATCHUP = "MonitorBrightness_CatchUp"
@@ -154,16 +175,21 @@ SETTINGS = (
     {"key": "screen_off_tick", "kind": "int", "default": 0},
     # 熄灭方式：system = Windows 系统级整组熄灭（默认，一定唤得回来）
     #           ddc    = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，慎用）
+    # ⚠️ v1.9.0 起默认改为 system。旧默认 ddc + ddc_allow_undeclared=False 会让
+    #    新装用户点「熄灭」时被"面板未声明待机"闸门全部跳过，表现为按钮没反应。
     {"key": "screen_off_method", "kind": "choice",
-     "values": ("system", "ddc"), "default": "ddc"},
+     "values": ("system", "ddc"), "default": "system"},
     # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
     {"key": "wake_switch_input", "kind": "flag", "default": True},
     # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
     # 用户在界面里选择"DDC 单屏待机"并确认风险后才会置 True。
     {"key": "ddc_allow_undeclared", "kind": "flag", "default": False},
+    # 定时防重复记账：{"date": "YYYY-MM-DD", "slot": "HH:MM", "at": "YYYY-MM-DD HH:MM:SS"}
+    # 计划任务与启动补检都写这里；同一天同一档只执行一次（save 时还会与磁盘取较新者）。
+    {"key": "last_fired", "kind": "fired", "default": {}},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 
 def coerce_setting(key, value):
     """按声明表把值规整到合法域；非法/缺失一律回落默认值。"""
@@ -197,6 +223,8 @@ def coerce_setting(key, value):
             return max(0, int(value))
         except Exception:
             return spec["default"]
+    if kind == "fired":
+        return _coerce_fired(value)
     if kind == "screenstate":
         # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
         return value if value in ("on", "off") else spec["default"]
@@ -242,6 +270,32 @@ def _valid_hhmm(text):
         return False
 
 
+def normalize_time_input(text):
+    """把用户键入的各种写法规整成 'HH:MM'；非法返回 None。
+
+    接受 `9:5` / `09：05`（全角冒号）/ `0905` 这类写法；
+    这是新时间输入框的"可键入"能力，单测直接覆盖。
+    """
+    s = str(text or "").strip().replace("：", ":").replace(" ", "")
+    m = re.match(r"^(\d{1,2}):(\d{1,2})$", s)
+    if not m:
+        m = re.match(r"^(\d{1,2})(\d{2})$", s)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return "%02d:%02d" % (h, mi)
+
+
+def shift_time(text, delta_min):
+    """'HH:MM' ± N 分钟（跨午夜回绕），返回 'HH:MM'。"""
+    base = normalize_time_input(text) or "12:00"
+    h, mi = int(base[:2]), int(base[3:])
+    total = (h * 60 + mi + delta_min) % (24 * 60)
+    return "%02d:%02d" % (total // 60, total % 60)
+
+
 def _valid_stamp(text):
     """记账时间点形状：'MM-DD HH:MM'（自己写的，只认这一种）。"""
     return bool(re.match(r"^\d{2}-\d{2} \d{2}:\d{2}$", text or ""))
@@ -251,6 +305,72 @@ def stamp_now():
     return datetime.now().strftime("%m-%d %H:%M")
 
 
+def _coerce_fired(value):
+    """last_fired 规整：只认 {"date": YYYY-MM-DD, "slot": HH:MM}。
+
+    at 是完整时间戳（秒级），只用于和磁盘上的记录比"谁更新"，缺省按当天 0 点算。
+    """
+    if not isinstance(value, dict):
+        return {}
+    date = str(value.get("date", "")).strip()
+    slot = str(value.get("slot", "")).strip()
+    at = str(value.get("at", "")).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date) or not _valid_hhmm(slot):
+        return {}
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", at):
+        at = date + " 00:00:00"
+    return {"date": date, "slot": slot, "at": at}
+
+
+def _fired_newer(a, b):
+    """a 是否比 b 更新（都是 _coerce_fired 的结果）。"""
+    if not a:
+        return False
+    if not b:
+        return True
+    return a.get("at", "") > b.get("at", "")
+
+
+def mark_fired(cfg, slot, when=None):
+    """记下"今天这一档已经执行过"，供启动补检防重复。"""
+    when = when or datetime.now()
+    slot = slot or {}
+    cfg["last_fired"] = {"date": when.strftime("%Y-%m-%d"),
+                         "slot": str(slot.get("time", "")),
+                         "at": when.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _write_event_log(text):
+    """追加一行事件日志（线程安全）。返回写入的那一行。"""
+    line = "%s %s" % (datetime.now().strftime("%m-%d %H:%M"), text)
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with _EVENT_LOCK:
+            try:
+                if os.path.getsize(EVENTS_FILE) > 256 * 1024:
+                    os.replace(EVENTS_FILE, EVENTS_FILE + ".1")
+            except OSError:
+                pass
+            with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+    return line
+
+
+def read_recent_events(limit=3):
+    """读事件日志最后几行，界面用来显示「今天 08:15 补执行」这类记录。"""
+    try:
+        with open(EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = [x.strip() for x in f.readlines() if x.strip()]
+        return lines[-limit:]
+    except Exception:
+        return []
+
+
+_EVENT_LOCK = threading.Lock()
+
+
 def _coerce_slots(value):
     """把各种写法规整成 [{time, level}]：按时间排序、时间去重、亮度 0-100、至少一档。"""
     out, seen = [], set()
@@ -258,8 +378,10 @@ def _coerce_slots(value):
         for item in value:
             if not isinstance(item, dict):
                 continue
-            t = str(item.get("time", "")).strip()
-            if not _valid_hhmm(t) or t in seen:
+            # 兼容旧写法：9:5 / 09：05 / 0905 统一成 09:05，顺带把"同一分钟"
+            # 的不同写法去重（否则会注册两个同一时刻的触发器）
+            t = normalize_time_input(item.get("time")) or ""
+            if not t or t in seen:
                 continue
             seen.add(t)
             try:
@@ -288,49 +410,118 @@ def _load_model_cache(raw):
     return {}
 
 
+# 配置读取失败时的说明（GUI 启动后显式提示；CLI 不受影响）
+CONFIG_LOAD_ERROR = ""
+
+
+def _backup_bad_config(reason):
+    """读坏时把原文件留一份副本，避免下一次保存把它彻底覆盖掉。"""
+    try:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = "%s.bad-%s.json" % (CONFIG_FILE, stamp)
+        shutil.copy2(CONFIG_FILE, bak)
+        return "配置文件读取失败（%s）。已备份为 %s，本次使用默认值。" % (reason, bak)
+    except Exception:
+        return "配置文件读取失败（%s）。备份失败，本次使用默认值。" % reason
+
+
 def load_config():
     """读取配置；兼容 v1.0.0 的单选字段 monitor（int）→ v2 的 monitors（list）。
 
     逐键走 coerce_setting，所以新增一个设置**不用**再来这里加一行校验。
+    读坏时不再静默吞掉：备份坏文件 + 把原因记到 CONFIG_LOAD_ERROR，由界面提示。
     """
+    global CONFIG_LOAD_ERROR
+    CONFIG_LOAD_ERROR = ""
     cfg = default_config()
+    if not os.path.exists(CONFIG_FILE):
+        return cfg
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                # v2 -> v3 迁移：day/night 四键 -> slots 两档
-                if "slots" not in raw and "day_time" in raw:
-                    raw = dict(raw, slots=[
-                        {"time": raw.get("day_time", "09:00"),
-                         "level": raw.get("day_level", 80)},
-                        {"time": raw.get("night_time", "20:00"),
-                         "level": raw.get("night_level", 30)}])
-                # v1 -> v2 迁移：旧配置只有 "monitor": 0
-                if "monitors" not in raw and "monitor" in raw:
-                    raw = dict(raw, monitors=[raw["monitor"]])
-                # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）
-                for _dev, _caps in (raw.get("caps") or {}).items():
-                    if isinstance(_caps, str) and _caps:
-                        _CAPS_CACHE.setdefault(_dev, _caps)
-                for key in SETTING_BY_KEY:
-                    if key in raw:
-                        cfg[key] = coerce_setting(key, raw[key])
-                cfg["models"] = _load_model_cache(raw)
-    except Exception:
-        pass
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("顶层不是 JSON 对象")
+        # v2 -> v3 迁移：day/night 四键 -> slots 两档
+        if "slots" not in raw and "day_time" in raw:
+            raw = dict(raw, slots=[
+                {"time": raw.get("day_time", "09:00"),
+                 "level": raw.get("day_level", 80)},
+                {"time": raw.get("night_time", "20:00"),
+                 "level": raw.get("night_level", 30)}])
+        # v1 -> v2 迁移：旧配置只有 "monitor": 0
+        if "monitors" not in raw and "monitor" in raw:
+            raw = dict(raw, monitors=[raw["monitor"]])
+        # v5 -> v6 迁移：旧默认「ddc + 不允许未声明值」= 逐台全被闸门跳过，
+        # 表现就是点熄灭没反应。主动选过 DDC 的用户会在确认框里被置
+        # ddc_allow_undeclared=True，所以这条组合只可能是没动过的旧默认。
+        try:
+            _ver = int(raw.get("version") or 0)
+        except Exception:
+            _ver = 0
+        if (_ver < 6 and raw.get("screen_off_method") == "ddc"
+                and not raw.get("ddc_allow_undeclared")):
+            raw = dict(raw, screen_off_method="system")
+        # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）。
+        # v1.9.0 起 key 里带 EDID 短哈希（dev#uid），旧 dev-only 键不再播种：
+        # 换面板后不会沿用旧缓存，代价只是首次重新实测一次。
+        for _dev, _caps in (raw.get("caps") or {}).items():
+            if isinstance(_caps, str) and _caps and "#" in str(_dev):
+                _CAPS_CACHE.setdefault(_dev, _caps)
+        for key in SETTING_BY_KEY:
+            if key in raw:
+                cfg[key] = coerce_setting(key, raw[key])
+        cfg["models"] = _load_model_cache(raw)
+    except Exception as e:
+        CONFIG_LOAD_ERROR = _backup_bad_config("%s: %s" % (type(e).__name__, e))
     return cfg
 
 
+def _atomic_write_text(path, text):
+    """原子写：同目录 mkstemp + os.replace，断电/并发读都不会读到半个文件。"""
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_disk_last_fired():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return coerce_setting("last_fired", raw.get("last_fired")) \
+            if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
 def save_config(cfg):
+    """保存配置。原子写 + last_fired 与磁盘取较新者。
+
+    为什么 last_fired 要合并：计划任务在后台跑 --apply-schedule 时也会写它，
+    而 GUI 常驻进程手里的 cfg 是启动时读的；如果 GUI 之后随手保存一次，
+    就会把任务刚写的"今天已执行"覆盖回旧值 → 下次启动又补执行一遍。
+    """
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
         if _CAPS_CACHE:
             payload["caps"] = dict(_CAPS_CACHE)
         payload["version"] = CONFIG_VERSION
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        mine = coerce_setting("last_fired", cfg.get("last_fired"))
+        payload["last_fired"] = mine
+        disk = _read_disk_last_fired()
+        if _fired_newer(disk, mine):
+            payload["last_fired"] = disk
+        _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -589,22 +780,75 @@ def _capabilities(handle):
         return ""
 
 
-# 能力串缓存：dev 名 -> 能力串。能力串是面板的静态固件属性（实测 3.1s/台），
+_EDID_CACHE = {}
+
+
+class _DISPLAY_DEVICE(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD),
+                ("DeviceName", wintypes.WCHAR * 32),
+                ("DeviceString", wintypes.WCHAR * 128),
+                ("StateFlags", wintypes.DWORD),
+                ("DeviceID", wintypes.WCHAR * 128),
+                ("DeviceKey", wintypes.WCHAR * 128)]
+
+
+def _display_uid(dev):
+    """取该输出口对应显示器的稳定标识（8 位短哈希）。
+
+    为什么不能只按 dev 名（DISPLAY1/DISPLAY2）缓存：拔线换面板后输出口名不变，
+    旧的能力串/亮度上限会继续套在新面板上（例如上限 255 的屏被当成 100）。
+
+    最稳的是 EDID；但本机（Lenovo Legion）实测 MONITOR 枚举键下没有
+    `Device Parameters\\EDID`，故改用 EnumDisplayDevicesW 的 DeviceID
+    （形如 `MONITOR\\LEN68C7\\{...}\\0005`）：它按"显示器设备实例"区分，
+    两块同型号屏也是不同实例；换面板时 Windows 会生成新实例，标识随之变化。
+    取不到时返回 ""，退回 dev-only 键 —— 只是退回旧行为，不会更糟。
+    """
+    if not dev:
+        return ""
+    if dev in _EDID_CACHE:
+        return _EDID_CACHE[dev]
+    uid = ""
+    try:
+        user32 = ctypes.windll.user32
+        dd = _DISPLAY_DEVICE()
+        dd.cb = ctypes.sizeof(dd)
+        # 枚举显示器的 lpDevice 必须是适配器全名 "\\.\DISPLAY1"；
+        # 本项目内部存的是短名 "DISPLAY1"，直接传会一直返回失败。
+        adapter = str(dev) if str(dev).startswith("\\\\.\\") else "\\\\.\\" + str(dev)
+        if user32.EnumDisplayDevicesW(adapter, 0, ctypes.byref(dd), 0):
+            did = str(dd.DeviceID).strip()
+            if did:
+                uid = hashlib.sha1(did.encode("utf-8")).hexdigest()[:8]
+    except Exception:
+        uid = ""
+    _EDID_CACHE[dev] = uid
+    return uid
+
+
+def _display_key(t):
+    """缓存键：`DISPLAY1#a1b2c3d4`。取不到显示器标识时退回 `DISPLAY1`。"""
+    dev = str(t.get("dev") or "")
+    uid = _display_uid(dev)
+    return ("%s#%s" % (dev, uid)) if uid else dev
+
+
+# 能力串缓存：display key -> 能力串。能力串是面板的静态固件属性（实测 3.1s/台），
 # 每次熄灭前都重读一遍曾让 DDC 熄灭耗时 6.3s/2 台 —— 缓存后只剩真正的写入
 # (~62ms/台)。随配置持久化（load_config 播种 / save_config 写回），
-# 换显示器后首次仍会实测刷新。
+# 换显示器后 EDID 变化 → key 不命中 → 首次实测刷新。
 _CAPS_CACHE = {}
 
 
-def _capabilities_cached(handle, dev):
-    """优先读缓存的能力串；dev 为空或缓存未命中时实读（读到了就缓存）。"""
-    if dev:
-        got = _CAPS_CACHE.get(dev)
+def _capabilities_cached(handle, key):
+    """优先读缓存的能力串；key 为空或缓存未命中时实读（读到了就缓存）。"""
+    if key:
+        got = _CAPS_CACHE.get(key)
         if got:
             return got
     caps = _capabilities(handle)
-    if caps and dev:
-        _CAPS_CACHE[dev] = caps
+    if caps and key:
+        _CAPS_CACHE[key] = caps
     return caps
 
 
@@ -659,12 +903,12 @@ def _caps_power(caps):
     return out
 
 
-def monitor_model(handle, dev=None):
+def monitor_model(handle, key=None):
     """从能力串里取型号（如 'Legion R27qe Gen2'）。取不到返回 None。
 
-    传 dev 走缓存；不传则实读（保持旧语义）。
+    传 display key（见 _display_key）走缓存；不传则实读（保持旧语义）。
     """
-    return _caps_model(_capabilities_cached(handle, dev))
+    return _caps_model(_capabilities_cached(handle, key))
 
 
 def monitor_label(index, info=None, model=None):
@@ -682,15 +926,17 @@ def monitor_label(index, info=None, model=None):
     return "%d: %s" % (index, " · ".join(parts))
 
 
-# 设备名 -> 0x10 的上限（多数是 100，少数 255）。按设备名缓存，避免每次写都多跑一趟 DDC。
+# display key（DEV#EDID）-> 0x10 的上限（多数是 100，少数 255）。按面板缓存，
+# 避免每次写都多跑一趟 DDC；换面板后 key 变化，不会沿用旧上限。
 _MAX_LUM = {}
 
 
 def _luminance_max(t):
-    if t["dev"] not in _MAX_LUM:
+    key = _display_key(t)
+    if key not in _MAX_LUM:
         got = _read_vcp(t["handle"], VCP_BRIGHTNESS)
-        _MAX_LUM[t["dev"]] = got[1] if got and got[1] else 100
-    return _MAX_LUM[t["dev"]]
+        _MAX_LUM[key] = got[1] if got and got[1] else 100
+    return _MAX_LUM[key]
 
 
 def _raw_from_percent(t, level):
@@ -943,22 +1189,31 @@ def screen_off_system():
 
 
 def screen_on_system():
-    """系统级点亮，并补一次输入事件（Windows 有时不主动重发画面）。"""
+    """系统级点亮，并补一次"显示需求"声明（Windows 有时不主动重发画面）。"""
     ok = _broadcast_monitor_power(SC_ON)
-    _nudge_user_input()
+    _request_display_on()
     return ok
 
 
-def _nudge_user_input():
-    """喂一次真实的用户输入事件。
+ES_CONTINUOUS = 0x80000000
+ES_DISPLAY_REQUIRED = 0x00000002
 
-    Windows 有时在收到点亮命令后仍不重发画面（它仍认为显示器处于关闭状态），
-    一次微小的鼠标移动就能把它踢回"有显示"。移 1 像素再移回来，肉眼无感。
+
+def _request_display_on():
+    """向系统声明"现在需要显示"，不移动真实光标。
+
+    v1.8.5 及更早用 mouse_event 把光标移 1 像素再移回来。虽然肉眼几乎无感，
+    但它确实是**真实输入**：会打断"用户是不是在操作"的判断（全屏游戏、演示、
+    远程协助里都能被感知），鼠标落在屏幕边缘时还可能出现 1px 抖动。
+    改成 SetThreadExecutionState(ES_DISPLAY_REQUIRED)：语义就是"强制显示器退出
+    低功耗状态"，不产生任何输入事件。它只对"系统把屏关掉"有效；DDC 面板
+    自身待机仍靠上面的 0xD6=1 / 重新驱动输出。
     """
     try:
-        u = ctypes.windll.user32
-        u.mouse_event(0x0001, 1, 0, 0, 0)      # MOUSEEVENTF_MOVE
-        u.mouse_event(0x0001, -1, 0, 0, 0)
+        k = ctypes.windll.kernel32
+        k.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
+        time.sleep(0.2)
+        k.SetThreadExecutionState(ES_CONTINUOUS)
         return True
     except Exception:
         return False
@@ -979,7 +1234,7 @@ def _switch_input_roundtrip(t):
     if not got:
         return False
     cur = got[0]
-    declared = [c for c in _caps_inputs(_capabilities_cached(h, t.get("dev")))
+    declared = [c for c in _caps_inputs(_capabilities_cached(h, _display_key(t)))
                 if 15 <= c <= 19]
     cand = [c for c in (declared or [15, 16, 17, 18, 19]) if c != cur]
     if not cand:
@@ -1029,10 +1284,10 @@ def _wake_one(t, allow_switch=True, expect_off=True):
 
     output_recycled = False
     if not expect_off:
-        _nudge_user_input()          # 屏幕本来就亮着：只喂输入，别去动输出
+        _request_display_on()        # 屏幕本来就亮着：只声明显示需求，别去动输出
     else:
         output_recycled = _output_recycle()
-        _nudge_user_input()
+        _request_display_on()
     stage = max(stage, 3)
     time.sleep(0.35)
 
@@ -1075,7 +1330,7 @@ def screen_off_many(indices, allow_undeclared=False):
         picked, bad = _select(targets, indices)
         errs.extend(bad)
         for t in picked:
-            declared = _caps_power(_capabilities_cached(t["handle"], t["dev"]))
+            declared = _caps_power(_capabilities_cached(t["handle"], _display_key(t)))
             if POWER_STANDBY not in declared and not allow_undeclared:
                 errs.append((t["index"], "面板未声明支持待机(0xD6=2)%s，已跳过"
                              "（要强制启用请重选「单屏待机」并确认风险）"
@@ -1105,30 +1360,46 @@ def screen_wake_many(indices, allow_switch=True, expect_off=True):
         raise RuntimeError(NO_MONITOR_MSG)
     picked, bad = _select(targets, indices)
     results = {}
+    lib = _dxva2()
 
     def work(t):
         try:
             results[t["index"]] = _wake_one(t, allow_switch, expect_off)
         except Exception as e:
             results[t["index"]] = (False, 0, str(e))
+        finally:
+            # 句柄所有权归线程：即使 join 超时、本函数先返回，也不会出现
+            # "主线程 DestroyPhysicalMonitor、线程还在用这个句柄"的 use-after-free。
+            # DDC API 本身没有超时参数，卡住的线程只能让它自己收尾（daemon，不阻塞退出）。
+            try:
+                lib.DestroyPhysicalMonitor(t["handle"])
+            except Exception:
+                pass
 
-    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
+    threads = [threading.Thread(target=work, args=(t,), daemon=True) for t in picked]
     for th in threads:
         th.start()
+    deadline = time.monotonic() + 30
+    timed_out = False
     for th in threads:
-        th.join(30)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            timed_out = True
+            break
+        th.join(left)
 
     ok, errs = [], list(bad)
-    try:
-        for t in picked:
-            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
-            if done:
-                ok.append(t["index"])
-            else:
-                errs.append((t["index"], "第 %d 级（%s）：%s"
-                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
-    finally:
-        release_targets(targets)
+    for t in picked:
+        done, stage, why = results.get(t["index"], (False, 0, "超时未返回（后台线程仍在收尾）"))
+        if done:
+            ok.append(t["index"])
+        else:
+            errs.append((t["index"], "第 %d 级（%s）：%s"
+                         % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
+    # 只释放**没交给线程**的句柄；被选中的句柄由各自线程负责销毁
+    release_targets([t for t in targets if all(t is not p for p in picked)])
+    if timed_out:
+        errs.append((-1, "部分显示器超过 30 秒仍未返回，已放弃等待（不会影响已完成的写入）"))
     return ok, errs
 
 
@@ -1231,6 +1502,35 @@ def active_slot_dict(slots, now_min):
     return best
 
 
+def catch_up_decision(cfg, now=None):
+    """启动补检判定（纯逻辑，不碰硬件，单测直接跑）。
+
+    只看**今天**已经到点的档位里最后一档：
+      - 今天还没到任何档位 → 不补（早上 7 点开机不该把昨晚 21:00 的夜间档再套一遍）
+      - 错过超过 CATCH_UP_LIMIT_MIN 分钟 → 不补（意图过期，下一档往往就在眼前）
+      - config 的 last_fired 已经是"今天 + 同一档" → 不补（计划任务已经跑过）
+    返回 dict：due / slot / missed_min / reason。
+    """
+    now = now or datetime.now()
+    now_min = _minutes(now)
+    slots = [s for s in (cfg.get("slots") or []) if _valid_hhmm(s.get("time"))]
+    due = [s for s in slots if parse_hhmm(s.get("time")) <= now_min]
+    if not due:
+        return {"due": False, "slot": None, "missed_min": 0,
+                "reason": "今天还没有到点的档位"}
+    slot = max(due, key=lambda s: parse_hhmm(s.get("time")))
+    missed = now_min - parse_hhmm(slot.get("time"))
+    if missed > CATCH_UP_LIMIT_MIN:
+        return {"due": False, "slot": slot, "missed_min": missed,
+                "reason": "已错过 %d 分钟，超过补检上限 %d 分钟" % (missed, CATCH_UP_LIMIT_MIN)}
+    fired = coerce_setting("last_fired", cfg.get("last_fired"))
+    if fired.get("date") == now.strftime("%Y-%m-%d") and fired.get("slot") == slot.get("time"):
+        return {"due": False, "slot": slot, "missed_min": missed,
+                "reason": "今天这一档已执行过"}
+    return {"due": True, "slot": slot, "missed_min": missed, "reason": ""}
+
+
+
 def current_level(cfg=None, now=None):
     """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""
     cfg = cfg or load_config()
@@ -1286,16 +1586,13 @@ def wake_options(cfg):
             "expect_off": cfg.get("screen_state") != "on"}
 
 
-def apply_schedule(cfg=None):
-    """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
+def apply_slot(cfg, slot, persist=True):
+    """套用指定档位（亮度 + 该档屏幕动作）；成功写亮度后记 last_fired。
 
     返回 (level, screen, ok, errs)；screen 为该档屏幕动作（""/off/on）。
     屏幕动作失败的错误以序号 -1 记入 errs（界面按原文显示）。
-    内部加载配置时，屏幕动作执行后会把屏幕状态记账落盘（供状态显示 / --screen status）。
+    记账只在**写亮度成功**时发生：全失败（比如显卡驱动没起来）留待下次启动重试。
     """
-    internal = cfg is None
-    cfg = cfg or load_config()
-    slot = active_slot_dict(cfg.get("slots", []), _minutes())
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
@@ -1310,9 +1607,21 @@ def apply_schedule(cfg=None):
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
     if screen in ("off", "on") and ok:
         mark_screen_state(cfg, screen)
-        if internal:
-            save_config(cfg)
+    if ok and persist:
+        mark_fired(cfg, slot)
+        save_config(cfg)
     return level, screen, ok, errs
+
+
+def apply_schedule(cfg=None, now=None):
+    """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
+
+    CLI --apply-schedule 与 GUI 启动补检都走这里；执行成功后写 last_fired，
+    供补检防重复（计划任务跑过之后，界面不会再补一遍）。
+    """
+    cfg = cfg or load_config()
+    slot = active_slot_dict(cfg.get("slots", []), _minutes(now))
+    return apply_slot(cfg, slot)
 
 
 # ============================================================
@@ -1371,13 +1680,27 @@ def task_target():
     return runner, '"%s"' % script
 
 
-def build_register_script(cfg):
-    """生成注册脚本：一条定时任务挂 N 个 Daily 触发器（每档一个），CatchUp 登录任务保留。
-
-    一条任务多触发器是任务计划程序的标准能力（-Trigger 接受触发器数组）。
-    """
+def _task_action(cfg):
+    """当前进程应写进任务的 (程序路径, 参数)。"""
     exe, prefix = task_target()
-    arg = (prefix + " --apply-schedule").strip()
+    return exe, (prefix + " --apply-schedule").strip()
+
+
+def task_signature(cfg):
+    """任务"指纹"：程序路径 + 参数 + 全部触发时间。用于启动自检与日志。"""
+    exe, arg = _task_action(cfg)
+    times = ",".join(str(s.get("time", "")) for s in cfg.get("slots", []))
+    return "%s|%s|%s" % (os.path.normcase(os.path.abspath(exe)), arg, times)
+
+
+def build_register_script(cfg):
+    """生成注册脚本：一条定时任务挂 N 个 Daily 触发器（每档一个），可选登录补跑任务。
+
+    v1.9.0 起：任务已存在时优先 Set-ScheduledTask **原地更新**（保留上次运行记录），
+    失败才回退到 Unregister + Register。旧实现每次都先删后建，会把 LastRunTime
+    重置成"从未运行"，也让用户误以为定时没生效。
+    """
+    exe, arg = _task_action(cfg)
     slots = cfg.get("slots", [])
     lines = [
         "$ErrorActionPreference = 'Stop'",
@@ -1389,52 +1712,172 @@ def build_register_script(cfg):
         "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable "
         "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)",
-        # 旧任务名（v1.2.x 及更早的 Day/Night 分任务）一并清掉，避免残留
+        # 只清历史遗留任务名；当前任务不再先删后建
         "foreach ($n in @(%s)) { Unregister-ScheduledTask -TaskName $n "
         "-Confirm:$false -ErrorAction SilentlyContinue }"
-        % ", ".join(_ps_quote(x) for x in (TASK_SCHEDULE, TASK_CATCHUP) + _LEGACY_TASKS),
+        % ", ".join(_ps_quote(x) for x in _LEGACY_TASKS),
+        "$triggers = @(",
     ]
     for i, x in enumerate(slots):
-        lines.append("$t%d = New-ScheduledTaskTrigger -Daily -At %s"
-                     % (i, _ps_quote(x["time"])))
-    lines.append(
-        "Register-ScheduledTask -TaskName '%s' -Action $action -Trigger @(%s) "
+        lines.append("  (New-ScheduledTaskTrigger -Daily -At %s)" % _ps_quote(x["time"]))
+    lines += [
+        ")",
+        "$old = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue" % TASK_SCHEDULE,
+        "if ($old) {",
+        "  try {",
+        "    Set-ScheduledTask -TaskName '%s' -Action $action -Trigger $triggers "
+        "-Settings $settings -Description %s -ErrorAction Stop | Out-Null"
+        % (TASK_SCHEDULE, _ps_quote("MonitorBrightness · %d 个时间段（到点切换亮度）" % len(slots))),
+        "    Write-Output 'REBUILT=UPDATED'",
+        "  } catch {",
+        "    Unregister-ScheduledTask -TaskName '%s' -Confirm:$false" % TASK_SCHEDULE,
+        "    Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $triggers "
         "-Settings $settings -Description %s | Out-Null"
-        % (TASK_SCHEDULE, ", ".join("$t%d" % i for i in range(len(slots))),
-           _ps_quote("MonitorBrightness · %d 个时间段（到点切换亮度）" % len(slots))))
+        % (TASK_SCHEDULE, _ps_quote("MonitorBrightness · %d 个时间段（到点切换亮度）" % len(slots))),
+        "    Write-Output ('REBUILT=FALLBACK ' + $_.Exception.Message)",
+        "  }",
+        "} else {",
+        "  Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $triggers "
+        "-Settings $settings -Description %s | Out-Null"
+        % (TASK_SCHEDULE, _ps_quote("MonitorBrightness · %d 个时间段（到点切换亮度）" % len(slots))),
+        "  Write-Output 'REBUILT=NEW'",
+        "}",
+    ]
     if cfg.get("catch_up_on_logon"):
         # 单独 try/catch：这条失败也不能拖垮定时任务，失败原因要能带回界面
         lines += [
             "$tLogon = New-ScheduledTaskTrigger -AtLogOn -User $me",
             "$tLogon.Delay = 'PT30S'",
-            "try { Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $tLogon "
-            "-Settings $settings -Description 'MonitorBrightness: 登录后按当前时间校准亮度"
-            "（补上错过的切换点）' -ErrorAction Stop | Out-Null; "
-            "Write-Output 'CATCHUP=OK' } "
-            "catch { Write-Output ('CATCHUP=FAIL ' + $_.Exception.Message) }" % TASK_CATCHUP,
+            "$g = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue" % TASK_CATCHUP,
+            "try {",
+            "  if ($g) {",
+            "    Set-ScheduledTask -TaskName '%s' -Action $action -Trigger $tLogon -Settings $settings "
+            "-Description 'MonitorBrightness: 登录后按当前时间校准亮度（补上错过的切换点）' "
+            "-ErrorAction Stop | Out-Null" % TASK_CATCHUP,
+            "  } else {",
+            "    Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $tLogon -Settings $settings "
+            "-Description 'MonitorBrightness: 登录后按当前时间校准亮度（补上错过的切换点）' "
+            "-ErrorAction Stop | Out-Null" % TASK_CATCHUP,
+            "  }",
+            "  Write-Output 'CATCHUP=OK'",
+            "} catch { Write-Output ('CATCHUP=FAIL ' + $_.Exception.Message) }",
         ]
+    else:
+        lines.append("Unregister-ScheduledTask -TaskName '%s' -Confirm:$false "
+                     "-ErrorAction SilentlyContinue" % TASK_CATCHUP)
     lines += [
         "$t = Get-ScheduledTask -TaskName '%s'" % TASK_SCHEDULE,
         "Write-Output ('StartWhenAvailable=' + $t.Settings.StartWhenAvailable)",
         "Write-Output ('Triggers=' + $t.Triggers.Count)",
-        "Write-Output ('NextRun=' + (Get-ScheduledTaskInfo -TaskName '%s').NextRunTime)" % TASK_SCHEDULE,
-        "$g = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue" % TASK_CATCHUP,
-        "if ($g) { Write-Output ('CatchUpTask=' + $g.State) } else { Write-Output 'CatchUpTask=MISSING' }",
+        "$info = Get-ScheduledTaskInfo -TaskName '%s'" % TASK_SCHEDULE,
+        "if ($info.LastRunTime.Year -lt 2000) { $lr = 'NEVER' } "
+        "else { $lr = $info.LastRunTime.ToString('yyyy-MM-dd HH:mm') }",
+        "if ($info.NextRunTime) { $nx = $info.NextRunTime.ToString('yyyy-MM-dd HH:mm') } "
+        "else { $nx = 'NONE' }",
+        "Write-Output ('TaskInfo=' + $lr + '|' + [int64]$info.LastTaskResult + '|' + $nx)",
+        "$g2 = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue" % TASK_CATCHUP,
+        "if ($g2) { Write-Output ('CatchUpTask=' + $g2.State) } else { Write-Output 'CatchUpTask=MISSING' }",
         "Write-Output 'REGISTER_OK'",
     ]
     return _ps_script(lines)
 
 
 def register_tasks(cfg):
-    """注册（覆盖）定时任务。返回 (是否成功, 说明文本)。
-
-    ⚠️ S5 施工时本函数曾被"按锚点整段替换"误删（它恰好在两个 build_* 之间），
-    App 在保存时调用它 -> NameError。现恢复，并由自测的"未定义名检查"守卫。
-    """
+    """注册/更新定时任务。返回 (是否成功, 说明文本)。"""
     code, out = _ps(build_register_script(cfg))
     if code == 0 and "REGISTER_OK" in out:
         return True, out
     return False, out or ("注册子进程退出码 %s" % code)
+
+
+# ------------------------------------------------------------
+# 任务定义校验：启动时静默自愈
+#   v1.8.5 之前只有用户手动点「应用」才会重建任务。exe 换目录/改名（每版构建目录
+#   dist_vXXX 都在变）后，任务 action 仍指旧路径：任务"跑了"，但找不到程序，
+#   LastTaskResult 0x80070002，用户侧就是"今天没有准时执行"。
+#   现在每次启动读一次落盘的任务 XML，路径/参数/触发点/设置任一项和当前进程不一致
+#   就静默重建，并写一条事件日志（界面可见）。
+# ------------------------------------------------------------
+TASKS_DIR = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
+
+
+def _read_task_xml(name=TASK_SCHEDULE):
+    """读任务计划落盘的 XML；读不到返回 ""。"""
+    path = os.path.join(TASKS_DIR, name)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return ""
+    return (raw.decode("utf-16", "replace") if raw[:2] in (b"\xff\xfe", b"\xfe\xff")
+            else raw.decode("utf-8", "replace"))
+
+
+def _task_definition(xml_text):
+    """从任务 XML 取 (Command, Arguments)。"""
+    m = re.search(r"<Actions[^>]*>(.*?)</Actions>", xml_text or "", re.S)
+    block = m.group(1) if m else ""
+    cm = re.search(r"<Command>(.*?)</Command>", block, re.S)
+    am = re.search(r"<Arguments>(.*?)</Arguments>", block, re.S)
+    return (html.unescape(cm.group(1).strip()) if cm else "",
+            html.unescape(am.group(1).strip()) if am else "")
+
+
+def _same_path(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(str(a).strip().strip('"'))) == \
+            os.path.normcase(os.path.abspath(str(b).strip().strip('"')))
+    except Exception:
+        return str(a).strip().strip('"').lower() == str(b).strip().strip('"').lower()
+
+
+def task_match_reason(cfg, xml_text=None):
+    """任务是否与当前进程/配置一致；一致返回空串，否则返回人话原因。"""
+    if xml_text is None:
+        xml_text = _read_task_xml()
+    if not xml_text:
+        return "任务未注册"
+    exe, arg = _task_action(cfg)
+    command, arguments = _task_definition(xml_text)
+    if not command:
+        return "任务定义里没有 action"
+    if not _same_path(command, exe):
+        return "程序路径不一致（任务：%s，当前：%s）" % (command, exe)
+    if arguments.strip() != arg.strip():
+        return "启动参数不一致（任务：%s，当前：%s）" % (arguments, arg)
+    block = _settings_block(xml_text)
+    if _xml_flag(block, "Enabled") is False:
+        return "任务已被禁用"
+    if _xml_flag(block, "StartWhenAvailable") is False:
+        return "未开启「错过补跑」(StartWhenAvailable)"
+    bounds = sorted(set(_boundary_minutes_all(xml_text)))
+    wanted = sorted({parse_hhmm(s.get("time"), (0, 0)) for s in cfg.get("slots", [])})
+    if bounds != wanted:
+        have = ",".join("%02d:%02d" % (m // 60, m % 60) for m in bounds) or "无"
+        want = ",".join("%02d:%02d" % (m // 60, m % 60) for m in wanted) or "无"
+        return "触发时间不一致（任务：%s，配置：%s）" % (have, want)
+    return ""
+
+
+def ensure_task_registration(cfg, force=False):
+    """定时启用时校验任务；不一致则静默重建。返回 (是否可用, 说明)。
+
+    在后台线程调用，不阻塞窗口显示。重建结果写 events.log，界面读它展示。
+    """
+    if not cfg.get("enabled"):
+        return True, "定时未启用，跳过任务校验"
+    reason = task_match_reason(cfg)
+    if not reason and not force:
+        return True, ""
+    ok, out = register_tasks(cfg)
+    if ok:
+        event = "计划任务已按当前程序重建（%s）" % (reason or "手动强制")
+        _write_event_log(event)
+        return True, event
+    detail = (out or "").strip().splitlines()
+    event = "计划任务重建失败：%s" % (detail[-1] if detail else "未知原因")
+    _write_event_log(event)
+    return False, event
 
 
 def build_unregister_script():
@@ -1472,7 +1915,6 @@ def build_query_script():
 
 
 # 任务计划把每个任务的定义落盘成 XML：<SystemRoot>\System32\Tasks\<任务名>
-TASKS_DIR = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
 
 
 def _xml_flag(block, tag):
@@ -1574,6 +2016,59 @@ def _as_ok_errs(result):
     if isinstance(result, Exception):
         return [], [(-1, str(result))]
     return result
+
+
+def build_runtime_query_script():
+    """查询"上次运行时间 / 上次结果 / 下次运行时间"——任务计划 API 才拿得到。
+
+    XML 里只有定义，没有 LastRunTime/LastTaskResult，所以要单独一次 PowerShell。
+    界面在后台线程调用，2~3 秒，不影响窗口显示。
+    """
+    return _ps_script([
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "$i = Get-ScheduledTaskInfo -TaskName '%s'" % TASK_SCHEDULE,
+        "$t = Get-ScheduledTask -TaskName '%s'" % TASK_SCHEDULE,
+        "if (-not $i) { Write-Output 'RUNTIME=MISSING'; exit 0 }",
+        "if ($i.LastRunTime.Year -lt 2000) { $lr = 'NEVER' } "
+        "else { $lr = $i.LastRunTime.ToString('yyyy-MM-dd HH:mm') }",
+        "if ($i.NextRunTime) { $nx = $i.NextRunTime.ToString('yyyy-MM-dd HH:mm') } "
+        "else { $nx = 'NONE' }",
+        "Write-Output ('RUNTIME=' + $lr + '|' + [int64]$i.LastTaskResult + '|' + $nx "
+        "+ '|' + $t.State)",
+    ])
+
+
+def query_task_runtime():
+    """返回一行 `RUNTIME=上次运行|上次结果|下次运行|状态`；失败返回 ""。"""
+    code, out = _ps(build_runtime_query_script())
+    return out if code == 0 else ""
+
+
+def _task_result_text(code):
+    """任务结果码 → 人话。0x41303 = 任务从未运行过（Windows 的哨兵值）。"""
+    try:
+        n = int(str(code).strip())
+    except Exception:
+        return str(code)
+    if n == 0:
+        return "成功"
+    if n == 0x41303:
+        return "从未运行"
+    if n == 0x41301:
+        return "正在运行"
+    if n == 0x41302:
+        return "被用户终止"
+    return "0x%X" % (n & 0xFFFFFFFF)
+
+
+def _runtime_fields(text):
+    """从 RUNTIME= 行解析 (上次运行, 上次结果, 下次运行, 状态)。"""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("RUNTIME="):
+            bits = line[8:].split("|")
+            return (bits + ["", "", "", ""])[:4]
+    return ("", "", "", "")
 
 
 def _saved_summary(part, out):
@@ -1887,9 +2382,27 @@ def cli_diag():
         _out("四、定时任务")
         for line in (query_task_status() or "").splitlines():
             _out("  " + line)
+        for line in (query_task_runtime() or "").splitlines():
+            _out("  " + line)
+        reason = task_match_reason(cfg)
+        _out("  任务定义与当前进程：%s" % (reason or "一致"))
+        _out("  当前进程应写：%s | %s" % _task_action(cfg))
     finally:
         release_targets(targets)
     sys.exit(0)
+
+
+def cli_ensure_schedule():
+    """按当前配置/当前 exe 重建计划任务（供发版部署后无界面自愈；也可排障用）。"""
+    cfg = load_config()
+    _out("配置：enabled=%s · slots=%s"
+         % (cfg.get("enabled"), [s.get("time") for s in cfg.get("slots", [])]))
+    ok, msg = ensure_task_registration(cfg, force=("--force" in sys.argv))
+    _out(msg or "任务定义与当前程序一致，无需重建")
+    if cfg.get("enabled"):
+        for line in (query_task_runtime() or "").splitlines():
+            _out("  " + line)
+    sys.exit(0 if ok else 1)
 
 
 def cli_selftest():
@@ -2079,18 +2592,79 @@ class DarkBox:
         return answer["ok"]
 
 
+def enable_dpi_awareness():
+    """在创建 Tk 之前声明 DPI 感知（否则 125%/150% 下整窗被系统位图拉伸变糊）。
+
+    优先 per-monitor v2（多屏不同缩放时也正确），失败回退 per-monitor，
+    再回退 system aware。返回实际生效的模式，方便 --diag/日志。
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        u = ctypes.windll.user32
+        u.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        u.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        if u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):   # PER_MONITOR_AWARE_V2
+            return "per-monitor-v2"
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)            # PER_MONITOR_DPI_AWARE
+        return "per-monitor"
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()                 # SYSTEM_DPI_AWARE
+        return "system"
+    except Exception:
+        return ""
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+def _work_area_height(widget=None):
+    """当前窗口所在显示器的工作区高度（已扣掉任务栏）。
+
+    v1.8.5 用 winfo_screenheight()（主屏**全高**，含任务栏）再减 180，
+    多屏/缩放不同时会把窗口顶出工作区。这里改成 MonitorFromWindow + rcWork。
+    """
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u.MonitorFromWindow.restype = wintypes.HMONITOR
+        hwnd = widget.winfo_id() if widget is not None else 0
+        hmon = u.MonitorFromWindow(hwnd, 2)                       # MONITOR_DEFAULTTONEAREST
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            h = int(mi.rcWork.bottom) - int(mi.rcWork.top)
+            if h > 0:
+                return h
+    except Exception:
+        pass
+    try:
+        return int(widget.winfo_screenheight()) if widget is not None else 800
+    except Exception:
+        return 800
+
+
 class ScrollArea(ttk.Frame):
     """可滚动内容容器（Canvas + 内部 Frame + 滚动条）。
 
-    设置项一多窗口就会超过 1080p 的可用高度（实测 5 个档位时 1117px），
-    底部控件就点不到了。高度按屏幕封顶，超出才出现滚动条。
+    设置项一多窗口就会超过可用高度（实测 5 个档位时 1117px），
+    底部控件就点不到了。高度按**当前屏工作区**封顶，超出才出现滚动条。
     """
 
     def __init__(self, root, bg, on_fit=None):
         super().__init__(root)
         self._on_fit = on_fit
-        # 标题栏 + 上下边距在部分 DPI 下不止 140px，留足余量避免窗口底边裁切
-        self._max_h = max(400, self.winfo_screenheight() - 180)
+        # rcWork 已扣任务栏；再留 120 给标题栏(约 31) + 窗口边框 + 呼吸边距
+        self._max_h = max(320, _work_area_height(self) - 120)
         self.canvas = tk.Canvas(self, background=bg, highlightthickness=0, bd=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.body = tk.Frame(self.canvas, background=bg)
@@ -2103,6 +2677,13 @@ class ScrollArea(ttk.Frame):
                          lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
         self.canvas.bind("<Leave>",
                          lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def refresh_max_height(self):
+        """窗口被拖到另一块屏后重算封顶高度。"""
+        h = max(320, _work_area_height(self) - 120)
+        if h != self._max_h:
+            self._max_h = h
+            self._on_body()
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -2829,6 +3410,74 @@ class BrightnessPanel:
         self.presets._command = self._on_preset if enabled else None
 
 
+class TimeField(tk.Frame):
+    """时间输入（P1：替代左右拖动/纯输入框）。
+
+    形态：可直接键入 HH:MM + ▲▼ 上下步进 15 分钟 + 四个常用预设。
+    键盘：输入框内 ↑/↓ 也能步进，回车/失焦自动补零（9:5 → 09:05）。
+    """
+
+    PRESETS = ("08:30", "12:00", "18:00", "21:00")
+    STEP = 15
+
+    def __init__(self, parent, value="12:00", bg=None):
+        bg = bg or parent.cget("bg")
+        super().__init__(parent, bg=bg)
+        top = tk.Frame(self, bg=bg)
+        top.pack(anchor="w", fill="x")
+        self.var = tk.StringVar(value=normalize_time_input(value) or "12:00")
+        self.entry = tk.Entry(
+            top, textvariable=self.var, width=6, justify="center",
+            bg=UI["fill"], fg=UI["text"], insertbackground=UI["text"],
+            disabledbackground=UI["fill"], disabledforeground=UI["text3"],
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=UI["sep"], highlightcolor=UI["accent"],
+            font=_ui_font(11))
+        self.entry.pack(side="left", ipady=3)
+        step = tk.Frame(top, bg=bg)
+        step.pack(side="left", padx=(6, 0))
+        self.up_btn = Button(step, "▲", lambda: self.step(self.STEP), kind="ghost",
+                             width=24, height=15, radius=4, font_size=7, pad_bg=bg)
+        self.up_btn.pack()
+        self.down_btn = Button(step, "▼", lambda: self.step(-self.STEP), kind="ghost",
+                               width=24, height=15, radius=4, font_size=7, pad_bg=bg)
+        self.down_btn.pack(pady=(2, 0))
+        self.entry.bind("<Return>", self._commit)
+        self.entry.bind("<FocusOut>", self._commit)
+        self.entry.bind("<Up>", lambda e: self.step(self.STEP))
+        self.entry.bind("<Down>", lambda e: self.step(-self.STEP))
+
+        presets = tk.Frame(self, bg=bg)
+        presets.pack(anchor="w", pady=(6, 0))
+        Label(presets, "常用", size=8, color=UI["text3"], bg=bg).pack(
+            side="left", padx=(0, 6))
+        self.preset_btns = []
+        for p in self.PRESETS:
+            b = Button(presets, p, lambda t=p: self.set_time(t), kind="ghost",
+                       height=22, radius=7, font_size=8, pad_bg=bg)
+            b.pack(side="left", padx=(0, 4))
+            self.preset_btns.append(b)
+
+    def _commit(self, _event=None):
+        """键入内容规整成 HH:MM；非法则保留原文，等保存时再报错。"""
+        norm = normalize_time_input(self.var.get())
+        if norm:
+            self.var.set(norm)
+        return "break"
+
+    def step(self, delta):
+        self.var.set(shift_time(self.var.get(), delta))
+        return "break"
+
+    def set_time(self, text):
+        norm = normalize_time_input(text)
+        if norm:
+            self.var.set(norm)
+
+    def get_time(self):
+        return normalize_time_input(self.var.get())
+
+
 class SlotEditor(Sheet):
     """单个时间段的编辑弹层（时间 / 亮度 / 到点是否熄屏点亮）。"""
 
@@ -2842,9 +3491,8 @@ class SlotEditor(Sheet):
         box.pack(fill="x", pady=(4, 0))
 
         Label(box, "时间", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
-        self.time_entry = ttk.Entry(box, width=8, justify="center")
-        self.time_entry.insert(0, slot.get("time", "12:00"))
-        self.time_entry.pack(anchor="w", pady=(4, 10))
+        self.time_field = TimeField(box, slot.get("time", "12:00"), bg=UI["card"])
+        self.time_field.pack(anchor="w", pady=(4, 10))
 
         Label(box, "亮度", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
         self.level_spin = ttk.Spinbox(box, from_=0, to=100, width=6, justify="center")
@@ -2867,8 +3515,8 @@ class SlotEditor(Sheet):
         self.show()
 
     def _do_save(self):
-        t = self.time_entry.get().strip()
-        if not _valid_hhmm(t):
+        t = self.time_field.get_time()
+        if not t:
             self.app.msg.showerror("格式不对", "时间需要写成 HH:MM，例如 09:00。")
             return
         try:
@@ -2988,8 +3636,12 @@ class SchedulePanel:
         self.task_next = Label(st, "", size=8, color=UI["text3"], bg=UI["card"])
         self.task_next.pack(side="right", padx=(0, 8))
         self.task_sub = Label(self.inner, "", size=8, color=UI["text3"],
-                              bg=UI["card"], justify="left")
+                              bg=UI["card"], justify="left", wraplength=360)
         self.task_sub.pack(fill="x", pady=(2, 0))
+        # 事件日志（补执行 / 任务重建）：计划任务跑过什么、启动补过什么，一眼可见
+        self.event_lbl = Label(self.inner, "", size=8, color=UI["orange"],
+                               bg=UI["card"], justify="left", wraplength=360)
+        self.event_lbl.pack(fill="x", pady=(2, 0))
 
         self.render()
 
@@ -3004,7 +3656,9 @@ class SchedulePanel:
         self.count_lbl.config(text="%d 档" % len(self.slots))
         for r in self._rows:
             r.set_dim(not on)
-        self.add_btn.set_enabled(on)
+        # ⚠️ 「添加」永远可点：编辑时间段是纯本地操作，不需要先启用定时。
+        # v1.8.5 把它和开关绑在一起，默认关闭时按钮点了没反应（用户反馈）。
+        self.add_btn.set_enabled(True)
 
     def _on_toggle(self, value):
         """开关切换 = 立即注册 / 注销任务计划（不再有单独的保存按钮）。"""
@@ -3028,6 +3682,7 @@ class SchedulePanel:
             self.slots.append(new)
             self.slots.sort(key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
             self.render()
+            self._notify_changed()
 
         def delete():
             if len(self.slots) <= 1:
@@ -3035,6 +3690,7 @@ class SchedulePanel:
                 return
             self.slots = [s for s in self.slots if s is not slot]
             self.render()
+            self._notify_changed()
 
         self._editor = SlotEditor(self.app, slot, save, delete)
 
@@ -3053,8 +3709,20 @@ class SchedulePanel:
             self.slots.append(new)
             self.slots.sort(key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
             self.render()
+            self._notify_changed()
 
         self._editor = SlotEditor(self.app, {"time": t, "level": 50, "screen": ""}, save)
+
+    def _notify_changed(self):
+        """时间段增删改后立刻落盘；定时已启用时由 App 去重写任务计划。
+
+        v1.8.5 只有开关切换才保存，用户改完时间不关开关 => 任务触发器还是旧的，
+        表现同样是"到点没执行"。
+        """
+        try:
+            self.app.on_slots_changed([dict(s) for s in self.slots])
+        except Exception as e:
+            self.app.status_var.set("保存定时设置失败：%s" % e)
 
     # ---- App 用到的接口 ----
     def schedule_enabled(self):
@@ -3084,8 +3752,13 @@ class SchedulePanel:
         self.task_next.config(text=info.get("next", ""))
         self.task_sub.config(text=info.get("detail", ""))
 
+    def set_events(self, lines):
+        """显示最近的事件（补执行 / 任务重建 / 重建失败）。"""
+        self.event_lbl.config(text="\n".join(lines or []))
+
     def set_actions_enabled(self, enabled):
-        self.add_btn.set_enabled(enabled and self.schedule_enabled())
+        # 添加/编辑是本地操作，只受"正在执行"影响，不受定时开关影响
+        self.add_btn.set_enabled(enabled)
         self.probe_task_btn.set_enabled(enabled)
 
 
@@ -3189,8 +3862,14 @@ class HelpSheet(Sheet):
             "0xD6=1 电源模式 → 写回亮度 → 输出重驱动（SC_MONITORPOWER 2→-1）"
             " → 切信号源，任何一级成功即停。",
         ])
+        block("定时为什么这次准了", [
+            "每次启动都会校验计划任务是否仍指向当前程序；换了目录/文件名会自动重建。",
+            "今天已经错过的那一档，启动时会在后台补一次（同一天同一档只补一次）。",
+            "任务状态行会显示下次运行、上次运行与上次结果；下面还会列出重建/补执行记录。",
+        ])
         block("排查命令", [
-            "--probe 打印每台屏的亮灭结论；--diag 打印枚举、能力串与寄存器回读。",
+            "--probe 打印每台屏的亮灭结论；--diag 打印枚举、能力串、寄存器回读与任务状态。",
+            "--ensure-schedule 按当前配置/当前程序重建计划任务；--selftest 打印档位判定表。",
         ])
         self.show()
 
@@ -3206,6 +3885,7 @@ class App:
         apply_dark_theme(root)
 
         self.cfg = load_config()
+        self._config_error = CONFIG_LOAD_ERROR
         self.monitors = []
         self.mon_info = []
         self.mon_models = {int(k): v for k, v in self.cfg.get("models", {}).items()}
@@ -3225,6 +3905,8 @@ class App:
         self._brighting = False
         self._fit_pending = False
         self._fitted_h = -1
+        self._schedule_reg_timer = None
+        self._auto_checked = False
 
         self.scroll = ScrollArea(root, UI["bg"], on_fit=self._fit_window)
         self.scroll.pack(side="top", fill="both", expand=True)
@@ -3265,6 +3947,12 @@ class App:
         if start_minimized and self.tray is not None:
             self.root.withdraw()
 
+        # 配置读坏的显式提示（不能静默吞掉：用户的设置还在坏文件里）
+        self.root.after(150, self._warn_config_error)
+        # 启动后台自检：任务定义与当前进程是否一致 + 今天错过的那一档要不要补。
+        # 900ms 是给首屏探测让路，避免和开窗时的 DDC 枚举抢总线；全程后台线程。
+        self.root.after(900, self._start_auto_checks)
+
     def _fit_window(self):
         """内容晚到（任务状态行/显示器行）后按请求尺寸重排窗口。
 
@@ -3282,6 +3970,7 @@ class App:
     def _fit_window_now(self):
         self._fit_pending = False
         try:
+            self.scroll.refresh_max_height()
             self.root.update_idletasks()
             need = self.scroll.body.winfo_reqheight()
             if need == self._fitted_h:
@@ -3522,18 +4211,25 @@ class App:
         def job_models():
             out = {}
             targets_now = enumerate_targets()
-            try:
-                def one(t):
-                    out[t["index"]] = monitor_model(t["handle"], t.get("dev"))
+            lib = _dxva2()
+            used = [t for t in targets_now if t["index"] in missing]
 
-                threads = [threading.Thread(target=one, args=(t,))
-                           for t in targets_now if t["index"] in missing]
-                for th in threads:
-                    th.start()
-                for th in threads:
-                    th.join(20)
-            finally:
-                release_targets(targets_now)
+            def one(t):
+                try:
+                    out[t["index"]] = monitor_model(t["handle"], _display_key(t))
+                finally:
+                    # 同 screen_wake_many：句柄由线程自己销毁，避免 join 超时后 UAF
+                    try:
+                        lib.DestroyPhysicalMonitor(t["handle"])
+                    except Exception:
+                        pass
+
+            threads = [threading.Thread(target=one, args=(t,), daemon=True) for t in used]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(20)
+            release_targets([t for t in targets_now if all(t is not u for u in used)])
             return {i: v for i, v in out.items() if v}
 
         self.run_bg(job_models, self._apply_models)
@@ -3853,7 +4549,125 @@ class App:
         self._stop_hotkey_listener()
         self.root.destroy()
 
+    # ---------- 启动自检 / 补执行 ----------
+    def _warn_config_error(self):
+        if self._config_error:
+            self.status_var.set("配置文件读取失败，已使用默认值")
+            self.msg.showwarning("配置文件有问题", self._config_error)
+
+    def _refresh_events(self):
+        try:
+            self.sch_panel.set_events(read_recent_events(3))
+        except Exception:
+            pass
+
+    def _start_auto_checks(self):
+        """窗口出来之后才跑：任务定义自检 + 今天错过档位的补执行（全后台）。"""
+        if self._auto_checked:
+            return
+        self._auto_checked = True
+        if not self.cfg.get("enabled"):
+            self._refresh_events()
+            return
+
+        def job():
+            out = {}
+            try:
+                out["task"] = ensure_task_registration(self.cfg)
+            except Exception as e:
+                out["task"] = (False, "任务自检失败：%s: %s" % (type(e).__name__, e))
+            try:
+                out["catchup"] = self._catch_up_worker()
+            except Exception as e:
+                out["catchup"] = {"due": True, "done": False,
+                                  "line": "补执行失败：%s: %s" % (type(e).__name__, e)}
+            return out
+
+        self.run_bg(job, self._finish_auto_checks)
+
+    def _catch_up_worker(self):
+        """后台线程执行：只在今天该档错过且未执行时补一次（判定见 catch_up_decision）。"""
+        cfg = load_config()
+        decision = catch_up_decision(cfg)
+        if not decision["due"]:
+            return {"due": False, "reason": decision["reason"]}
+        slot = dict(decision["slot"])
+        level, screen, ok, errs = apply_slot(cfg, slot)
+        now = datetime.now()
+        if ok:
+            line = "今天 %s 补执行 %s 档（错过 %d 分钟）" % (
+                now.strftime("%H:%M"), slot["time"], decision["missed_min"])
+        else:
+            line = "补执行 %s 档失败（%d 台未写入）" % (
+                slot["time"], len([e for e in errs if e[0] >= 0]))
+        _write_event_log(line)
+        return {"due": True, "done": bool(ok), "slot": slot,
+                "missed_min": decision["missed_min"], "line": line, "errs": errs}
+
+    def _finish_auto_checks(self, result):
+        if isinstance(result, Exception):
+            self.status_var.set("启动自检失败：%s" % result)
+            self._refresh_events()
+            return
+        _task_ok, task_msg = result.get("task", (True, ""))
+        cu = result.get("catchup") or {}
+        if task_msg:
+            self.status_var.set(task_msg)
+        if cu.get("due"):
+            self.status_var.set(cu.get("line", ""))
+            if not cu.get("done"):
+                errs = cu.get("errs") or []
+                for i, why in errs[:2]:
+                    _write_event_log("  %s" % why)
+        # 补执行写盘后，把本进程手里的 last_fired 同步一下，避免后续保存领先
+        if cu.get("done"):
+            self.cfg["last_fired"] = coerce_setting(
+                "last_fired", load_config().get("last_fired"))
+        self._refresh_events()
+        if task_msg or cu.get("due"):
+            self.refresh_task_status()
+
     # ---------- 定时 ----------
+    def on_slots_changed(self, slots):
+        """面板里增删改时间段后的统一出口：立即落盘；已启用则重写任务。"""
+        self.cfg["slots"] = [dict(s) for s in slots]
+        ok, msg = save_config(self.cfg)
+        if not ok:
+            self.msg.showerror("保存时间段失败", msg)
+            return
+        if not self.cfg.get("enabled"):
+            self.status_var.set("时间段已保存（开启每日定时后生效）")
+            return
+        self.status_var.set("时间段已保存，正在重写任务计划…")
+        if self._schedule_reg_timer:
+            try:
+                self.root.after_cancel(self._schedule_reg_timer)
+            except Exception:
+                pass
+        # 500ms 防抖：连续改几档只重建一次任务（每次 PowerShell 约 2~3 秒）
+        self._schedule_reg_timer = self.root.after(500, self._register_after_edit)
+
+    def _register_after_edit(self):
+        self._schedule_reg_timer = None
+        self.run_bg(lambda: register_tasks(self.cfg),
+                    self._finish_edit_register, busy=True)
+
+    def _finish_edit_register(self, result):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            self.status_var.set("重写任务计划失败：%s" % out)
+            self.msg.showerror("重写任务计划失败", out or "未知错误")
+            return
+        _write_event_log("时间段已更新，任务计划已重写")
+        self.refresh_task_status()
+        self.status_var.set("定时已更新")
+        self._refresh_events()
+        # 新加/改到"已经过去的时刻"时，今天这一档应当立即生效
+        if self.cfg.get("enabled"):
+            self.run_bg(self._catch_up_worker, self._finish_auto_checks)
+
     def save_schedule(self):
         try:
             self._save_schedule_inner()
@@ -3896,6 +4710,8 @@ class App:
         self.refresh_task_status()
         self.status_var.set("定时已启用")
         self.msg.showinfo("定时已保存", _saved_summary(part, out))
+        # 启用时如果今天这一档已经过去（例如 12:08 才启用 08:30），立即补一次
+        self.run_bg(self._catch_up_worker, self._finish_auto_checks)
 
     def cancel_schedule(self):
         self.cfg["enabled"] = False
@@ -3926,21 +4742,24 @@ class App:
 
         def job():
             try:
-                return query_task_status()
+                return (query_task_status(), query_task_runtime())
             except Exception:
-                return ""
+                return ("", "")
 
-        def done(text):
+        def done(result):
             self._task_querying = False
-            self._apply_task_status(text)
+            if isinstance(result, Exception):
+                result = ("", "")
+            text, runtime = result
+            self._apply_task_status(text, runtime)
 
         self.run_bg(job, done)
 
     # 兼容旧名（托盘/tray 里调用）
     _refresh_task_status = refresh_task_status
 
-    def _apply_task_status(self, text):
-        info = task_summary(text, self.cfg.get("slots", []))
+    def _apply_task_status(self, text, runtime=""):
+        info = task_summary(text, self.cfg.get("slots", []), runtime)
         self.sch_panel.set_task_status(info)
         self.scroll.refresh()
         self._tray_update_tooltip()
@@ -3953,8 +4772,14 @@ def _safe_int(text, fallback=0):
         return fallback
 
 
-def task_summary(text, slots):
-    """把 query_task_status() 的原始文本变成界面要的一份结论。
+def _short_dt(text):
+    """'2026-11-04 08:30' → '11-04 08:30'；格式不认识就原样返回。"""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2})$", str(text or "").strip())
+    return "%s-%s %s" % (m.group(2), m.group(3), m.group(4)) if m else str(text or "")
+
+
+def task_summary(text, slots, runtime=""):
+    """把 query_task_status() / query_task_runtime() 的原始文本变成界面结论。
 
     返回 {"state": ok|warn|error|loading, "title": ..., "next": ..., "detail": ...}
     """
@@ -3974,9 +4799,15 @@ def task_summary(text, slots):
         return {"state": "warn", "title": "任务计划：未注册",
                 "next": "", "detail": "打开「启用每日定时」开关即可注册"}
 
+    last_run, last_code, rt_next, rt_state = _runtime_fields(runtime)
     bits = sched.split("|")
     state = "已启用" if bits[0] == "Ready" else bits[0]
+    if rt_state:
+        state = {"Ready": "已启用", "Running": "运行中",
+                 "Disabled": "已禁用"}.get(rt_state, rt_state)
     nxt = (bits[1] if len(bits) > 1 else "").strip()
+    if rt_next and rt_next not in ("NONE", "MISSING"):
+        nxt = rt_next                       # 任务计划 API 的 NextRunTime 才是权威值
     swa = "补跑已开" if any("True" in b for b in bits[2:]) else "补跑未开"
     trig = ""
     for b in bits:
@@ -3991,9 +4822,14 @@ def task_summary(text, slots):
         "已注册" if (catch and catch != "MISSING") else "未注册")
     if extra:
         detail += " · %d 个触发点不在当前配置" % len(extra)
+    # 上次运行 / 上次结果：让"任务到底跑没跑"在界面里直接可见
+    if last_run:
+        last = "从未运行" if last_run == "NEVER" else \
+            "上次 %s（%s）" % (_short_dt(last_run), _task_result_text(last_code))
+        detail += " · " + last
     return {"state": "ok" if state == "已启用" and swa == "补跑已开" else "warn",
             "title": "任务计划：%s" % state,
-            "next": ("下次 %s" % nxt) if nxt else "",
+            "next": ("下次 %s" % _short_dt(nxt)) if nxt else "",
             "detail": detail}
 
 
@@ -4145,8 +4981,21 @@ def main():
         if cmd == "--selftest":
             cli_selftest()
             return
+        if cmd == "--ensure-schedule":
+            cli_ensure_schedule()
+            return
     if not acquire_single_instance():
         return                                  # 已有实例：已唤起其窗口，直接退出
+    enable_dpi_awareness()                      # 必须在创建任何 Tk 窗口之前
+    if not PIL_OK:
+        # GUI 明确报错退出；CLI 路径（--set/--apply-schedule/--diag/--selftest）不受影响
+        from tkinter import messagebox
+        messagebox.showerror(
+            "缺少 Pillow",
+            "图形界面需要 Pillow（用于圆角抗锯齿贴图），当前环境没有安装。\n\n"
+            "命令行功能仍可正常使用：--set / --list / --probe / --diag / --selftest / "
+            "--apply-schedule。\n安装后重试：pip install pillow")
+        return
     root = tk.Tk()
     App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)

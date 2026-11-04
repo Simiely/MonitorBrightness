@@ -25,19 +25,22 @@ MonitorBrightness 是一个 Windows 桌面小工具，用于**外接显示器亮
                              ▼
 ┌────────────────────────────────────┐
 │  定时层                             │
-│  PowerShell Register-ScheduledTask  │ → 任务计划程序
-│  + -StartWhenAvailable              │   MonitorBrightness_Day
-│  （v1.0.0 用的是 schtasks.exe）      │   MonitorBrightness_Night
-└────────────────────────────────────┘   MonitorBrightness_CatchUp
+│  PowerShell Register/Set-ScheduledTask │ → 任务计划程序
+│  + -StartWhenAvailable              │   MonitorBrightness_Schedule（多触发器）
+│  （v1.0.0 用的是 schtasks.exe）      │   MonitorBrightness_CatchUp（登录校准）
+│  v1.9.0：启动读任务 XML 自愈重建      │
+└────────────────────────────────────┘
         ▲
         │ 到点执行
 ┌───────┴────────────────────────────┐
-│  --apply-schedule                   │ 按「当前时刻」判定白天/晚上 → 下发
-│  resolve_phase() + apply_schedule() │ 目标显示器取配置里的勾选列表
+│  --apply-schedule                   │ 按「当前时刻」判定档位 → 下发 → 写 last_fired
+│  apply_slot() + catch_up_decision() │ 启动补检：今天错过 ≤12h 且同日同档未执行才补
 └────────────────────────────────────┘
 
-CLI 入口:    --set <all|0,1> <亮度> / --apply-schedule / --list / --selftest
-配置持久化:  %APPDATA%/MonitorBrightness/config.json   （v2：monitors 为数组）
+CLI 入口:    --set <all|0,1> <亮度> / --apply-schedule / --ensure-schedule /
+             --list / --probe / --diag / --selftest
+配置持久化:  %APPDATA%/MonitorBrightness/config.json   （原子写；坏文件留 .bad-* 副本）
+事件日志:    %APPDATA%/MonitorBrightness/events.log   （任务重建 / 启动补执行）
 ```
 
 **单文件内的模块分区**（按注释分节）：
@@ -45,13 +48,15 @@ CLI 入口:    --set <all|0,1> <亮度> / --apply-schedule / --list / --selftest
 1. 配置读写 —— `load_config` / `save_config` / `normalize_indices` / `clamp_level`
 2. 亮度控制 —— `list_monitors` / `set_brightness_many` / `get_brightness_many` /
    `enum_displays` / `monitor_model` / `monitor_label`
-3. 档位判定 —— `parse_hhmm` / `resolve_phase` / `current_phase` / `apply_schedule`
+3. 档位判定 —— `parse_hhmm` / `normalize_time_input` / `resolve_phase` / `current_phase` /
+   `apply_slot` / `apply_schedule` / `catch_up_decision` / `mark_fired`
 4. 任务计划 —— `_ps` / `task_target` / `build_register_script` / `register_tasks` /
-   `unregister_tasks` / `query_task_status`
+   `task_match_reason` / `ensure_task_registration` / `query_task_status` /
+   `query_task_runtime` / `unregister_tasks`
 5. 深色主题 —— `apply_dark_theme` / `apply_dark_titlebar`
-6. 命令行入口 —— `cli_set` / `cli_apply_schedule` / `cli_list` / `cli_selftest`
-   （`_out` / `_err` / `parse_level_arg` / `parse_index_arg`）
-7. 图形界面 —— `class App`（tkinter）
+6. 命令行入口 —— `cli_set` / `cli_apply_schedule` / `cli_list` / `cli_ensure_schedule` /
+   `cli_selftest`（`_out` / `_err` / `parse_level_arg` / `parse_index_arg`）
+7. 图形界面 —— `class App`（tkinter）；`TimeField` 为可键入时间控件（v1.9.0）
 
 ## 架构健康度（2026-10-08 量化审计，不靠读代码的印象）
 
