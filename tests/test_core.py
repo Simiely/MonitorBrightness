@@ -88,17 +88,32 @@ class ConfigTest(TempConfigCase):
         self.assertEqual([s["time"] for s in cfg["slots"]], ["09:00", "20:00"])
         self.assertEqual([s["level"] for s in cfg["slots"]], [80, 30])
 
-    def test_legacy_ddc_default_migrates_to_system(self):
+    def test_default_off_method_is_ddc(self):
+        """v1.9.3：默认熄灭方式恢复 v1.8.5 的 ddc。"""
+        self.assertEqual(mb.default_config()["screen_off_method"], "ddc")
+
+    def test_migrated_system_is_restored_to_ddc_with_log(self):
+        """v1.9.3：撤销 v1.9.0 的 ddc→system 迁移；反向恢复必须落日志。"""
         with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"version": 5, "screen_off_method": "ddc",
                        "ddc_allow_undeclared": False}, f)
-        self.assertEqual(mb.load_config()["screen_off_method"], "system")
-
-        # 主动选过 DDC（确认框会置 allow_undeclared=True）不能被改掉
-        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"version": 5, "screen_off_method": "ddc",
-                       "ddc_allow_undeclared": True}, f)
         self.assertEqual(mb.load_config()["screen_off_method"], "ddc")
+
+        # 被 v1.9.0 自动迁成 system 的旧配置：恢复为 ddc，并写事件日志
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"version": 6, "screen_off_method": "system",
+                       "ddc_allow_undeclared": False}, f)
+        cfg = mb.load_config()
+        self.assertEqual(cfg["screen_off_method"], "ddc")
+        with open(mb.CONFIG_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["screen_off_method"], "ddc")
+        self.assertIn("system → ddc", "\n".join(mb.read_recent_events(5)))
+
+        # 主动选过 DDC（确认框会置 allow_undeclared=True）后改选 system 的，不动
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"version": 6, "screen_off_method": "system",
+                       "ddc_allow_undeclared": True}, f)
+        self.assertEqual(mb.load_config()["screen_off_method"], "system")
 
 
 class TimeTest(unittest.TestCase):

@@ -3,6 +3,33 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.3] - 2026-11-04
+
+### 回滚（用户裁定：只修被复现的 bug，不许改已验证的操作逻辑）
+
+- **熄灭方式默认值恢复 `ddc`**：撤销 v1.9.0 把默认值从 `ddc` 改成 `system` 的改动。
+- **撤销「旧配置 ddc→system」自动迁移**：不再静默改用户配置；被迁成 `system` 且
+  未允许未声明值的配置，加载时反向恢复为 `ddc`，并把「system → ddc」写进事件日志。
+- **点亮恢复 `mouse_event` 1px**：撤销 `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`，
+  恢复 v1.8.5 的 `_nudge_user_input`（点亮命令后移 1px 再移回，用于把系统从"显示器关闭"
+  状态踢回有显示）。
+- **唤醒句柄生命周期恢复 v1.8.5**：撤销"谁用谁销毁 + 全局 30 秒 deadline"，
+  恢复线程 `join(30)` 后统一 `release_targets(targets)`。
+- **保留**（用户点名保留）：能力串缓存 key 的 `DEV#EDID` 修复、任务路径重建、
+  `parse_hhmm` TypeError、静默异常写入 error.log/状态栏、config 原子写、Pillow 守卫。
+
+### 验证（不触碰屏幕）
+
+- 函数级 diff：`_broadcast_monitor_power` / `screen_off_system` / `screen_on_system` /
+  `_nudge_user_input` / `_wake_one` / `_output_recycle` / `screen_off_cfg` / `screen_on_cfg` /
+  `wake_options` / `mark_screen_state` / `_write_vcp` / `_read_vcp` / `enumerate_targets` /
+  `release_targets` / GUI 的 `screen_off`/`screen_on`/`run_bg` 与 v1.8.5 **逐字节一致**；
+  仅剩缓存 key 差异（用户点名保留）。
+- 干跑（写操作全部打桩）：ddc 熄灭 = 每台 1 次 `0xD6=2`，2 台共 1.4 ms；
+  system 熄灭 = 1 次 `SC_MONITORPOWER` 广播；与 v1.8.5 调用序列一致（1.7 ms / 0.5 ms）。
+  点亮序列与耗时（~4.0 s，含固定的 0.35/0.8/2 s 等待）与 v1.8.5 一致。
+- 22 项单元测试通过（新增默认值/反向恢复断言）。
+
 ## [1.9.2] - 2026-11-04
 
 ### 新增（用户要求：任务重建成功要有明确提示）

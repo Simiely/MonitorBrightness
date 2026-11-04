@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 启动补执行 / 补执行失败都落在这里，界面直接读它展示
@@ -175,12 +175,11 @@ SETTINGS = (
     # 熄灭那一刻的系统 tick（毫秒）。用来判断"熄灭之后有没有过键鼠输入"——有输入
     # 就说明系统已经把屏幕唤醒了（见 _screen_woke_by_input）。重启后 tick 失效，忽略。
     {"key": "screen_off_tick", "kind": "int", "default": 0},
-    # 熄灭方式：system = Windows 系统级整组熄灭（默认，一定唤得回来）
-    #           ddc    = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，慎用）
-    # ⚠️ v1.9.0 起默认改为 system。旧默认 ddc + ddc_allow_undeclared=False 会让
-    #    新装用户点「熄灭」时被"面板未声明待机"闸门全部跳过，表现为按钮没反应。
+    # 熄灭方式：system = Windows 系统级整组熄灭（一定唤得回来）
+    #           ddc    = 逐台 DDC 0xD6=2 待机（默认；v1.8.5 已验证的熄灭路径）
+    # v1.9.3 恢复 v1.8.5 的默认值：v1.9.0 曾未经要求把默认改成 system。
     {"key": "screen_off_method", "kind": "choice",
-     "values": ("system", "ddc"), "default": "system"},
+     "values": ("system", "ddc"), "default": "ddc"},
     # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
     {"key": "wake_switch_input", "kind": "flag", "default": True},
     # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
@@ -436,6 +435,7 @@ def load_config():
     global CONFIG_LOAD_ERROR
     CONFIG_LOAD_ERROR = ""
     cfg = default_config()
+    _recovered_off_method = False
     if not os.path.exists(CONFIG_FILE):
         return cfg
     try:
@@ -453,16 +453,13 @@ def load_config():
         # v1 -> v2 迁移：旧配置只有 "monitor": 0
         if "monitors" not in raw and "monitor" in raw:
             raw = dict(raw, monitors=[raw["monitor"]])
-        # v5 -> v6 迁移：旧默认「ddc + 不允许未声明值」= 逐台全被闸门跳过，
-        # 表现就是点熄灭没反应。主动选过 DDC 的用户会在确认框里被置
-        # ddc_allow_undeclared=True，所以这条组合只可能是没动过的旧默认。
-        try:
-            _ver = int(raw.get("version") or 0)
-        except Exception:
-            _ver = 0
-        if (_ver < 6 and raw.get("screen_off_method") == "ddc"
+        # v1.9.3：撤销 v1.9.0 的「旧配置 ddc → system」自动迁移。
+        # 迁移的判别特征是「system 且未允许未声明的 0xD6=2」；这里按同样特征
+        # 反向恢复为 v1.8.5 的默认 ddc。改动必须落日志，不静默改用户配置。
+        if (raw.get("screen_off_method") == "system"
                 and not raw.get("ddc_allow_undeclared")):
-            raw = dict(raw, screen_off_method="system")
+            raw = dict(raw, screen_off_method="ddc")
+            _recovered_off_method = True
         # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）。
         # v1.9.0 起 key 里带 EDID 短哈希（dev#uid），旧 dev-only 键不再播种：
         # 换面板后不会沿用旧缓存，代价只是首次重新实测一次。
@@ -473,6 +470,13 @@ def load_config():
             if key in raw:
                 cfg[key] = coerce_setting(key, raw[key])
         cfg["models"] = _load_model_cache(raw)
+        if _recovered_off_method:
+            _ok, _err = save_config(cfg)
+            if _ok:
+                _write_event_log("熄灭方式已恢复：system → ddc"
+                                 "（撤销 v1.9.0 的默认值迁移，恢复 v1.8.5 行为）")
+            else:
+                _write_event_log("熄灭方式恢复失败（磁盘仍为 system）：%s" % _err)
     except Exception as e:
         CONFIG_LOAD_ERROR = _backup_bad_config("%s: %s" % (type(e).__name__, e))
     return cfg
@@ -1191,31 +1195,22 @@ def screen_off_system():
 
 
 def screen_on_system():
-    """系统级点亮，并补一次"显示需求"声明（Windows 有时不主动重发画面）。"""
+    """系统级点亮，并补一次输入事件（Windows 有时不主动重发画面）。"""
     ok = _broadcast_monitor_power(SC_ON)
-    _request_display_on()
+    _nudge_user_input()
     return ok
 
 
-ES_CONTINUOUS = 0x80000000
-ES_DISPLAY_REQUIRED = 0x00000002
+def _nudge_user_input():
+    """喂一次真实的用户输入事件。
 
-
-def _request_display_on():
-    """向系统声明"现在需要显示"，不移动真实光标。
-
-    v1.8.5 及更早用 mouse_event 把光标移 1 像素再移回来。虽然肉眼几乎无感，
-    但它确实是**真实输入**：会打断"用户是不是在操作"的判断（全屏游戏、演示、
-    远程协助里都能被感知），鼠标落在屏幕边缘时还可能出现 1px 抖动。
-    改成 SetThreadExecutionState(ES_DISPLAY_REQUIRED)：语义就是"强制显示器退出
-    低功耗状态"，不产生任何输入事件。它只对"系统把屏关掉"有效；DDC 面板
-    自身待机仍靠上面的 0xD6=1 / 重新驱动输出。
+    Windows 有时在收到点亮命令后仍不重发画面（它仍认为显示器处于关闭状态），
+    一次微小的鼠标移动就能把它踢回"有显示"。移 1 像素再移回来，肉眼无感。
     """
     try:
-        k = ctypes.windll.kernel32
-        k.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
-        time.sleep(0.2)
-        k.SetThreadExecutionState(ES_CONTINUOUS)
+        u = ctypes.windll.user32
+        u.mouse_event(0x0001, 1, 0, 0, 0)      # MOUSEEVENTF_MOVE
+        u.mouse_event(0x0001, -1, 0, 0, 0)
         return True
     except Exception:
         return False
@@ -1286,10 +1281,10 @@ def _wake_one(t, allow_switch=True, expect_off=True):
 
     output_recycled = False
     if not expect_off:
-        _request_display_on()        # 屏幕本来就亮着：只声明显示需求，别去动输出
+        _nudge_user_input()          # 屏幕本来就亮着：只喂输入，别去动输出
     else:
         output_recycled = _output_recycle()
-        _request_display_on()
+        _nudge_user_input()
     stage = max(stage, 3)
     time.sleep(0.35)
 
@@ -1362,46 +1357,30 @@ def screen_wake_many(indices, allow_switch=True, expect_off=True):
         raise RuntimeError(NO_MONITOR_MSG)
     picked, bad = _select(targets, indices)
     results = {}
-    lib = _dxva2()
 
     def work(t):
         try:
             results[t["index"]] = _wake_one(t, allow_switch, expect_off)
         except Exception as e:
             results[t["index"]] = (False, 0, str(e))
-        finally:
-            # 句柄所有权归线程：即使 join 超时、本函数先返回，也不会出现
-            # "主线程 DestroyPhysicalMonitor、线程还在用这个句柄"的 use-after-free。
-            # DDC API 本身没有超时参数，卡住的线程只能让它自己收尾（daemon，不阻塞退出）。
-            try:
-                lib.DestroyPhysicalMonitor(t["handle"])
-            except Exception:
-                pass
 
-    threads = [threading.Thread(target=work, args=(t,), daemon=True) for t in picked]
+    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
     for th in threads:
         th.start()
-    deadline = time.monotonic() + 30
-    timed_out = False
     for th in threads:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            timed_out = True
-            break
-        th.join(left)
+        th.join(30)
 
     ok, errs = [], list(bad)
-    for t in picked:
-        done, stage, why = results.get(t["index"], (False, 0, "超时未返回（后台线程仍在收尾）"))
-        if done:
-            ok.append(t["index"])
-        else:
-            errs.append((t["index"], "第 %d 级（%s）：%s"
-                         % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
-    # 只释放**没交给线程**的句柄；被选中的句柄由各自线程负责销毁
-    release_targets([t for t in targets if all(t is not p for p in picked)])
-    if timed_out:
-        errs.append((-1, "部分显示器超过 30 秒仍未返回，已放弃等待（不会影响已完成的写入）"))
+    try:
+        for t in picked:
+            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
+            if done:
+                ok.append(t["index"])
+            else:
+                errs.append((t["index"], "第 %d 级（%s）：%s"
+                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
+    finally:
+        release_targets(targets)
     return ok, errs
 
 
