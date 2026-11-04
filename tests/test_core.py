@@ -5,7 +5,7 @@
   - 时间解析与旧配置兼容
   - 启动补检判定（错过阈值、同日同档防重）
   - 计划任务参数拼装与落盘 XML 校验
-  - 「添加时间段」在定时关闭时也可点，且点完列表 +1、配置落盘（需要可用 Tk）
+  - 「添加时间段」点击后 300ms 内出现可见弹窗，并能在弹窗里完成一次添加（需要可用 Tk）
 """
 import glob
 import html
@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 
@@ -238,10 +239,10 @@ class TaskTest(TempConfigCase):
 
 
 class AddButtonRegression(TempConfigCase):
-    """「＋ 添加时间段」在定时关闭时也必须能点，点完列表 +1 且配置落盘。
+    """点击「＋ 添加时间段」→ 300ms 内出现可见弹窗 → 在弹窗里完成一次添加。
 
-    用隐藏的 Tk 构建真实的 SchedulePanel，把 SlotEditor 换成"立即保存"的假弹层，
-    全程不显示窗口、不碰显示器。
+    用隐藏的 Tk 构建真实的 SchedulePanel 和真实 SlotEditor，全程不显示窗口、
+    不碰显示器。v1.9.0 的教训：只断言列表 +1 不够，必须断言弹窗真的可见。
     """
 
     def setUp(self):
@@ -263,7 +264,7 @@ class AddButtonRegression(TempConfigCase):
             pass
         super().tearDown()
 
-    def test_add_click_while_schedule_disabled(self):
+    def test_add_click_opens_visible_dialog_and_saves(self):
         import tkinter as tk
 
         cfg = mb.default_config()
@@ -279,7 +280,9 @@ class AddButtonRegression(TempConfigCase):
             msg = Msg()
 
         fake = FakeApp()
+        fake.root = self.root
         fake.body = tk.Frame(self.root, bg=mb.UI["bg"])
+        fake.body.pack(fill="both", expand=True)
         fake.status_var = tk.StringVar()
         fake.slots_saved = []
         fake.refresh_task_status = lambda: None
@@ -294,29 +297,46 @@ class AddButtonRegression(TempConfigCase):
 
         fake.on_slots_changed = on_slots_changed
         panel = mb.SchedulePanel(fake, cfg)
+        self.root.update()
         self.assertTrue(panel.add_btn._enabled,
                         "定时未启用时「添加」也必须可点（v1.8.5 的回归）")
+        # 按钮真正绑到 add_row，不是绑到别的空 handler
+        self.assertIs(panel.add_btn._command.__func__, mb.SchedulePanel.add_row)
 
-        old_editor = mb.SlotEditor
+        self.assertEqual(len(panel.slots), 1)
+        panel.add_btn._command()              # 等价于一次完整点击的最终出口
 
-        class InstantEditor:
-            def __init__(self, app, slot, on_save, on_delete=None):
-                self.slot = dict(slot)
-                on_save(self.slot)
+        dialog = None
+        deadline = time.time() + 0.3
+        while time.time() < deadline:
+            self.root.update()
+            for w in self.root.winfo_children():
+                if isinstance(w, tk.Toplevel) and w.winfo_exists():
+                    dialog = w
+                    if w.winfo_ismapped() and w.winfo_width() > 0:
+                        break
+            if dialog is not None and dialog.winfo_ismapped():
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(dialog, "点击后 300ms 内没有创建 Toplevel 弹窗")
+        self.assertTrue(dialog.winfo_ismapped(), "弹窗存在但不可见")
+        self.assertGreater(dialog.winfo_width(), 0, "弹窗宽度为 0")
+        self.assertGreater(dialog.winfo_height(), 0, "弹窗高度为 0")
 
-        mb.SlotEditor = InstantEditor
-        try:
-            self.assertEqual(len(panel.slots), 1)
-            panel.add_btn._command()          # 等价于点击（Button 的内部出口）
-        finally:
-            mb.SlotEditor = old_editor
+        editor = panel._editor
+        self.assertIsNotNone(editor, "弹窗没有挂到 panel._editor")
+        editor.time_field.set_time("07:15")
+        editor.level_spin.set(40)
+        editor.ok_btn._command()              # 弹窗里的「保存」
+        self.root.update()
 
-        self.assertEqual(len(panel.slots), 2, "点完必须多一条")
+        self.assertEqual(len(panel.slots), 2, "保存后列表必须多一条")
+        self.assertIn("07:15", [s["time"] for s in panel.slots])
+        self.assertFalse(dialog.winfo_exists(), "保存后弹窗应关闭")
         self.assertTrue(written.get("ok"), written.get("msg"))
         disk = mb.load_config()
         self.assertEqual(len(disk["slots"]), 2, "必须落盘")
-        self.assertEqual([s["time"] for s in fake.slots_saved],
-                         [s["time"] for s in panel.slots])
+        self.assertIn("07:15", [s["time"] for s in disk["slots"]])
 
 
 if __name__ == "__main__":

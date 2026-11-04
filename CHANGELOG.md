@@ -3,6 +3,26 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.1] - 2026-11-04
+
+### 修复（真机反馈：点「添加时间段」仍无弹窗，窗口像没反应）
+
+- **根因（具体到行）**：`parse_hhmm()`（`monitor_brightness.py:1450`）返回的是
+  "当天分钟数 int"，而 `SchedulePanel.add_row()`（`:3699`）写成
+  `hh, mm = parse_hhmm(...)`，点击瞬间抛
+  `TypeError: cannot unpack non-iterable int object`。v1.9.0 只是把按钮从禁用
+  改成可点，第一次真正执行到这条路径；windowed 打包后 `sys.stderr` 为 `None`，
+  Tk 回调异常被静默吞掉，所以界面看起来"完全没反应"。
+- **改法**：`add_row` 按分钟数直接 `(m + 60) % 1440` 递增；同时给根窗口安装
+  `report_callback_exception`，异常写 `%APPDATA%\MonitorBrightness\error.log`，
+  并在状态栏显式显示"界面异常：…"，不再出现点了没反应的黑洞。
+- **回归**：`AddButtonRegression` 改为真实 `SlotEditor`：点击后 300ms 内断言
+  Toplevel `winfo_ismapped()` 且宽高 > 0；再在弹窗填 `07:20 / 60%` 保存，
+  断言列表 6 档、config 落盘、弹窗关闭。
+- **截图取证**：独立桌面 + `PrintWindow`，不抢前台、不移动真实光标：
+  `proof_v191/01_before_click.png`、`02_dialog_visible.png`、`03_after_add.png`。
+- **构建**：`APP_VERSION` 1.9.1，`VERSION_DIR=dist_v191`。
+
 ## [1.9.0] - 2026-11-04
 
 ### 修复（用户反馈：定时没准时执行）

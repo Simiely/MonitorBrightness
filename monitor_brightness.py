@@ -38,6 +38,7 @@ import tempfile
 import threading
 import subprocess
 import time
+import traceback
 import ctypes.wintypes
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -69,11 +70,12 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 启动补执行 / 补执行失败都落在这里，界面直接读它展示
 EVENTS_FILE = os.path.join(CONFIG_DIR, "events.log")
+ERROR_FILE = os.path.join(CONFIG_DIR, "error.log")
 
 # 启动补检的最大错过时长（分钟）。取 12 小时的理由：
 # 覆盖"前一晚关机、早上开机后才想起"的整个工作日；超过 12 小时的档位意图已经过期，
@@ -3698,9 +3700,9 @@ class SchedulePanel:
         used = {s.get("time") for s in self.slots}
         t = "12:00"
         while t in used:
-            hh, mm = parse_hhmm(t, (12, 0))
-            hh = (hh + 60) % (24 * 60)
-            t = "%02d:%02d" % (hh // 60, hh % 60)
+            m = parse_hhmm(t, (12, 0))
+            m = (m + 60) % (24 * 60)
+            t = "%02d:%02d" % (m // 60, m % 60)
 
         def save(new):
             if any(s.get("time") == new["time"] for s in self.slots):
@@ -3899,6 +3901,9 @@ class App:
         self._last_verdict = {"state": self.cfg.get("screen_state", "on"), "detail": ""}
         self.status_var = tk.StringVar(value="就绪")
         self.msg = DarkBox(self.root)
+        # windowed 打包后 stderr 为 None，Tk 回调异常会彻底静默；
+        # 落到 error.log + 状态栏，避免再出现「点了没反应」式黑洞。
+        self.root.report_callback_exception = self._report_tk_error
         self._sheet = None
         self._editor = None
         self._probing = False
@@ -4550,6 +4555,25 @@ class App:
         self.root.destroy()
 
     # ---------- 启动自检 / 补执行 ----------
+    def _report_tk_error(self, exc, val, tb):
+        """Tk 回调异常兜底：windowed 下 stderr 不可见，必须落盘并提示。"""
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(ERROR_FILE, "a", encoding="utf-8") as f:
+                f.write("%s\n%s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), detail))
+        except Exception:
+            pass
+        short = "%s: %s" % (getattr(exc, "__name__", "错误"), val)
+        try:
+            _write_event_log("界面异常 %s" % short)
+        except Exception:
+            pass
+        try:
+            self.status_var.set("界面异常：%s（详见 error.log）" % short)
+        except Exception:
+            pass
+
     def _warn_config_error(self):
         if self._config_error:
             self.status_var.set("配置文件读取失败，已使用默认值")

@@ -179,6 +179,10 @@ python -m unittest discover -s tests -v
 关掉再打开「启用每日定时」开关即可强制覆盖注册；也可以直接跑 `--ensure-schedule`。
 「上次运行」如果一直是"从未运行"，用「检测」重查一次，或跑 `--diag` 看任务定义与结果码。
 
+**界面点了没反应？**
+v1.9.1 起所有 Tk 回调异常都会写 `%APPDATA%\MonitorBrightness\error.log`，并在窗口底部
+状态栏显示「界面异常：…」。把该日志发回即可定位，不会再出现"点完毫无反应"的情况。
+
 **点亮没反应，或者点完反而更黑？**
 
 v1.9.0 起默认「熄灭方式 = **系统级**」（`SC_MONITORPOWER 2`，恢复由 Windows 负责，

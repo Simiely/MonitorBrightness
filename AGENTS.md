@@ -1,6 +1,6 @@
 # AGENTS.md · 项目规则
 
-> 📌 **文档基线**：2026-11-04（v1.9.0：定时任务启动自愈 + 启动补检 + 键入式时间控件）
+> 📌 **文档基线**：2026-11-04（v1.9.1：修复「添加时间段」弹窗被 int 解包异常静默吞掉 + 界面异常落盘）
 > **更新文档/代码后，请更新此行**（日期 + 新 commit hash），并在 CHANGELOG 追加版本
 
 ## 技术栈
@@ -110,7 +110,12 @@
   且**每条 Register-ScheduledTask 单独 try/catch**：开头 `$ErrorActionPreference='Stop'`
   会让一次失败把后面所有语句（含回读校验）全部跳过。
 - **`--windowed` 里任何用户可触发的回调都要包异常兜底** → 没有控制台，Tk 回调抛异常会
-  **完全静默**，用户视角就是"点了没反应"（本项目真踩过：`self.catch_up_on_logon` 拼错属性名）。
+  **完全静默**，用户视角就是"点了没反应"（本项目真踩过两次：`self.catch_up_on_logon`
+  拼错属性名；`add_row` 里 `hh, mm = parse_hhmm(...)` 解包 int 抛 `TypeError`）。
+  v1.9.1 起根窗口装 `report_callback_exception`：异常落 `error.log` + 状态栏提示。
+- **`parse_hhmm()` 返回的是"当天分钟数 int"，不是 `(时, 分)`** → 要递增请直接
+  `m = (m + 60) % 1440`；弹窗/列表相关回归必须断言 **Toplevel `winfo_ismapped()` 且宽高 > 0**，
+  只断言"列表 +1"会漏掉"弹窗根本没出现"。
 - **读任务 XML 会用 UTF-16 LE** → `C:\Windows\System32\Tasks\<任务名>` 是 UTF-16 LE，
   用 ASCII 模式 grep 永远匹配不到；要先按编码解出来。该目录**列表被权限挡**，但直接按文件名访问可以。
 - **`schtasks.exe` 没有「错过就补跑」开关** → 用它注册的每日任务，电脑关机/睡眠错过时间点后
