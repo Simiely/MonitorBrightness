@@ -3,6 +3,125 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.7] - 2026-11-04
+
+### 新增（0x60 切源翻转的快速点亮）
+
+- 现场依据：两次独立实测（Legion R27qe Gen2 / DISPLAY2，16:57 与 17:00），
+  `0x60` 读当前源 → 写 17 → **立即**写回原值：单台 182~188ms，两次都点亮，
+  读回 `0x60` 均回到 15。点亮来自「离开当前口再回来」的边沿（DP 接收端重跑链路
+  训练并重锁时序），与停在中途多久无关，所以本路径**不 sleep**。
+- 新增 `screen_wake_entry(cfg, indices)` 作为点亮统一入口（GUI 点亮、CLI
+  `--screen on`、计划任务 `apply_schedule` 都改走这里）：
+  - `wake_fast_flip`（默认 1）+ `screen_off_method=ddc` + `wake_switch_input` +
+    记账认为屏熄过 → 走 `screen_wake_flip()`，逐台 `0x60` 翻转，单台 ~180ms；
+    全选/部分选择都只动勾选的屏，**绝不发 SC_MONITORPOWER 广播**。
+  - 其余情况（开关关闭、system 模式、屏亮着、禁用切源）→ 原样调用
+    `screen_on_cfg()`，v1.9.6 行为不变。
+  - 同一台 8 秒内第二次触发点亮 → 该台升级为 `_wake_one()` 完整阶梯，
+    状态行提示「已升级为完整点亮」。
+  - 读不到当前源 / 无可用中间源 / 写失败 → 回退完整阶梯；写回失败会立即补写一次
+    并读回校验，避免把屏留在中间源。
+- 中间源选择：优先 17；当前就是 17 时取能力串已声明的另一个口（优先 15）。
+- 旧配置缺 `wake_fast_flip` 按默认 1 处理；`CONFIG_VERSION` 不变（读侧逐键 coerce）。
+- `_wake_one` / `screen_off_cfg` / `screen_on_cfg` / `_switch_input_roundtrip` /
+  `_output_recycle` / `screen_wake_many` / `wake_options` 与 v1.9.6 逐字节一致
+  （见 `_mb_func_diff` 验证），本轮只新增路由层与新函数。
+- 单测 +9：翻转序列无等待、当前值 17 的中间源、8 秒二击升级、8 秒二击的完整阶梯、
+  门控（屏亮/禁用切源/system 模式）、全选零广播、开关关闭回退、旧配置缺键兼容。
+
+## [1.9.6] - 2026-11-04
+
+### 修复（点亮误伤未勾选显示器）
+
+- 根因：点亮第 3 级 `_output_recycle()` 调用 `SendMessageTimeoutW(HWND_BROADCAST,
+  SC_MONITORPOWER, ...)`，这是**系统级广播**，会黑掉所有显示器；而且每个被选中的
+  显示器各执行一次，2 台就是 2×OFF + 2×ON。
+- 修法（只加过滤层）：`screen_wake_many()` 计算 `allow_recycle = 选中台数 == 总台数`，
+  传给 `_wake_one(..., allow_recycle)`；只勾部分时**跳过系统级广播**，仅对勾选的
+  那台发 `0xD6=1` / 写亮度 / 输入注入 /（允许时）切输入源。
+- 全选时 `allow_recycle=True`，调用序列、sleep、广播次数与 v1.9.5 完全一致。
+
+### 修复（空勾选）
+
+- `screen_on` / `screen_off` 在 `selected_indices()` 为空时不再落到 `_select` 的
+  “空=全部”分支，改为状态行提示「请先勾选要操作的显示器」，不发任何命令。
+
+### UI
+
+- 「任务计划」下方事件行 `event_lbl` 由橙色 `#ff9f0a` 改为辅助灰 `#6c6c70`
+  （与 `task_sub`/`task_next` 同色）；`pady`、字号、wraplength 均未动。
+- 该行若包含「失败/错误/异常/未就绪」字样，仍保留橙色，避免把告警灰掉。
+
+### 验证
+
+- 干跑序列（写/广播打桩、读与 sleep 真实）：只勾 1 台 → 仅 DISPLAY1 4 次写
+  （`0xD6=1`、`0x10=80`、`0x60=17`、`0x60=15`），广播 **0** 次，3167ms；
+  勾 2 台 → 两台各 4 次写，广播 4 次（2×OFF + 2×ON），4029ms。
+- 真机（仅 DISPLAY1，`allow_switch=True`）：4 次写全部落在 DISPLAY1，
+  广播 0 次，**3406ms**；DISPLAY2 全程 0 次写、状态读回前后不变；
+  DISPLAY1 输入源已写回 15，亮度 80、电源 1 与测试前一致。
+- 26 项单元测试通过（新增 3 项），`--selftest` 通过。
+
+## [1.9.5] - 2026-11-04
+
+### 修复（仅 C 项：忙时点击被静默丢弃）
+
+- `_busy` 窗口内（点亮约 4.03s）点「熄灭/点亮」或用热键，原来直接 `return`，
+  无日志无提示。现在：
+  - 状态行立刻显示「正在唤醒中…（或 正在熄灭中…）点亮/熄灭请求已排队，完成后自动执行」；
+  - 记住**最后一次**请求（连点只保留最后一个意图），当前忙任务结束后补执行一次；
+  - `events.log` 记录「忙时…请求已排队」与「补执行忙时排队的…请求」。
+- **未改任何时序**：`_wake_one`、`screen_off_cfg`、`screen_on_cfg`、sleep 时长、
+  `_busy` 窗口长度、失败回退行为全部保持 v1.9.4 原样；补执行在忙任务回调结束时
+  触发（受现有 150ms 轮询节拍约束，最多晚 150ms）。
+
+### 明确不做（用户裁定）
+
+- **A 取消**：不改熄灭值，不把 `0xD6=2` 替换成能力串声明的 `04/05`，不加
+  「用声明值替换硬编码值」的逻辑（`ddc` 熄灭在这台机器上一直可用）。
+- **B 不做**：不做分级升级、不改 sleep、不加早退判据；**亮屏逻辑与 v1.8.5 一致**
+  （固定阶梯属基线固有行为，不是本次回归）。
+
+### 验证
+
+- 函数级 diff：`_wake_one` / `screen_off_many` / `screen_wake_many` /
+  `_switch_input_roundtrip` / `_output_recycle` / `_finish_screen_off` /
+  `_finish_screen_on` / `run_bg` 与 v1.8.5 **逐字节一致**；仅
+  `screen_off` / `screen_on`（新增 `_busy_action` 赋值）与 `_poll_read_queue`
+  （新增排队补执行）有差异，均在 GUI 层。
+- 23 项单元测试通过（新增 4 项：忙时提示/排队、只补执行一次、轮询顺序、空闲点击）；
+  `--selftest` 通过。
+- 部署：覆盖 `D:\Tool\MonitorBrightness.exe`（部署前后体积/SHA256 见交付记录）。
+
+## [1.9.4] - 2026-11-04
+
+### 变更（用户对三项待定的裁定）
+
+- **启动自检 = 只检查任务配置**：保留读 `System32\Tasks\*` XML、比对路径/参数/触发点/
+  `StartWhenAvailable`、不一致则原地重建；**删除** v1.9.0 新增的 in-app 补执行、
+  12 小时补检阈值与 `last_fired` 记账。配置一致时状态行只显示
+  「定时任务已就绪，下次运行 X」，不弹窗。**本程序启动时不会主动熄屏。**
+  （v1.8.5 已有的登录校准任务 `MonitorBrightness_CatchUp` 保持不动。）
+- **撤销 DPI 感知**：删除 `SetProcessDpiAwarenessContext/SetProcessDpiAwareness/
+  SetProcessDPIAware` 三档回退；`ScrollArea` 恢复 `winfo_screenheight() - 180` 的封顶逻辑；
+  `--diag` 无 DPI 输出，保持原样。
+- **保留旁路增强**（均不在熄灭/点亮调用链）：`events.log` + 界面事件行、
+  `woke_by_input` 只做内存记账（删掉探测回调里的 `save_config`）、
+  `_fetch_models` 线程内销毁句柄（其 `join(20)` 是 v1.8.5 原有等待，未新增）。
+- **`apply_schedule` 恢复 v1.8.5 语义**：不再写 `last_fired`，只由计划任务
+  （`--apply-schedule`）调用；GUI 启动自检不再调用它。
+
+### 验证（不触碰屏幕）
+
+- 30 项函数级 diff：26 项与 v1.8.5 **逐字节一致**；4 项（`_capabilities_cached`、
+  `_luminance_max`、`_switch_input_roundtrip`、`screen_off_many`）仅缓存 key 不同
+  （`DEV#EDID`，用户点名保留）。
+- 熄灭/点亮调用链内无 `_write_event_log`、无新增 `join`/`sleep`；
+  `_write_event_log` 只出现在配置恢复、任务重建、界面异常兜底、时间段重写四处。
+- 19 项单元测试通过；`--selftest` 通过。
+- 部署：覆盖 `D:\Tool\MonitorBrightness.exe`（部署前后体积/SHA256 见交付记录）。
+
 ## [1.9.3] - 2026-11-04
 
 ### 回滚（用户裁定：只修被复现的 bug，不许改已验证的操作逻辑）

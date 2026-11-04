@@ -1,9 +1,9 @@
 """不碰硬件的回归测试：python -m unittest discover -s tests -v
 
-覆盖 v1.9.0 修的几处核心逻辑：
-  - 配置原子写 / 坏配置备份与提示 / last_fired 与磁盘取较新
+覆盖 v1.9.x 修的几处核心逻辑：
+  - 配置原子写 / 坏配置备份与提示 / 熄灭方式默认 ddc
   - 时间解析与旧配置兼容
-  - 启动补检判定（错过阈值、同日同档防重）
+  - 启动自检只校验计划任务，绝不补执行、绝不熄屏（v1.9.4）
   - 计划任务参数拼装与落盘 XML 校验
   - 「添加时间段」点击后 300ms 内出现可见弹窗，并能在弹窗里完成一次添加（需要可用 Tk）
   - v1.9.2 任务重建成功：300ms 内可见「确认」窗，点确认销毁；失败/启动自愈不弹
@@ -16,6 +16,7 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import unittest
 from datetime import datetime
 
@@ -65,19 +66,6 @@ class ConfigTest(TempConfigCase):
         self.assertEqual(cfg["slots"], mb._coerce_slots(None))
         self.assertTrue(glob.glob(mb.CONFIG_FILE + ".bad-*.json"),
                         "坏配置必须留副本，避免下一次保存覆盖掉用户原文件")
-
-    def test_last_fired_keeps_newer_disk_value(self):
-        disk = mb.default_config()
-        mb.mark_fired(disk, {"time": "08:30"}, datetime(2026, 11, 4, 8, 30, 10))
-        mb.save_config(disk)
-
-        stale = mb.default_config()
-        mb.mark_fired(stale, {"time": "08:30"}, datetime(2026, 11, 3, 8, 30, 10))
-        mb.save_config(stale)
-
-        got = mb.load_config()
-        self.assertEqual(got["last_fired"]["date"], "2026-11-04",
-                         "GUI 手里的旧 cfg 不能覆盖计划任务刚写的 last_fired")
 
     def test_legacy_day_night_migration(self):
         raw = {"version": 2, "day_time": "09:00", "day_level": 80,
@@ -143,7 +131,9 @@ class TimeTest(unittest.TestCase):
         self.assertEqual(got[1]["screen"], "")
 
 
-class CatchUpTest(TempConfigCase):
+class StartupCheckTest(TempConfigCase):
+    """v1.9.4：启动自检只校验任务配置，绝不补执行、绝不熄屏。"""
+
     def make_cfg(self, slots=None):
         cfg = mb.default_config()
         cfg["enabled"] = True
@@ -153,39 +143,347 @@ class CatchUpTest(TempConfigCase):
         ])
         return cfg
 
-    def test_due_after_missed(self):
-        d = mb.catch_up_decision(self.make_cfg(), datetime(2026, 11, 4, 9, 5))
-        self.assertTrue(d["due"])
-        self.assertEqual(d["slot"]["time"], "08:30")
-        self.assertEqual(d["missed_min"], 35)
+    def test_no_in_app_catch_up_api(self):
+        for name in ("catch_up_decision", "_catch_up_worker", "apply_slot",
+                     "mark_fired", "CATCH_UP_LIMIT_MIN"):
+            self.assertFalse(hasattr(mb, name), "%s 必须被删除" % name)
 
-    def test_before_first_slot_today_no_catch_up(self):
-        d = mb.catch_up_decision(self.make_cfg(), datetime(2026, 11, 4, 6, 30))
-        self.assertFalse(d["due"], "早上开机不该把昨晚 21:00 的夜间档再套一遍")
+    def test_consistent_task_returns_without_rebuild(self):
+        calls = []
+        old_match, old_reg = mb.task_match_reason, mb.register_tasks
+        mb.task_match_reason = lambda cfg: ""
+        mb.register_tasks = lambda cfg: calls.append(1) or (True, "")
+        try:
+            ok, msg = mb.ensure_task_registration(self.make_cfg())
+        finally:
+            mb.task_match_reason, mb.register_tasks = old_match, old_reg
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+        self.assertEqual(calls, [], "配置一致时不得重建任务")
+        # 启动自检链路里不能出现任何执行档位/熄屏的函数
+        self.assertNotIn("screen_off", mb.App._start_auto_checks.__code__.co_names)
 
-    def test_same_day_same_slot_not_repeated(self):
-        cfg = self.make_cfg()
-        mb.mark_fired(cfg, {"time": "08:30"}, datetime(2026, 11, 4, 8, 30, 5))
-        d = mb.catch_up_decision(cfg, datetime(2026, 11, 4, 10, 0))
-        self.assertFalse(d["due"])
-        self.assertIn("已执行", d["reason"])
+    def test_finish_auto_checks_reports_ready_only(self):
+        class Fake:
+            status_var = None
+            cfg = None
 
-    def test_yesterday_record_does_not_block_today(self):
-        cfg = self.make_cfg()
-        mb.mark_fired(cfg, {"time": "08:30"}, datetime(2026, 11, 3, 8, 30, 5))
-        d = mb.catch_up_decision(cfg, datetime(2026, 11, 4, 9, 0))
-        self.assertTrue(d["due"])
+        fake = Fake()
+        import tkinter as tk
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+        except Exception as e:               # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            fake.status_var = tk.StringVar()
+            fake.cfg = self.make_cfg()
+            fake._refresh_events = lambda: None
+            fake.refresh_task_status = lambda: None
+            mb.App._finish_auto_checks(fake, {"task": (True, "")})
+            text = fake.status_var.get()
+        finally:
+            probe.destroy()
+        self.assertIn("定时任务已就绪", text)
+        self.assertIn("下次运行", text)
 
-    def test_over_threshold_skipped(self):
-        d = mb.catch_up_decision(self.make_cfg(), datetime(2026, 11, 4, 21, 40))
-        # 21:40 的当前档是 21:00（错过 40 分钟），仍然该补
-        self.assertTrue(d["due"])
-        d2 = mb.catch_up_decision(self.make_cfg(), datetime(2026, 11, 4, 21, 1))
-        self.assertTrue(d2["due"])
-        cfg = self.make_cfg([{"time": "08:30", "level": 80}])
-        d3 = mb.catch_up_decision(cfg, datetime(2026, 11, 4, 21, 0))
-        self.assertFalse(d3["due"])
-        self.assertGreater(d3["missed_min"], mb.CATCH_UP_LIMIT_MIN)
+
+class BusyQueueTest(TempConfigCase):
+    """v1.9.5：忙时点击/热键不再静默丢弃，改为提示 + 结束后补执行一次。"""
+
+    class _Var:
+        def __init__(self):
+            self._v = ""
+
+        def set(self, v):
+            self._v = v
+
+        def get(self):
+            return self._v
+
+    def test_busy_click_is_queued_with_visible_hint(self):
+        fake = type("F", (), {})()
+        fake._queue_screen_action = types.MethodType(mb.App._queue_screen_action, fake)
+        fake.status_var = self._Var()
+        fake._busy = True
+        fake._busy_action = "on"          # 当前正在唤醒（约 4s 窗口）
+        fake._pending_screen = None
+        fake.selected_indices = lambda: [0]
+        fake.run_bg = lambda *a, **k: self.fail("忙时不得启动新的屏幕任务")
+
+        mb.App.screen_on(fake)
+        text = fake.status_var.get()
+        self.assertIn("正在唤醒中", text)
+        self.assertIn("点亮请求已排队", text)
+        self.assertEqual(fake._pending_screen, "on")
+
+        with open(mb.EVENTS_FILE, "r", encoding="utf-8") as f:
+            log = f.read()
+        self.assertIn("忙时点亮请求已排队", log)
+
+        # 连点两次只保留最后一次意图
+        mb.App.screen_off(fake)
+        self.assertEqual(fake._pending_screen, "off")
+        self.assertIn("熄灭请求已排队", fake.status_var.get())
+
+    def test_pending_is_replayed_once_after_busy_done(self):
+        fake = type("F", (), {})()
+        fake._busy = False
+        fake._pending_screen = "on"
+        fake.screen_on = lambda: calls.append("on")
+
+        calls = []
+        self.assertTrue(mb.App._dispatch_pending_screen(fake))
+        self.assertEqual(calls, ["on"])
+        self.assertIsNone(fake._pending_screen)
+        self.assertFalse(mb.App._dispatch_pending_screen(fake), "只能补执行一次")
+        self.assertEqual(calls, ["on"])
+
+        with open(mb.EVENTS_FILE, "r", encoding="utf-8") as f:
+            self.assertIn("补执行忙时排队的点亮请求", f.read())
+
+    def test_poll_dispatches_pending_after_on_done(self):
+        order = []
+        fake = type("F", (), {})()
+        fake._dispatch_pending_screen = types.MethodType(mb.App._dispatch_pending_screen, fake)
+        fake._read_queue = __import__("queue").Queue()
+        fake._bg_tasks = 1
+        fake._busy = True
+        fake._busy_action = "on"
+        fake._pending_screen = "off"
+        fake._hotkeys_on = False
+        fake._relight_pending = False
+        fake.root = type("R", (), {"after": lambda *a, **k: None})()
+        fake._set_actions_enabled = lambda enabled: None
+        fake.screen_off = lambda: order.append("replay-off")
+        fake._read_queue.put(("done", (lambda r: order.append("on_done"), None, True), None))
+
+        mb.App._poll_read_queue(fake)
+        self.assertEqual(order, ["on_done", "replay-off"], "补执行必须在当前动作回调之后")
+        self.assertFalse(fake._busy)
+        self.assertIsNone(fake._busy_action)
+        self.assertIsNone(fake._pending_screen)
+
+    def test_idle_click_sets_busy_action_and_runs(self):
+        seen = []
+        fake = type("F", (), {})()
+        fake.status_var = self._Var()
+        fake._busy = False
+        fake._busy_action = None
+        fake.selected_indices = lambda: [0]
+        fake._finish_screen_on = lambda result: None
+        fake.run_bg = lambda job, on_done, busy: seen.append(busy)
+
+        mb.App.screen_on(fake)
+        self.assertEqual(fake._busy_action, "on")
+        self.assertEqual(seen, [True])
+        self.assertIn("正在点亮显示器", fake.status_var.get())
+
+
+class WakeSelectionTest(TempConfigCase):
+    """v1.9.6：点亮只作用于已勾选显示器；空勾选不发命令。"""
+
+    def _targets(self):
+        return [{"index": 0, "handle": 0xA0, "dev": "DISPLAY1", "desc": "A"},
+                {"index": 1, "handle": 0xB0, "dev": "DISPLAY2", "desc": "B"}]
+
+    def _patch(self):
+        self._orig = (mb.enumerate_targets, mb.release_targets, mb._write_vcp,
+                      mb._read_vcp, mb._nudge_user_input, mb._output_recycle,
+                      mb._switch_input_roundtrip, mb.time.sleep)
+        self.writes, self.switches, self.recycles = [], [], []
+        mb.enumerate_targets = self._targets
+        mb.release_targets = lambda ts: None
+        mb._write_vcp = lambda h, c, v: (self.writes.append((h, c, v)), True)[1]
+        mb._read_vcp = lambda h, c: (80, 100)
+        mb._nudge_user_input = lambda: None
+        mb._output_recycle = lambda: (self.recycles.append("recycle"), True)[1]
+        mb._switch_input_roundtrip = lambda t: (self.switches.append(t["handle"]), True)[1]
+        mb.time.sleep = lambda s: None
+
+    def _restore(self):
+        (mb.enumerate_targets, mb.release_targets, mb._write_vcp, mb._read_vcp,
+         mb._nudge_user_input, mb._output_recycle, mb._switch_input_roundtrip,
+         mb.time.sleep) = self._orig
+
+    def test_subset_wake_writes_only_checked_monitor(self):
+        self._patch()
+        try:
+            ok, errs = mb.screen_wake_many([0], allow_switch=True, expect_off=True)
+        finally:
+            self._restore()
+        self.assertEqual([w[0] for w in self.writes], [0xA0, 0xA0],
+                         "只勾 1 台时，另一台必须 0 次写调用")
+        self.assertEqual(self.recycles, [], "子集时不得广播 SC_MONITORPOWER")
+        self.assertEqual(self.switches, [0xA0])
+        self.assertEqual(ok, [0])
+        self.assertEqual(errs, [])
+
+    def test_all_selected_keeps_recycle_behavior(self):
+        self._patch()
+        try:
+            ok, errs = mb.screen_wake_many([0, 1], allow_switch=True, expect_off=True)
+        finally:
+            self._restore()
+        self.assertEqual(sorted({w[0] for w in self.writes}), [0xA0, 0xB0])
+        self.assertEqual(len(self.recycles), 2, "全选时每台仍走系统级重驱动（原行为）")
+        self.assertEqual(sorted(ok), [0, 1])
+
+    def test_empty_selection_shows_prompt_without_commands(self):
+        fake = type("F", (), {})()
+        fake.status_var = BusyQueueTest._Var()
+        fake._busy = False
+        fake.selected_indices = lambda: []
+        fake.run_bg = lambda *a, **k: self.fail("空勾选不得发命令")
+
+        mb.App.screen_on(fake)
+        self.assertIn("请先勾选", fake.status_var.get())
+        mb.App.screen_off(fake)
+        self.assertIn("请先勾选", fake.status_var.get())
+
+
+class FastFlipTest(TempConfigCase):
+    """v1.9.7：0x60 切源翻转快速点亮（打桩，不发任何真实 DDC 命令）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig = (mb._read_vcp, mb._write_vcp, mb._capabilities_cached,
+                      mb._display_key, mb.enumerate_targets, mb.release_targets,
+                      mb.screen_on_cfg, mb.screen_wake_flip, mb._fast_flip_one,
+                      mb._wake_one, mb._broadcast_monitor_power, mb.time.sleep,
+                      dict(mb._FAST_FLIP_AT))
+        mb._FAST_FLIP_AT.clear()
+        self.sleeps = []
+        mb.time.sleep = lambda s: self.sleeps.append(s)
+
+    def tearDown(self):
+        (mb._read_vcp, mb._write_vcp, mb._capabilities_cached, mb._display_key,
+         mb.enumerate_targets, mb.release_targets, mb.screen_on_cfg,
+         mb.screen_wake_flip, mb._fast_flip_one, mb._wake_one,
+         mb._broadcast_monitor_power, mb.time.sleep, old_at) = self._orig
+        mb._FAST_FLIP_AT.clear()
+        mb._FAST_FLIP_AT.update(old_at)
+        super().tearDown()
+
+    def _targets(self):
+        return [{"index": 0, "handle": 0xA0, "dev": "DISPLAY1", "desc": "A"},
+                {"index": 1, "handle": 0xB0, "dev": "DISPLAY2", "desc": "B"}]
+
+    def test_flip_sequence_has_no_wait(self):
+        writes = []
+        mb._read_vcp = lambda h, c: (15, 100) if c == mb.VCP_INPUT_SOURCE else None
+        mb._write_vcp = lambda h, c, v: (writes.append((h, c, v)), True)[1]
+        mb._capabilities_cached = lambda h, k: "60(11 12 0F)"
+        mb._display_key = lambda t: t["dev"]
+
+        ok, note = mb._fast_flip_one({"index": 0, "handle": 0xA0, "dev": "DISPLAY1"})
+        self.assertTrue(ok, note)
+        self.assertEqual(writes, [(0xA0, mb.VCP_INPUT_SOURCE, 17),
+                                 (0xA0, mb.VCP_INPUT_SOURCE, 15)],
+                         "必须 读 0x60 → 写中间源 → 立即写回原源")
+        self.assertEqual(self.sleeps, [], "快速路径不得有任何 sleep")
+        self.assertIn("翻转 0x60 15→17→15", note)
+        self.assertIn("耗时", note)
+
+    def test_mid_source_when_current_is_17(self):
+        self.assertEqual(mb.pick_flip_source(15, [17, 18, 15]), 17)
+        self.assertEqual(mb.pick_flip_source(17, [17, 18, 15]), 15,
+                         "当前就是 17 时必须换一个声明过的口")
+        self.assertEqual(mb.pick_flip_source(17, [17, 18]), 18)
+        self.assertEqual(mb.pick_flip_source(15, []), 17, "能力串读不到时用通用候选")
+        self.assertIsNone(mb.pick_flip_source(17, [17]))
+
+    def test_second_trigger_within_8s_escalates(self):
+        mb._mark_fast_flip("DISPLAY1#x", 100.0)
+        self.assertTrue(mb._fast_flip_recent("DISPLAY1#x", 103.0), "8 秒内算第二次")
+        self.assertFalse(mb._fast_flip_recent("DISPLAY1#x", 120.0), "超过窗口不算")
+        self.assertFalse(mb._fast_flip_recent("DISPLAY2#x", 103.0), "另一台不受影响")
+
+    def test_second_trigger_uses_full_ladder_and_says_so(self):
+        ladder = []
+        mb.enumerate_targets = self._targets
+        mb.release_targets = lambda ts: None
+        mb._display_key = lambda t: t["dev"]
+        mb._fast_flip_one = lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms")
+        mb._wake_one = lambda t, a, e, r: (ladder.append((t["dev"], e)),
+                                          (True, 4, "x"))[1]
+
+        mb.screen_wake_flip([0])
+        # 第一次成功后 GUI 会把 screen_state 记成 on，第二次点击 expect_off=False；
+        # 但 8 秒内二击仍必须升级为完整阶梯（用户点第二次=第一次没亮）。
+        mb.screen_wake_flip([0], expect_off=False)
+        self.assertEqual(ladder, [("DISPLAY1", True)],
+                         "第二次必须以 expect_off=True 走完整 _wake_one 阶梯")
+        self.assertIn("已升级为完整点亮", "；".join(mb.take_wake_info()))
+
+    def test_fast_flip_never_broadcasts(self):
+        broadcast = []
+        mb.enumerate_targets = self._targets
+        mb.release_targets = lambda ts: None
+        mb._display_key = lambda t: t["dev"]
+        mb._broadcast_monitor_power = lambda flag: (broadcast.append(flag), True)[1]
+        mb._fast_flip_one = lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms")
+
+        ok, errs = mb.screen_wake_flip([0, 1])
+        self.assertEqual(sorted(ok), [0, 1])
+        self.assertEqual(errs, [])
+        self.assertEqual(broadcast, [], "快速路径绝不发 SC_MONITORPOWER 广播")
+
+    def test_switch_off_falls_back_to_v196_ladder(self):
+        cfg = mb.default_config()
+        cfg["wake_fast_flip"] = False
+        cfg["screen_state"] = "off"
+        calls = []
+        mb.screen_on_cfg = lambda c, i: (calls.append("ladder"), ([0], []))[1]
+        mb.screen_wake_flip = lambda *a, **k: self.fail("关掉开关不得走快速路径")
+
+        ok, errs = mb.screen_wake_entry(cfg, [0])
+        self.assertEqual(calls, ["ladder"])
+        self.assertEqual(ok, [0])
+        self.assertEqual(errs, [])
+
+    def test_fast_path_gate_needs_ddc_and_switch_allowed(self):
+        cfg = mb.default_config()
+        self.assertEqual(cfg["screen_off_method"], "ddc")
+        self.assertTrue(cfg["wake_fast_flip"])
+
+        calls = []
+        mb.screen_wake_flip = lambda *a, **k: (calls.append("flip"), ([0], []))[1]
+        mb.screen_on_cfg = lambda c, i: (calls.append("ladder"), ([0], []))[1]
+
+        cfg["screen_state"] = "on"                      # 屏亮着也进路由器（内部不翻转）
+        mb.screen_wake_entry(cfg, [0])
+        cfg["screen_state"] = "off"
+        cfg["wake_switch_input"] = False                # 用户禁用切源：回旧路径
+        mb.screen_wake_entry(cfg, [0])
+        cfg["wake_switch_input"] = True
+        cfg["screen_off_method"] = "system"             # 系统级点亮本来就是即时广播
+        mb.screen_wake_entry(cfg, [0])
+        cfg["screen_off_method"] = "ddc"
+        mb.screen_wake_entry(cfg, [0])
+        self.assertEqual(calls, ["flip", "ladder", "ladder", "flip"])
+
+    def test_lit_screen_without_recent_flip_keeps_old_behavior(self):
+        calls = []
+        mb.enumerate_targets = self._targets
+        mb.release_targets = lambda ts: None
+        mb._display_key = lambda t: t["dev"]
+        mb._fast_flip_one = lambda t: self.fail("屏亮着且无近期记录时不得翻转")
+        mb._wake_one = lambda t, a, e, r: (calls.append((t["dev"], e, r)),
+                                          (True, 4, "x"))[1]
+
+        mb.screen_wake_flip([0, 1], expect_off=False)
+        self.assertEqual(sorted(calls),
+                         [("DISPLAY1", False, True), ("DISPLAY2", False, True)],
+                         "必须原样按 expect_off=False 走 _wake_one，不翻转")
+
+    def test_old_config_without_key_defaults_to_enabled(self):
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"version": 6, "screen_off_method": "ddc"}, f)
+        cfg = mb.load_config()
+        self.assertIs(cfg["wake_fast_flip"], True,
+                      "旧配置缺 wake_fast_flip 必须按默认 1 处理")
+        self.assertEqual(mb.default_config()["wake_fast_flip"], True)
 
 
 class TaskTest(TempConfigCase):
@@ -422,7 +720,6 @@ class RebuildNoticeRegression(TempConfigCase):
         fake.refresh_task_status = lambda: None
         fake._refresh_events = lambda: None
         fake.run_bg = lambda *a, **k: None
-        fake._catch_up_worker = lambda: None
         fake._finish_auto_checks = lambda result: None
         fake._announce_rebuilt = lambda *a: mb.App._announce_rebuilt(fake, *a)
         return fake, cfg
@@ -501,7 +798,6 @@ class RebuildNoticeRegression(TempConfigCase):
         fake, _cfg = self._fake()
         mb.App._finish_auto_checks(fake, {
             "task": (True, "计划任务已按当前程序重建（程序路径不一致），2 档，下次 11-04 21:00"),
-            "catchup": {"due": False},
         })
         self.root.update()
         self.assertEqual(self._top_levels(), [], "启动自动重建成功不应弹窗")

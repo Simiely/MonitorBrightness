@@ -70,17 +70,17 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.7"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-# 事件日志：任务重建 / 启动补执行 / 补执行失败都落在这里，界面直接读它展示
+# 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
+# ⚠️ 本程序启动时不会主动熄屏：启动自检只校验计划任务定义，绝不补执行任何档位。
 EVENTS_FILE = os.path.join(CONFIG_DIR, "events.log")
 ERROR_FILE = os.path.join(CONFIG_DIR, "error.log")
 
-# 启动补检的最大错过时长（分钟）。取 12 小时的理由：
-# 覆盖"前一晚关机、早上开机后才想起"的整个工作日；超过 12 小时的档位意图已经过期，
-# 往往下一档就在眼前，再补会把白天亮度硬套到夜里。
-CATCH_UP_LIMIT_MIN = 12 * 60
+# v1.9.4：删除启动补执行与 12 小时补检阈值。启动自检只比对任务定义
+# （路径/参数/触发点/StartWhenAvailable），绝不按「今天错过了哪一档」执行业务动作，
+# 因此本程序启动时不会主动熄屏，也不会主动改亮度。
 
 TASK_SCHEDULE = "MonitorBrightness_Schedule"
 TASK_CATCHUP = "MonitorBrightness_CatchUp"
@@ -182,12 +182,12 @@ SETTINGS = (
      "values": ("system", "ddc"), "default": "ddc"},
     # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
     {"key": "wake_switch_input", "kind": "flag", "default": True},
+    # v1.9.7 快速点亮：0x60 切源翻转（读当前源 → 写中间源 → 立即写回），单台 ~180ms。
+    # 仅有「ddc + 允许切源 + 记账认为熄过屏」时启用；关掉=完全回到 v1.9.6 完整阶梯。
+    {"key": "wake_fast_flip", "kind": "flag", "default": True},
     # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
     # 用户在界面里选择"DDC 单屏待机"并确认风险后才会置 True。
     {"key": "ddc_allow_undeclared", "kind": "flag", "default": False},
-    # 定时防重复记账：{"date": "YYYY-MM-DD", "slot": "HH:MM", "at": "YYYY-MM-DD HH:MM:SS"}
-    # 计划任务与启动补检都写这里；同一天同一档只执行一次（save 时还会与磁盘取较新者）。
-    {"key": "last_fired", "kind": "fired", "default": {}},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 6
@@ -224,8 +224,6 @@ def coerce_setting(key, value):
             return max(0, int(value))
         except Exception:
             return spec["default"]
-    if kind == "fired":
-        return _coerce_fired(value)
     if kind == "screenstate":
         # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
         return value if value in ("on", "off") else spec["default"]
@@ -306,43 +304,11 @@ def stamp_now():
     return datetime.now().strftime("%m-%d %H:%M")
 
 
-def _coerce_fired(value):
-    """last_fired 规整：只认 {"date": YYYY-MM-DD, "slot": HH:MM}。
-
-    at 是完整时间戳（秒级），只用于和磁盘上的记录比"谁更新"，缺省按当天 0 点算。
-    """
-    if not isinstance(value, dict):
-        return {}
-    date = str(value.get("date", "")).strip()
-    slot = str(value.get("slot", "")).strip()
-    at = str(value.get("at", "")).strip()
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date) or not _valid_hhmm(slot):
-        return {}
-    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", at):
-        at = date + " 00:00:00"
-    return {"date": date, "slot": slot, "at": at}
-
-
-def _fired_newer(a, b):
-    """a 是否比 b 更新（都是 _coerce_fired 的结果）。"""
-    if not a:
-        return False
-    if not b:
-        return True
-    return a.get("at", "") > b.get("at", "")
-
-
-def mark_fired(cfg, slot, when=None):
-    """记下"今天这一档已经执行过"，供启动补检防重复。"""
-    when = when or datetime.now()
-    slot = slot or {}
-    cfg["last_fired"] = {"date": when.strftime("%Y-%m-%d"),
-                         "slot": str(slot.get("time", "")),
-                         "at": when.strftime("%Y-%m-%d %H:%M:%S")}
-
-
 def _write_event_log(text):
-    """追加一行事件日志（线程安全）。返回写入的那一行。"""
+    """追加一行事件日志（线程安全）。返回写入的那一行。
+
+    ⚠️ 只用于旁路记账（任务重建/配置恢复等），不得在熄灭、点亮调用链里使用。
+    """
     line = "%s %s" % (datetime.now().strftime("%m-%d %H:%M"), text)
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -360,7 +326,7 @@ def _write_event_log(text):
 
 
 def read_recent_events(limit=3):
-    """读事件日志最后几行，界面用来显示「今天 08:15 补执行」这类记录。"""
+    """读事件日志最后几行，界面用来显示「任务计划已重建」这类记录。"""
     try:
         with open(EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = [x.strip() for x in f.readlines() if x.strip()]
@@ -499,34 +465,14 @@ def _atomic_write_text(path, text):
         raise
 
 
-def _read_disk_last_fired():
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return coerce_setting("last_fired", raw.get("last_fired")) \
-            if isinstance(raw, dict) else {}
-    except Exception:
-        return {}
-
-
 def save_config(cfg):
-    """保存配置。原子写 + last_fired 与磁盘取较新者。
-
-    为什么 last_fired 要合并：计划任务在后台跑 --apply-schedule 时也会写它，
-    而 GUI 常驻进程手里的 cfg 是启动时读的；如果 GUI 之后随手保存一次，
-    就会把任务刚写的"今天已执行"覆盖回旧值 → 下次启动又补执行一遍。
-    """
+    """保存配置：原子写（断电/并发读都不会读到半个文件）。"""
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
         if _CAPS_CACHE:
             payload["caps"] = dict(_CAPS_CACHE)
         payload["version"] = CONFIG_VERSION
-        mine = coerce_setting("last_fired", cfg.get("last_fired"))
-        payload["last_fired"] = mine
-        disk = _read_disk_last_fired()
-        if _fired_newer(disk, mine):
-            payload["last_fired"] = disk
         _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
     except Exception as e:
@@ -1244,13 +1190,17 @@ def _switch_input_roundtrip(t):
     return _write_vcp(h, VCP_INPUT_SOURCE, cur)
 
 
-def _wake_one(t, allow_switch=True, expect_off=True):
+def _wake_one(t, allow_switch=True, expect_off=True, allow_recycle=True):
     """分级唤醒单台显示器。返回 (命令是否都下发成功, 走到第几级, 说明)。
 
     ⚠️ **不用 `0xD6` 回读判断"醒了没有"**（v1.7.0 现场取证）：
     本机写入 `0xD6=2` 待机之后，回读仍是 `1`、`0x10` 亮度也照样读得到。
     拿它当判据就会出现"程序说点亮成功、屏幕其实黑着"——和 v1.5.0 熄屏事故同源。
     所以这里只保证"该发的命令都发到位"，真实亮灭交给「检测亮灭」+ 眼睛。
+
+    ⚠️ `allow_recycle=False`（v1.9.6）：只勾选了部分显示器时禁用第 3 级的
+    `SC_MONITORPOWER` 广播。那是**系统级**调用，会作用于所有显示器，把没勾选的
+    那台也黑一下再点亮。此时只用每台的 `0xD6=1` + 亮度写 + 输入注入。
 
     顺序按"危害从小到大"，前三步都不碰信号源：
       1 `0xD6=1` 电源模式=开（标准唤醒命令，无害）
@@ -1283,13 +1233,16 @@ def _wake_one(t, allow_switch=True, expect_off=True):
     if not expect_off:
         _nudge_user_input()          # 屏幕本来就亮着：只喂输入，别去动输出
     else:
-        output_recycled = _output_recycle()
+        if allow_recycle:
+            output_recycled = _output_recycle()
         _nudge_user_input()
     stage = max(stage, 3)
     time.sleep(0.35)
 
     if not allow_switch:
-        return wrote, stage, "已下发电源/亮度/输出重驱动（切信号源已禁用）"
+        note = ("已下发电源/亮度/输出重驱动" if output_recycled
+                else "已下发电源/亮度/输入注入")
+        return wrote, stage, note + "（切信号源已禁用）"
     if not expect_off:
         return wrote, stage, "已下发电源/亮度/系统输入（未熄过屏，跳过切信号源）"
     if not _switch_input_roundtrip(t):
@@ -1356,11 +1309,14 @@ def screen_wake_many(indices, allow_switch=True, expect_off=True):
     if not targets:
         raise RuntimeError(NO_MONITOR_MSG)
     picked, bad = _select(targets, indices)
+    # v1.9.6：只勾选部分显示器时，禁用系统级 SC_MONITORPOWER 重驱动
+    # （广播会把没勾选的那台也黑一下）。全选时保持原行为，逐字节不变。
+    allow_recycle = len(picked) == len(targets)
     results = {}
 
     def work(t):
         try:
-            results[t["index"]] = _wake_one(t, allow_switch, expect_off)
+            results[t["index"]] = _wake_one(t, allow_switch, expect_off, allow_recycle)
         except Exception as e:
             results[t["index"]] = (False, 0, str(e))
 
@@ -1419,6 +1375,213 @@ def screen_on_cfg(cfg, indices):
     if not screen_on_system():
         return [], [(-1, "系统级点亮下发失败")]
     return _system_ok_targets(indices), []
+
+
+# ============================================================
+# 快速点亮（v1.9.7）：0x60 信号源翻转，0 等待
+# ------------------------------------------------------------
+# 现场依据：两次独立实测（Legion R27qe Gen2 / DISPLAY2，16:57 与 17:00）
+#   读 0x60 → 写 17 → 立即写回 15：动作 182~188ms，两次都把屏点亮，
+#   读回 0x60 均回到原值 15。
+# 为什么不用等：SetVCPFeature 返回只代表这次 DDC 写事务被面板 ACK，真正的点亮
+# 来自「离开当前口→再回来」这一个边沿——DP 接收端必须重跑链路训练并重锁时序。
+# 停在中途多久与重锁无关（v1.9.6 的 2 秒只是让第二次写不落在面板切换窗口里）。
+#
+# 边界：本路径只写 0x60；不写 0xD6 / 0x10，不发系统广播。
+# 失败（读不到当前源 / 无可用中间源 / 写失败）一律回退 v1.9.6 的完整阶梯；
+# 同一台 8 秒内第二次触发点亮时也升级为完整阶梯。
+# ============================================================
+FAST_FLIP_WINDOW_S = 8.0
+_FAST_FLIP_AT = {}                 # 显示器标识 -> 上次触发的时间（monotonic 秒）
+_FAST_FLIP_LOCK = threading.Lock()
+_WAKE_INFO = []                    # 本次点亮的说明行（后台线程写，界面/CLI 读）
+_WAKE_INFO_LOCK = threading.Lock()
+
+
+def _wake_info(text):
+    """追加一行本次点亮的说明（线程安全）。"""
+    with _WAKE_INFO_LOCK:
+        _WAKE_INFO.append(str(text))
+
+
+def reset_wake_info():
+    with _WAKE_INFO_LOCK:
+        del _WAKE_INFO[:]
+
+
+def take_wake_info():
+    """取走并清空本次点亮的说明行；界面状态行 / CLI 输出用。"""
+    with _WAKE_INFO_LOCK:
+        out = list(_WAKE_INFO)
+        del _WAKE_INFO[:]
+    return out
+
+
+def pick_flip_source(cur, declared):
+    """纯函数：为 0x60 翻转挑一个**与当前值不同**的中间源。
+
+    规则（按优先级）：
+      1) 优先 17（HDMI-1，现场实测在这台 Legion 上有效）；
+      2) 当前就是 17 时，从能力串声明的口里另选一个——优先 15（DP-1），
+         其次按 15/16/17/18/19 的顺序；
+      3) 能力串读不到时退回 MCCS 15~19 的通用候选（与 _switch_input_roundtrip 同口径）。
+    没有可用候选（例如能力串只声明了当前这一个口）返回 None。
+    ⚠️ 能力串里的数值是十六进制（见 _caps_inputs），这里接收的已是整数。
+    """
+    try:
+        cur = int(cur)
+    except Exception:
+        return None
+    cands = []
+    for c in (declared or []):
+        try:
+            c = int(c)
+        except Exception:
+            continue
+        if 15 <= c <= 19 and c not in cands:
+            cands.append(c)
+    if not cands:
+        cands = [15, 16, 17, 18, 19]
+    if 17 in cands and cur != 17:
+        return 17
+    for c in (15, 16, 17, 18, 19):
+        if c in cands and c != cur:
+            return c
+    return None
+
+
+def _fast_flip_recent(key, now=None):
+    """这台屏在 8 秒内是否已经快速点亮过一次（只读，不改时间戳）。"""
+    now = time.monotonic() if now is None else now
+    with _FAST_FLIP_LOCK:
+        last = _FAST_FLIP_AT.get(key)
+        return last is not None and (now - last) <= FAST_FLIP_WINDOW_S
+
+
+def _mark_fast_flip(key, now=None):
+    """记下这台屏的快速点亮时刻（后续 8 秒内再点亮就升级完整阶梯）。"""
+    now = time.monotonic() if now is None else now
+    with _FAST_FLIP_LOCK:
+        _FAST_FLIP_AT[key] = now
+
+
+def _fast_flip_one(t):
+    """对一台屏做 0x60 翻转，返回 (成功, 说明)。真实调用序列（无 sleep）：
+
+      GetVCPFeatureAndVCPFeatureReply(h, 0x60)   读当前源
+      SetVCPFeature(h, 0x60, 中间源)             切走
+      SetVCPFeature(h, 0x60, 当前源)             立即切回
+
+    ⚠️ 写本回失败时先立即补写一次（不等待），仍失败才判失败；
+    并把「可能停在中间源」写进说明，避免界面报"已点亮"而屏其实不在原口。
+    """
+    t0 = time.perf_counter()
+    h = t["handle"]
+    got = _read_vcp(h, VCP_INPUT_SOURCE)
+    if not got:
+        return False, "读 0x60 失败"
+    cur = int(got[0])
+    # 只有当前源正好是 17 时才需要读能力串另选一个口；其余情况直接用 17，
+    # 避免为了"快速"在缓存未命中时搭进去 3 秒的能力串实读。
+    declared = []
+    reason = ""
+    if cur == 17:
+        declared = _caps_inputs(_capabilities_cached(h, _display_key(t)))
+    mid = pick_flip_source(cur, declared)
+    if mid is None:
+        return False, "0x60 无可用中间源（当前 %d）" % cur
+    if cur == 17:
+        reason = "（当前已是 17，按能力串声明改选 %d）" % mid
+    if not _write_vcp(h, VCP_INPUT_SOURCE, mid):
+        return False, "写 0x60=%d 失败（当前 %d）" % (mid, cur)
+    if not _write_vcp(h, VCP_INPUT_SOURCE, cur):
+        _write_vcp(h, VCP_INPUT_SOURCE, cur)          # 立即补写一次，不等待
+        back = _read_vcp(h, VCP_INPUT_SOURCE)
+        if not back or int(back[0]) != cur:
+            return False, ("写回 0x60=%d 失败（现读 %s），屏可能停在中间源 %d"
+                           % (cur, ("%d" % back[0]) if back else "—", mid))
+    ms = (time.perf_counter() - t0) * 1000.0
+    return True, "翻转 0x60 %d→%d→%d，耗时 %.1f ms%s" % (cur, mid, cur, ms, reason)
+
+
+def screen_wake_flip(indices, allow_switch=True, expect_off=True):
+    """快速点亮：逐台 0x60 翻转。与 screen_wake_many 同形状返回。
+
+    全选/部分选择都只操作选中的屏，**绝不发系统广播**。
+    同一台 8 秒内第二次触发、或翻转做不成时，该台回退到 _wake_one 完整阶梯。
+    """
+    targets = enumerate_targets()
+    if not targets:
+        raise RuntimeError(NO_MONITOR_MSG)
+    picked, bad = _select(targets, indices)
+    # 与 screen_wake_many 同一口径：只有全选时才允许升级路径里的系统级重驱动
+    allow_recycle = len(picked) == len(targets)
+    now = time.monotonic()
+    results = {}
+
+    def work(t):
+        key = _display_key(t)
+        try:
+            if _fast_flip_recent(key, now):
+                _mark_fast_flip(key, now)
+                _wake_info("已升级为完整点亮（显示器 %d 在 8 秒内第二次点亮）" % t["index"])
+                # 用户 8 秒内再点一次 = 第一次没亮：强制按"屏仍黑"走完整阶梯
+                results[t["index"]] = _wake_one(t, allow_switch, True, allow_recycle)
+                return
+            if not expect_off:
+                # 屏亮着、且没有近期的快速点亮记录：不翻转（避免可见黑屏），按旧行为
+                results[t["index"]] = _wake_one(t, allow_switch, False, allow_recycle)
+                return
+            _mark_fast_flip(key, now)
+            ok, note = _fast_flip_one(t)
+            if ok:
+                _wake_info("快速点亮：" + note)
+                results[t["index"]] = (True, 1, note)
+                return
+            _wake_info("快速点亮不可用（%s），已回退完整阶梯" % note)
+            results[t["index"]] = _wake_one(t, allow_switch, expect_off, allow_recycle)
+        except Exception as e:
+            results[t["index"]] = (False, 0, str(e))
+
+    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(30)
+
+    ok, errs = [], list(bad)
+    try:
+        for t in picked:
+            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
+            if done:
+                ok.append(t["index"])
+            else:
+                errs.append((t["index"], "第 %d 级（%s）：%s"
+                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
+    finally:
+        release_targets(targets)
+    return ok, errs
+
+
+def screen_wake_entry(cfg, indices):
+    """点亮统一入口（v1.9.7）：快速翻转优先，其余情况原样走 v1.9.6。
+
+    只有同时满足以下条件才走快速路径，任何一条不满足都完全回到旧行为：
+      - 开关 wake_fast_flip 打开（旧配置缺键 -> 默认 1）；
+      - 熄灭方式为 ddc（system 模式的 SC_MONITORPOWER -1 是即时广播，不需要翻转）；
+      - 允许切信号源（用户关掉「切信号源」时不得偷偷切换）。
+    屏亮着（记账为 on）且 8 秒内没有快速点亮记录时，路由器内部按旧行为发
+    `_wake_one(..., expect_off=False)`，不会翻转造成可见黑屏。
+    """
+    reset_wake_info()
+    if not bool(cfg.get("wake_fast_flip", True)):
+        return screen_on_cfg(cfg, indices)
+    if cfg.get("screen_off_method") != "ddc":
+        return screen_on_cfg(cfg, indices)
+    opts = wake_options(cfg)
+    if not opts["allow_switch"]:
+        return screen_on_cfg(cfg, indices)
+    return screen_wake_flip(indices, opts["allow_switch"], opts["expect_off"])
 
 
 # ============================================================
@@ -1483,35 +1646,6 @@ def active_slot_dict(slots, now_min):
     return best
 
 
-def catch_up_decision(cfg, now=None):
-    """启动补检判定（纯逻辑，不碰硬件，单测直接跑）。
-
-    只看**今天**已经到点的档位里最后一档：
-      - 今天还没到任何档位 → 不补（早上 7 点开机不该把昨晚 21:00 的夜间档再套一遍）
-      - 错过超过 CATCH_UP_LIMIT_MIN 分钟 → 不补（意图过期，下一档往往就在眼前）
-      - config 的 last_fired 已经是"今天 + 同一档" → 不补（计划任务已经跑过）
-    返回 dict：due / slot / missed_min / reason。
-    """
-    now = now or datetime.now()
-    now_min = _minutes(now)
-    slots = [s for s in (cfg.get("slots") or []) if _valid_hhmm(s.get("time"))]
-    due = [s for s in slots if parse_hhmm(s.get("time")) <= now_min]
-    if not due:
-        return {"due": False, "slot": None, "missed_min": 0,
-                "reason": "今天还没有到点的档位"}
-    slot = max(due, key=lambda s: parse_hhmm(s.get("time")))
-    missed = now_min - parse_hhmm(slot.get("time"))
-    if missed > CATCH_UP_LIMIT_MIN:
-        return {"due": False, "slot": slot, "missed_min": missed,
-                "reason": "已错过 %d 分钟，超过补检上限 %d 分钟" % (missed, CATCH_UP_LIMIT_MIN)}
-    fired = coerce_setting("last_fired", cfg.get("last_fired"))
-    if fired.get("date") == now.strftime("%Y-%m-%d") and fired.get("slot") == slot.get("time"):
-        return {"due": False, "slot": slot, "missed_min": missed,
-                "reason": "今天这一档已执行过"}
-    return {"due": True, "slot": slot, "missed_min": missed, "reason": ""}
-
-
-
 def current_level(cfg=None, now=None):
     """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""
     cfg = cfg or load_config()
@@ -1567,13 +1701,19 @@ def wake_options(cfg):
             "expect_off": cfg.get("screen_state") != "on"}
 
 
-def apply_slot(cfg, slot, persist=True):
-    """套用指定档位（亮度 + 该档屏幕动作）；成功写亮度后记 last_fired。
+def apply_schedule(cfg=None):
+    """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
 
     返回 (level, screen, ok, errs)；screen 为该档屏幕动作（""/off/on）。
     屏幕动作失败的错误以序号 -1 记入 errs（界面按原文显示）。
-    记账只在**写亮度成功**时发生：全失败（比如显卡驱动没起来）留待下次启动重试。
+    内部加载配置时，屏幕动作执行后会把屏幕状态记账落盘（供状态显示 / --screen status）。
+
+    v1.9.4：恢复 v1.8.5 的语义（不再写 last_fired、不再从 GUI 启动自检调用）。
+    本函数只由计划任务（--apply-schedule）与用户显式操作触发。
     """
+    internal = cfg is None
+    cfg = cfg or load_config()
+    slot = active_slot_dict(cfg.get("slots", []), _minutes())
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
@@ -1581,28 +1721,16 @@ def apply_slot(cfg, slot, persist=True):
     if screen == "off":
         sok, serrs = screen_off_cfg(cfg, targets)
     elif screen == "on":
-        sok, serrs = screen_on_cfg(cfg, targets)
+        sok, serrs = screen_wake_entry(cfg, targets)
     else:
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
     if screen in ("off", "on") and ok:
         mark_screen_state(cfg, screen)
-    if ok and persist:
-        mark_fired(cfg, slot)
-        save_config(cfg)
+        if internal:
+            save_config(cfg)
     return level, screen, ok, errs
-
-
-def apply_schedule(cfg=None, now=None):
-    """按当前时间套用对应档位（亮度 + 该档的屏幕动作）。
-
-    CLI --apply-schedule 与 GUI 启动补检都走这里；执行成功后写 last_fired，
-    供补检防重复（计划任务跑过之后，界面不会再补一遍）。
-    """
-    cfg = cfg or load_config()
-    slot = active_slot_dict(cfg.get("slots", []), _minutes(now))
-    return apply_slot(cfg, slot)
 
 
 # ============================================================
@@ -2307,6 +2435,8 @@ def cli_apply_schedule():
             _err("显示器 %s: %s" % (i, e))
         if screen:
             _out("屏幕动作: %s" % screen)
+        for line in take_wake_info():
+            _out(line)
         sys.exit(0 if ok else 1)
     except Exception as e:
         _err(e)
@@ -2643,79 +2773,18 @@ class DarkBox:
         return answer["ok"]
 
 
-def enable_dpi_awareness():
-    """在创建 Tk 之前声明 DPI 感知（否则 125%/150% 下整窗被系统位图拉伸变糊）。
-
-    优先 per-monitor v2（多屏不同缩放时也正确），失败回退 per-monitor，
-    再回退 system aware。返回实际生效的模式，方便 --diag/日志。
-    """
-    if os.name != "nt":
-        return ""
-    try:
-        u = ctypes.windll.user32
-        u.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-        u.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
-        if u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):   # PER_MONITOR_AWARE_V2
-            return "per-monitor-v2"
-    except Exception:
-        pass
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)            # PER_MONITOR_DPI_AWARE
-        return "per-monitor"
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()                 # SYSTEM_DPI_AWARE
-        return "system"
-    except Exception:
-        return ""
-
-
-class _MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD),
-                ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT),
-                ("dwFlags", wintypes.DWORD)]
-
-
-def _work_area_height(widget=None):
-    """当前窗口所在显示器的工作区高度（已扣掉任务栏）。
-
-    v1.8.5 用 winfo_screenheight()（主屏**全高**，含任务栏）再减 180，
-    多屏/缩放不同时会把窗口顶出工作区。这里改成 MonitorFromWindow + rcWork。
-    """
-    try:
-        u = ctypes.windll.user32
-        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-        u.MonitorFromWindow.restype = wintypes.HMONITOR
-        hwnd = widget.winfo_id() if widget is not None else 0
-        hmon = u.MonitorFromWindow(hwnd, 2)                       # MONITOR_DEFAULTTONEAREST
-        mi = _MONITORINFO()
-        mi.cbSize = ctypes.sizeof(mi)
-        if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            h = int(mi.rcWork.bottom) - int(mi.rcWork.top)
-            if h > 0:
-                return h
-    except Exception:
-        pass
-    try:
-        return int(widget.winfo_screenheight()) if widget is not None else 800
-    except Exception:
-        return 800
-
-
 class ScrollArea(ttk.Frame):
     """可滚动内容容器（Canvas + 内部 Frame + 滚动条）。
 
-    设置项一多窗口就会超过可用高度（实测 5 个档位时 1117px），
-    底部控件就点不到了。高度按**当前屏工作区**封顶，超出才出现滚动条。
+    设置项一多窗口就会超过 1080p 的可用高度（实测 5 个档位时 1117px），
+    底部控件就点不到了。高度按屏幕封顶，超出才出现滚动条。
     """
 
     def __init__(self, root, bg, on_fit=None):
         super().__init__(root)
         self._on_fit = on_fit
-        # rcWork 已扣任务栏；再留 120 给标题栏(约 31) + 窗口边框 + 呼吸边距
-        self._max_h = max(320, _work_area_height(self) - 120)
+        # 标题栏 + 上下边距在部分 DPI 下不止 140px，留足余量避免窗口底边裁切
+        self._max_h = max(400, self.winfo_screenheight() - 180)
         self.canvas = tk.Canvas(self, background=bg, highlightthickness=0, bd=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.body = tk.Frame(self.canvas, background=bg)
@@ -2728,13 +2797,6 @@ class ScrollArea(ttk.Frame):
                          lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
         self.canvas.bind("<Leave>",
                          lambda e: self.canvas.unbind_all("<MouseWheel>"))
-
-    def refresh_max_height(self):
-        """窗口被拖到另一块屏后重算封顶高度。"""
-        h = max(320, _work_area_height(self) - 120)
-        if h != self._max_h:
-            self._max_h = h
-            self._on_body()
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -3694,8 +3756,8 @@ class SchedulePanel:
         self.task_sub = Label(self.inner, "", size=8, color=UI["text3"],
                               bg=UI["card"], justify="left", wraplength=360)
         self.task_sub.pack(fill="x", pady=(2, 0))
-        # 事件日志（补执行 / 任务重建）：计划任务跑过什么、启动补过什么，一眼可见
-        self.event_lbl = Label(self.inner, "", size=8, color=UI["orange"],
+        # 事件日志（任务重建 / 配置恢复）：辅助说明色，仅异常时才用橙色提示
+        self.event_lbl = Label(self.inner, "", size=8, color=UI["text3"],
                                bg=UI["card"], justify="left", wraplength=360)
         self.event_lbl.pack(fill="x", pady=(2, 0))
 
@@ -3809,8 +3871,14 @@ class SchedulePanel:
         self.task_sub.config(text=info.get("detail", ""))
 
     def set_events(self, lines):
-        """显示最近的事件（补执行 / 任务重建 / 重建失败）。"""
-        self.event_lbl.config(text="\n".join(lines or []))
+        """显示最近的事件（任务重建 / 配置恢复 / 重建失败）。
+
+        正常事件用辅助灰（与 task_sub 同色）；含失败/异常字样时保留橙色，
+        避免把告警一起灰掉。只改颜色，不碰 pady 与字号。
+        """
+        text = "\n".join(lines or [])
+        bad = any(k in text for k in ("失败", "错误", "异常", "未就绪"))
+        self.event_lbl.config(text=text, fg=UI["orange"] if bad else UI["text3"])
 
     def set_actions_enabled(self, enabled):
         # 添加/编辑是本地操作，只受"正在执行"影响，不受定时开关影响
@@ -3921,8 +3989,8 @@ class HelpSheet(Sheet):
         ])
         block("定时为什么这次准了", [
             "每次启动都会校验计划任务是否仍指向当前程序；换了目录/文件名会自动重建。",
-            "今天已经错过的那一档，启动时会在后台补一次（同一天同一档只补一次）。",
-            "任务状态行会显示下次运行、上次运行与上次结果；下面还会列出重建/补执行记录。",
+            "启动自检只检查任务配置，不会主动熄屏，也不会补执行今天错过的档位。",
+            "任务状态行会显示下次运行、上次运行与上次结果；下面还会列出重建记录。",
         ])
         block("排查命令", [
             "--probe 打印每台屏的亮灭结论；--diag 打印枚举、能力串、寄存器回读与任务状态。",
@@ -3949,6 +4017,8 @@ class App:
         self._read_queue = queue.Queue()
         self._bg_tasks = 0
         self._busy = False
+        self._busy_action = None      # 当前忙任务对应的屏幕动作（"on"/"off"/None）
+        self._pending_screen = None   # 忙时最后一次点击/热键，结束后补执行一次
         self._task_querying = False
         self._hotkeys_on = False
         self._relight_pending = False
@@ -4009,8 +4079,8 @@ class App:
 
         # 配置读坏的显式提示（不能静默吞掉：用户的设置还在坏文件里）
         self.root.after(150, self._warn_config_error)
-        # 启动后台自检：任务定义与当前进程是否一致 + 今天错过的那一档要不要补。
-        # 900ms 是给首屏探测让路，避免和开窗时的 DDC 枚举抢总线；全程后台线程。
+        # 启动后台自检：只校验任务定义与当前进程是否一致（不一致则原地重建）。
+        # 不补执行、不改亮度、不熄屏；900ms 是给首屏探测让路，全程后台线程。
         self.root.after(900, self._start_auto_checks)
 
     def _fit_window(self):
@@ -4030,7 +4100,6 @@ class App:
     def _fit_window_now(self):
         self._fit_pending = False
         try:
-            self.scroll.refresh_max_height()
             self.root.update_idletasks()
             need = self.scroll.body.winfo_reqheight()
             if need == self._fitted_h:
@@ -4217,9 +4286,15 @@ class App:
             self._bg_tasks = max(0, self._bg_tasks - 1)
             if busy:
                 self._busy = False
+                self._busy_action = None
                 self._set_actions_enabled(True)
-            if on_done is not None:
-                on_done(result)
+            try:
+                if on_done is not None:
+                    on_done(result)
+            finally:
+                # 忙时排队的屏幕请求：当前动作一结束就补执行（只一次）
+                if busy:
+                    self._dispatch_pending_screen()
         if self._bg_tasks > 0 or self._hotkeys_on or self._relight_pending:
             self.root.after(150, self._poll_read_queue)
 
@@ -4379,8 +4454,8 @@ class App:
             return
         v = screen_verdict(self.cfg, states)
         if v.get("woke_by_input"):
+            # 只做内存记账（旁路）：这里不落盘，避免在探测回调里加同步 IO
             mark_screen_state(self.cfg, "on")
-            save_config(self.cfg)
         if v["state"] != "off":
             vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
             if vals and len(set(vals)) == 1:
@@ -4420,10 +4495,47 @@ class App:
         self.cfg["monitor_ids"] = ids
 
     # ---------- 熄屏 / 点亮 ----------
+    def _queue_screen_action(self, action):
+        """忙时点击/热键：给可见反馈，并记下最后一次请求，结束后补执行一次。
+
+        v1.9.5：之前 `_busy` 窗口内直接静默 return，热键也一样，用户看到的是
+        「点了没反应」。这里只做排队记账，**不启动任何屏幕动作**，因此不改变
+        熄灭/点亮调用链，也不改变 `_busy` 窗口长度。
+        """
+        self._pending_screen = action
+        label = "点亮" if action == "on" else "熄灭"
+        if self._busy_action == "on":
+            head = "正在唤醒中…"
+        elif self._busy_action == "off":
+            head = "正在熄灭中…"
+        else:
+            head = "正在处理其他操作…"
+        self.status_var.set("%s%s请求已排队，完成后自动执行" % (head, label))
+        _write_event_log("忙时%s请求已排队（当前动作：%s）"
+                         % (label, {"on": "点亮", "off": "熄灭"}.get(
+                             self._busy_action, "其它")))
+
+    def _dispatch_pending_screen(self):
+        """当前忙任务结束后补执行排队的那一次屏幕请求。返回是否补执行。"""
+        if self._busy or not self._pending_screen:
+            return False
+        action, self._pending_screen = self._pending_screen, None
+        _write_event_log("补执行忙时排队的%s请求" % ("点亮" if action == "on" else "熄灭"))
+        if action == "on":
+            self.screen_on()
+        else:
+            self.screen_off()
+        return True
+
     def screen_off(self):
-        if self._busy:
-            return
         targets = self.selected_indices()
+        if not targets:
+            self.status_var.set("请先勾选要操作的显示器")
+            return
+        if self._busy:
+            self._queue_screen_action("off")
+            return
+        self._busy_action = "off"
         self.status_var.set("正在熄灭显示器…")
         self.run_bg(lambda: screen_off_cfg(self.cfg, targets),
                     self._finish_screen_off, busy=True)
@@ -4448,21 +4560,27 @@ class App:
         self.probe_screens()
 
     def screen_on(self):
-        if self._busy:
-            return
         targets = self.selected_indices()
+        if not targets:
+            self.status_var.set("请先勾选要操作的显示器")
+            return
+        if self._busy:
+            self._queue_screen_action("on")
+            return
+        self._busy_action = "on"
         self.status_var.set("正在点亮显示器…")
-        self.run_bg(lambda: screen_on_cfg(self.cfg, targets),
+        self.run_bg(lambda: screen_wake_entry(self.cfg, targets),
                     self._finish_screen_on, busy=True)
 
     def _finish_screen_on(self, result):
         ok, errs = _as_ok_errs(result)
+        info = take_wake_info()
         self._relight_pending = False
         if ok:
             mark_screen_state(self.cfg, "on")
             self._remember_selection()
             save_config(self.cfg)
-            self.status_var.set("已点亮显示器")
+            self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
             self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
         if errs:
             detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e
@@ -4609,7 +4727,7 @@ class App:
         self._stop_hotkey_listener()
         self.root.destroy()
 
-    # ---------- 启动自检 / 补执行 ----------
+    # ---------- 启动自检（只校验任务，不执行业务动作） ----------
     def _report_tk_error(self, exc, val, tb):
         """Tk 回调异常兜底：windowed 下 stderr 不可见，必须落盘并提示。"""
         detail = "".join(traceback.format_exception(exc, val, tb))
@@ -4641,7 +4759,11 @@ class App:
             pass
 
     def _start_auto_checks(self):
-        """窗口出来之后才跑：任务定义自检 + 今天错过档位的补执行（全后台）。"""
+        """窗口出来之后才跑：只校验计划任务是否已正确配置（全后台）。
+
+        ⚠️ 本程序启动时不会主动熄屏：这里只读任务 XML / 必要时原地重建任务，
+        绝不按「今天错过了哪一档」补执行，也不会改亮度或屏幕状态。
+        """
         if self._auto_checked:
             return
         self._auto_checked = True
@@ -4650,38 +4772,12 @@ class App:
             return
 
         def job():
-            out = {}
             try:
-                out["task"] = ensure_task_registration(self.cfg)
+                return {"task": ensure_task_registration(self.cfg)}
             except Exception as e:
-                out["task"] = (False, "任务自检失败：%s: %s" % (type(e).__name__, e))
-            try:
-                out["catchup"] = self._catch_up_worker()
-            except Exception as e:
-                out["catchup"] = {"due": True, "done": False,
-                                  "line": "补执行失败：%s: %s" % (type(e).__name__, e)}
-            return out
+                return {"task": (False, "任务自检失败：%s: %s" % (type(e).__name__, e))}
 
         self.run_bg(job, self._finish_auto_checks)
-
-    def _catch_up_worker(self):
-        """后台线程执行：只在今天该档错过且未执行时补一次（判定见 catch_up_decision）。"""
-        cfg = load_config()
-        decision = catch_up_decision(cfg)
-        if not decision["due"]:
-            return {"due": False, "reason": decision["reason"]}
-        slot = dict(decision["slot"])
-        level, screen, ok, errs = apply_slot(cfg, slot)
-        now = datetime.now()
-        if ok:
-            line = "今天 %s 补执行 %s 档（错过 %d 分钟）" % (
-                now.strftime("%H:%M"), slot["time"], decision["missed_min"])
-        else:
-            line = "补执行 %s 档失败（%d 台未写入）" % (
-                slot["time"], len([e for e in errs if e[0] >= 0]))
-        _write_event_log(line)
-        return {"due": True, "done": bool(ok), "slot": slot,
-                "missed_min": decision["missed_min"], "line": line, "errs": errs}
 
     def _finish_auto_checks(self, result):
         if isinstance(result, Exception):
@@ -4689,23 +4785,18 @@ class App:
             self._refresh_events()
             return
         _task_ok, task_msg = result.get("task", (True, ""))
-        cu = result.get("catchup") or {}
         # 启动自愈成功时不弹「确认」窗：每次启动都可能发生（换 exe 路径后尤其），
         # 开机即弹会糊脸；反馈走状态卡 + 事件日志（task_msg 已含档位数/下次运行）。
         if task_msg:
             self.status_var.set(task_msg)
-        if cu.get("due"):
-            self.status_var.set(cu.get("line", ""))
-            if not cu.get("done"):
-                errs = cu.get("errs") or []
-                for i, why in errs[:2]:
-                    _write_event_log("  %s" % why)
-        # 补执行写盘后，把本进程手里的 last_fired 同步一下，避免后续保存领先
-        if cu.get("done"):
-            self.cfg["last_fired"] = coerce_setting(
-                "last_fired", load_config().get("last_fired"))
+        else:
+            # 配置正确：只报「已就绪 + 下次运行」，不做任何业务动作
+            nxt = _next_run_text([parse_hhmm(s.get("time"), (0, 0))
+                                  for s in self.cfg.get("slots") or []])
+            self.status_var.set(("定时任务已就绪，下次运行 %s" % nxt) if nxt
+                                else "定时任务已就绪")
         self._refresh_events()
-        if task_msg or cu.get("due"):
+        if task_msg:
             self.refresh_task_status()
 
     # ---------- 定时 ----------
@@ -4745,9 +4836,6 @@ class App:
         self.refresh_task_status()
         self.status_var.set("定时已更新")
         self._refresh_events()
-        # 新加/改到"已经过去的时刻"时，今天这一档应当立即生效
-        if self.cfg.get("enabled"):
-            self.run_bg(self._catch_up_worker, self._finish_auto_checks)
 
     def save_schedule(self):
         try:
@@ -4833,8 +4921,6 @@ class App:
         self.refresh_task_status()
         self.status_var.set("定时已启用")
         self._announce_rebuilt(part, out, before_xml, "定时已保存")
-        # 启用时如果今天这一档已经过去（例如 12:08 才启用 08:30），立即补一次
-        self.run_bg(self._catch_up_worker, self._finish_auto_checks)
 
     def cancel_schedule(self):
         self.cfg["enabled"] = False
@@ -5059,8 +5145,10 @@ def cli_screen(action):
         ok, errs = screen_off_cfg(cfg, targets)
         _out("已熄灭显示器" if ok else "熄灭失败")
     else:
-        ok, errs = screen_on_cfg(cfg, targets)
+        ok, errs = screen_wake_entry(cfg, targets)
         _out("已点亮显示器" if ok else "点亮失败")
+        for line in take_wake_info():
+            _out(line)
     if ok:
         mark_screen_state(cfg, action)
         save_config(cfg)
@@ -5109,7 +5197,6 @@ def main():
             return
     if not acquire_single_instance():
         return                                  # 已有实例：已唤起其窗口，直接退出
-    enable_dpi_awareness()                      # 必须在创建任何 Tk 窗口之前
     if not PIL_OK:
         # GUI 明确报错退出；CLI 路径（--set/--apply-schedule/--diag/--selftest）不受影响
         from tkinter import messagebox
