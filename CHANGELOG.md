@@ -3,6 +3,16 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] · 2026-11-17
+
+- 接入 knowledge-base 的**单项目规范**（spec 2.1.3 / repo-kit 2.7.2，profile `link-only`）
+- 新增 `schema/taxonomy.json`、`tools/repo-kit/`、`tools/update-repo-kit.ps1`、`schema/kit.lock.json` 与 CI
+- 只查链接与入口，**不要求 frontmatter**
+- 10 个相对链接纳入检查
+- **不新增 `requirements.txt`**：本仓是 Python 应用但无依赖声明，只含文档依赖的清单会误导；CI 改为显式安装
+- `docs/` 下三篇分析文档目前没有入口，补链接另行处理
+- 验收：`REPO CHECK: PASS`（ERROR=0）、`KIT LOCK: PASS (v2.7.2, spec=2.1.3)`
+
 ## [1.9.7] - 2026-11-04
 
 ### 新增（0x60 切源翻转的快速点亮）

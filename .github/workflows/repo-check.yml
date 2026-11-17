@@ -1,0 +1,36 @@
+name: repo-check
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'schema/**'
+      - 'tools/**'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'DEVELOPMENT.md'
+      - 'CHANGELOG.md'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Doc dependencies
+        # 本仓是 Python 应用但没有任何依赖声明文件（依赖只散在 README 正文），
+        # 建一个只含文档依赖的 requirements.txt 会误导成"应用依赖清单"，
+        # 所以这里显式装，不动仓库的依赖现状。
+        run: python -m pip install "PyYAML>=6.0" "markdown-it-py>=3.0" "jsonschema>=4.20"
+      - name: Invariants (link-only)
+        run: python tools/repo-kit/check_repo.py --root .
+      - name: Kit lock
+        run: pwsh tools/update-repo-kit.ps1 -Check

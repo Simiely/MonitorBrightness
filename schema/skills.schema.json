@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/repo-kit/skills.schema.json",
+  "title": "WorkBuddy SKILL.md frontmatter",
+  "description": "技能加载器契约：name + description；允许技能自定义字段。",
+  "type": "object",
+  "required": ["name", "description"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "minLength": 2,
+      "maxLength": 64
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1200
+    },
+    "agent_created": {
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

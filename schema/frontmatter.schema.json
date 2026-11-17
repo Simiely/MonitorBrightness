@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/repo-kit/frontmatter.schema.json",
+  "title": "repo-kit v2 page frontmatter",
+  "description": "每页的机器契约。只允许标量与 inline list；字段闭集；按 type/kind 补必填项。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "type",
+    "kind",
+    "status",
+    "owner",
+    "source_type",
+    "source",
+    "last_reviewed"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "type": {
+      "enum": ["tutorial", "how-to", "reference", "explanation"]
+    },
+    "kind": {
+      "enum": ["standard", "decision", "index", "note", "glossary", "report", "pitfall"]
+    },
+    "status": {
+      "enum": ["draft", "active", "resolved", "superseded", "archived"]
+    },
+    "owner": {
+      "type": "string",
+      "pattern": "^@[a-z0-9][a-z0-9-]*$"
+    },
+    "tier": {
+      "enum": ["normal", "critical"]
+    },
+    "confidence": {
+      "enum": ["low", "medium", "high"]
+    },
+    "topics": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "defines": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "symptom": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "cause": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "detect": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "avoid": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "recover": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "applies_to": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9.-]*$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "severity": {
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "source_type": {
+      "enum": ["code", "schema", "url", "doc"]
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "source_retrieved": {
+      "type": "string",
+      "format": "date"
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(code|schema|url|doc):.+"
+      },
+      "uniqueItems": true
+    },
+    "last_reviewed": {
+      "type": "string",
+      "format": "date"
+    },
+    "review_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3650
+    },
+    "related": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+:(depends-on|extends|spawned-from|supersedes|contradicts|see-also)$"
+      },
+      "uniqueItems": true
+    },
+    "supersedes": {
+      "type": "string"
+    },
+    "superseded_by": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["source_type"],
+        "properties": { "source_type": { "const": "url" } }
+      },
+      "then": {
+        "required": ["source_retrieved"]
+      }
+    },
+    {
+      "if": {
+        "required": ["status"],
+        "properties": { "status": { "const": "superseded" } }
+      },
+      "then": {
+        "required": ["superseded_by"]
+      }
+    },
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": { "kind": { "const": "pitfall" } }
+      },
+      "then": {
+        "required": [
+          "summary",
+          "symptom",
+          "cause",
+          "detect",
+          "avoid",
+          "recover",
+          "applies_to",
+          "severity"
+        ]
+      }
+    }
+  ]
+}
