@@ -38,7 +38,7 @@
 
 ### 方式 A：下载 exe（推荐）
 
-到 [Releases](../../releases) 下载 `MonitorBrightness_v*.zip`（内含单文件 exe）→ 解压双击运行。
+到 [Releases](https://github.com/Simiely/MonitorBrightness/releases) 下载 `MonitorBrightness_v*.zip`（内含单文件 exe）→ 解压双击运行。
 
 1. **前提**：先在显示器物理菜单（OSD）里把 **DDC/CI** 设为「开」；
 2. 打开程序 → 在列表里**勾选**要调的显示器（每台一个勾选框；**一个都不勾 = 全部**）→ 拖亮度滑块**松手即生效**（或点 0%/75%/100% 预设）；
