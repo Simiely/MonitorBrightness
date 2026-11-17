@@ -155,6 +155,15 @@ python -m unittest discover -s tests -v
 | [`AGENTS.md`](AGENTS.md) | 给 AI / 未来自己的项目规则、关键坑、常用命令 |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | 架构说明 + 关键问题记录（一坑一篇） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 版本变更记录 |
+| [`rules/坑位.md`](rules/坑位.md) | 全部关键坑（16 条，`AGENTS.md` 只留最该先看的 5 条） |
+
+深入阅读（`docs/`）：
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/architecture-review.md`](docs/architecture-review.md) | 架构复盘：模块边界与耦合点 |
+| [`docs/rollback-classification.md`](docs/rollback-classification.md) | 回滚分类：哪些改动可回滚、哪些不可 |
+| [`docs/rootcause-latency.md`](docs/rootcause-latency.md) | 延迟根因分析：从测量到定位 |
 
 文档组织遵循 [knowledge-base 单项目规范](https://github.com/Simiely/knowledge-base)。
 
