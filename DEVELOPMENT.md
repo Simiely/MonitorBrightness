@@ -54,6 +54,42 @@ GUI(tkinter) ──run_bg(后台线程)──► 亮度/唤醒层：enumerate_ta
 | 11 | `rm -rf dist && pyinstaller` 打包没执行 | safe-delete 短路 | [build-rm-blocked](docs/问题记录/build-rm-blocked.md) |
 | 12 | DDC/CI 枚举不到显示器 | OSD 开关 · 直连 | [ddc-enumeration-empty](docs/问题记录/ddc-enumeration-empty.md) |
 | 13 | 定时任务到点不生效（路径类） | task_target · 启动自愈 | [task-path-invalid](docs/问题记录/task-path-invalid.md) |
+| 14 | CCD 不能直接断开主屏（rc=87） | PATH_ACTIVE · 主屏护栏 | [topology-primary-rc87](docs/问题记录/topology-primary-rc87.md) |
+
+## 拓扑后端设计定稿（阶段 D，2026-11-27）
+
+> 依据：`docs/拓扑探针.md` 的 A/C 阶段真机实测，不是推演。
+> 目标：准确、稳定、跨机器通用；**默认路径 `ddc` 不变**。
+
+### 实测确定的事实
+
+| 事实 | 数字 / 结论 |
+|---|---|
+| `QDC_ALL_PATHS` 的 path 数 | 233 条 ≠ 屏数；只对应 3 块屏（2 物理 + 1 VDD） |
+| `DISPLAYn` | 同一块屏对应 4 个 source（DISPLAY1/2/3/4）→ **不能当标识** |
+| 稳定锚点 | 显卡 LUID + EDID mfr/prod + `connectorInstance`，两块同型号屏靠 1/2 区分 |
+| VDD | `VDD by MTT`，inactive 但 `targetAvailable=1`，可独立识别 |
+| 断开 / 接回 | 副屏 rc=0 / 805ms，接回 986ms；DDC 在 inactive 时读不到、接回后恢复 |
+| 主屏断开 | rc=87 `ERROR_INVALID_PARAMETER`，Windows 不允许直接移除主屏 |
+| 计划任务 | Interactive principal 下 CCD 查询 rc=0 → 定时触发可行 |
+| 回滚 | C5 强制回读失败后，原始字节快照成功恢复，两屏均 ACTIVE |
+
+### 决策
+
+| # | 决策 | 依据 |
+|---|---|---|
+| D1 | 稳定锚点 = LUID + EDID mfr/prod + connectorInstance；EDID 无效退回 SetupAPI `DeviceID` 哈希 | 两块同型号屏唯一区分；`DISPLAYn` 不唯一 |
+| D2 | 新增 `screen_off_method = topology` 作为**选项**，默认仍 `ddc`；提交带 `SDC_SAVE_TO_DATABASE`；已断开则 no-op | 不破坏已验收路径；断开语义跨重启保持 |
+| D3 | 档位顺序：`off` 跳过亮度；`on` = 恢复快照 → 回读 → 有界轮询 ≤2s → 写亮度 | inactive 时 DDC 不可读；接回实测 <1s |
+| D4 | VDD 永不作为目标；主屏直接拒绝；活动物理屏 ≤1 拒绝 | rc=87 实测；Sunshine 依赖 VDD |
+| D5 | 旧 `monitors` / `monitor_ids` 只读兼容，新增 `monitor_anchors`，首次保存时迁移 | 不静默改变用户已验收的勾选 |
+| D6 | 动作前存原始字节快照；回读失败自动回滚；最多 1 次回滚，错误码原样上报 | C5 实测有效；避免 sunshine 那种无限重试卡死 |
+
+### 实现顺序
+
+E1 只读层接入（`screen_verdict` / `--diag`）→ E2 身份层替换 `DISPLAYn` →
+E3 动作层（快照 / 回读 / 回滚 / 护栏）→ E4 配置与 GUI → E5 串流回归（用户执行）。
+每步独立可停；单测全部 monkeypatch，不碰真机屏幕。
 
 ## 变更记录
 

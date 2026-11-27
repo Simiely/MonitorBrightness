@@ -37,6 +37,11 @@
   副屏断开 rc=0 / 全程 805ms、接回 986ms 且 DDC 恢复；**主屏断开 rc=87，Windows 不允许**
   （已加护栏）；计划任务（Interactive principal）内 CCD 查询 `rc=0`，可用。
   结论：有界轮询取 2 秒足够；主屏不能直接作为断开目标
+- **C5 回滚验证**：`--force-verify-fail` 让"提交成功但回读失败"真实发生，原始字节快照
+  自动恢复成功，两屏仍 ACTIVE → 回滚路径可用，不会卡在半途状态
+- **阶段 D 设计定稿**：写进 `DEVELOPMENT.md`，6 条决策（稳定锚点 / topology 选项 /
+  档位顺序 / VDD+主屏护栏 / 旧配置迁移 / 快照回滚）+ E1–E5 实现顺序；
+  新增一坑一篇 `docs/问题记录/topology-primary-rc87.md`
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层

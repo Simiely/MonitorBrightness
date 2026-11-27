@@ -171,6 +171,8 @@ def main():
     ap.add_argument("--on", action="store_true", help="恢复最近快照")
     ap.add_argument("--restore", metavar="快照.json", help="恢复指定快照")
     ap.add_argument("--apply", action="store_true", help="真正提交（不加则只预演）")
+    ap.add_argument("--force-verify-fail", action="store_true",
+                    help="C5 实验：提交成功后强制回读失败，验证快照自动回滚")
     args = ap.parse_args()
 
     if os.name != "nt":
@@ -245,6 +247,9 @@ def main():
     log("SetDisplayConfig 返回成功，回读验证中…")
 
     ok = verify(u32, info["anchor"], expect_active=False)
+    if args.force_verify_fail:
+        log("C5 实验：强制把回读结果改成失败（拓扑本身已提交成功）")
+        ok = False
     if not ok:
         restore(u32, snap_path)
         raise RuntimeError("回读未确认断开，已回滚")
