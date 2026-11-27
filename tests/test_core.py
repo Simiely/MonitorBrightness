@@ -1069,8 +1069,8 @@ class TopologyGuiTest(TempConfigCase):
             self.assertTrue(any("VDD by MTT" in t for t in texts), texts)
             self.assertTrue(any("虚拟显示器" in t for t in texts), texts)
             btns = [_row_button_texts(row) for row in panel.inner.winfo_children()]
-            # 活动行给「熄灭/显示」，断开的物理屏给「显示」，虚拟屏什么都不给
-            self.assertEqual(btns[0], ["熄灭", "显示"], btns)
+            # 亮着的行只有一个「熄灭」；断开的物理屏只有「显示」；虚拟屏什么都不给
+            self.assertEqual(btns[0], ["熄灭"], btns)
             self.assertEqual(btns[1], ["显示"], btns)
             self.assertEqual(btns[2], [], btns)
         finally:
@@ -1106,10 +1106,11 @@ class TopologyGuiTest(TempConfigCase):
         finally:
             root.destroy()
 
-    def test_primary_off_button_disabled_not_hidden_in_topology_mode(self):
-        """拓扑模式断不开主屏，但按钮要**在**（置灰+说明），不能凭空消失。
+    def test_primary_row_has_one_enabled_off_button_in_topology_mode(self):
+        """拓扑模式移不走主屏，但「熄灭」**可点**：点了会解释并给替代方案。
 
-        实测：藏掉之后用户看到的是"这一行没正常显示"，而不是"这里不可用"。
+        用户反馈：灰按钮"感觉不符合直觉"。按钮应该表达"现在能做的那一件事"，
+        不能做的时候不该摆一个灰的在那儿。
         """
         try:
             import tkinter as tk
@@ -1135,8 +1136,8 @@ class TopologyGuiTest(TempConfigCase):
             fake.mon_panel = panel
             panel.rebuild([])
             rows = list(panel.inner.winfo_children())
-            self.assertEqual(_row_button_texts(rows[0]), ["熄灭", "显示"])
-            self.assertEqual(_row_button_texts(rows[1]), ["熄灭", "显示"])
+            self.assertEqual(_row_button_texts(rows[0]), ["熄灭"])
+            self.assertEqual(_row_button_texts(rows[1]), ["熄灭"])
 
             def off_enabled(row):
                 queue = list(row.winfo_children())
@@ -1147,8 +1148,41 @@ class TopologyGuiTest(TempConfigCase):
                     queue.extend(w.winfo_children())
                 return None
 
-            self.assertFalse(off_enabled(rows[0]))    # 主屏：置灰
-            self.assertTrue(off_enabled(rows[1]))     # 副屏：可点
+            # 主屏也能点（点了会问是否改用待机），不再是灰的
+            self.assertTrue(off_enabled(rows[0]))
+            self.assertTrue(off_enabled(rows[1]))
+        finally:
+            root.destroy()
+
+    def test_ddc_mode_switches_button_by_state(self):
+        """DDC 模式下屏幕被枚举不代表面板亮着：按探测结论给「显示」。"""
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            cfg = mb.default_config()
+            cfg["screen_off_method"] = "ddc"
+            fake = types.SimpleNamespace(
+                body=tk.Frame(root), cfg=cfg,
+                monitors=[{"index": 0, "dev": "DISPLAY1"},
+                          {"index": 1, "dev": "DISPLAY2"}],
+                mon_info=[("DISPLAY1", 2560, 1440, True),
+                          ("DISPLAY2", 2560, 1440, False)], mon_models={},
+                topo_inactive=[], _screen_states={1: "off"},
+                refresh_monitors=lambda silent=False: None,
+                read_current=lambda: None, on_monitor_toggle=lambda: None,
+                select_none=lambda: None, select_all=lambda: None,
+                monitor_off=lambda i: None, monitor_on=lambda i: None,
+                topology_enable=lambda anchor: None)
+            panel = mb.MonitorPanel(fake)
+            fake.mon_panel = panel
+            panel.rebuild([])
+            rows = list(panel.inner.winfo_children())
+            self.assertEqual(_row_button_texts(rows[0]), ["熄灭"])   # 亮着
+            self.assertEqual(_row_button_texts(rows[1]), ["显示"])   # DDC 报待机
         finally:
             root.destroy()
 

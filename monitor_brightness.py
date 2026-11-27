@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.6"     # 界面只显示本次运行的事件（不再挂历史）
+APP_VERSION = "2.01.7"     # 行内按钮按状态切换；主屏熄灭改问一句
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -2666,6 +2666,33 @@ def screen_off_cfg(cfg, indices):
     return out
 
 
+def screen_on_row(cfg, index):
+    """行内「显示」：只点亮这一块。
+
+    拓扑模式下分两种情况，靠"有没有真的接回一块屏"来分：
+      - 它确实断开了 → 按拓扑接回，再写亮度；
+      - 它本来就在拓扑里（`restored` 为空）→ 那多半只是面板被待机了，
+        拓扑帮不上忙，改走 DDC 唤醒。**不许切信号源**：拓扑模式下切源
+        会把副屏切到空口，等于自找黑屏。
+    """
+    if cfg.get("screen_off_method") != "topology":
+        return screen_wake_entry(cfg, [index])
+    anchors = selection_anchors([index])
+    if not anchors:
+        return [], [(-1, "拿不到这块屏的锚点，无法单独点亮")]
+    ok, errs, restored = topology_on(anchors, cfg)
+    if errs:
+        return ok, errs
+    ids = topology_indices_for_anchors(restored) or [index]
+    bok, berrs = set_brightness_many(ids, current_level(cfg))
+    if restored:
+        dlog("screen.on.row", index=index, via="topology", ids=ids)
+        return ok + bok, errs + berrs
+    wok, werrs = screen_wake_many([index], allow_switch=False)
+    dlog("screen.on.row", index=index, via="ddc-wake", ok=wok, errs=werrs)
+    return wok + bok, werrs + berrs
+
+
 def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
     """点亮显示器。ddc = 分级 DDC；topology = 现读现算接回后写亮度；其余系统级。"""
     dlog("screen.on.enter", method=cfg.get("screen_off_method"),
@@ -4879,7 +4906,7 @@ class MonitorPanel:
                 chk.pack(side="left", padx=(0, 8), pady=7)
                 # 逐台按钮先于文本 pack：文本是 expand 的，后 pack 的侧边控件
                 # 在窄窗口里会被挤掉。顺序：勾选 / 按钮(右) / 文本(左,撑满)。
-                btns = self._row_buttons(row, i)
+                btns = self._row_action_button(row, i)
                 txt = tk.Frame(row, bg=UI["card"])
                 txt.pack(side="left", fill="x", expand=True)
                 self.mon_text[i] = txt
@@ -4890,10 +4917,6 @@ class MonitorPanel:
                 if info:
                     sub = "%d × %d · %s · %s" % (
                         info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
-                    if (self.app.cfg.get("screen_off_method") == "topology"
-                            and info[3]):
-                        # 按钮还在但置灰，必须说清为什么，否则用户以为程序坏了
-                        sub += " · 拓扑模式不可断开"
                 Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"],
                       justify="left", wraplength=320).pack(anchor="w")
                 self.mon_rows[i] = row
@@ -4920,33 +4943,47 @@ class MonitorPanel:
                             "已断开 · 设备仍连接（点「显示」接回，位置会回到原处）"),
                       size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
         finally:
+            self._btn_state = tuple(
+                self._row_is_off(i) for i in range(len(self.app.monitors or [])))
             self._suspend = False
 
-    def _row_buttons(self, row, index):
-        """给一行活动显示器装「熄灭 / 显示」。返回容器或 None。
+    def _row_is_off(self, index):
+        """这一行现在是不是"灭着"——决定放「熄灭」还是「显示」。
 
-        **两种按钮始终都在**，不可用时置灰并说明原因 —— 实测：把主屏的
-        「熄灭」直接藏掉，用户看到的是"这一行没正常显示"，而不是"这里不可用"。
+        只看**上一次探测**的结论，不按模式猜：
+          - 拓扑模式下，能进 `self.monitors` 说明它还在拓扑里，但面板仍可能被
+            DDC 待机（主屏走"点了给选择"那条路时就是这样）—— 那时必须给出
+            「显示」，否则用户没法把它唤回来。
+          - DDC 模式下屏幕被枚举到同样不代表面板亮着。
+        探测不到（unknown）就按"亮着"处理，给「熄灭」。
+        """
+        return getattr(self.app, "_screen_states", {}).get(index) == "off"
 
-        系统级熄灭是**整组广播**，没有"只关一块"这回事，那种模式下一个按钮
-        都不放（整行都没有，一眼就能看出不是漏画）。
+    def refresh_buttons(self):
+        """探测结果变了就重画（只在"亮/灭"结论真的变了时重画，避免闪烁）。"""
+        want = tuple(self._row_is_off(i) for i in range(len(self.app.monitors or [])))
+        if want == getattr(self, "_btn_state", None):
+            return
+        self.rebuild(self.app.selected_indices())
+
+    def _row_action_button(self, row, index):
+        """一行**只有一个动作按钮**：亮着给「熄灭」，灭着给「显示」。
+
+        以前是两个都摆上（一个常灰），实测用户看到的是"这按钮怎么是灰的、
+        是不是坏了"。按钮本来就该表达"现在能做的那一件事"。
+        系统级熄灭是整组广播，没有"只动一块"，那种模式一个都不放。
         """
         method = self.app.cfg.get("screen_off_method")
         if method not in ("ddc", "topology"):
             return None
         box = tk.Frame(row, bg=UI["card"])
         box.pack(side="right", padx=(6, 10))
-        primary = bool(self.app.mon_info[index][3]) if index < len(self.app.mon_info) else False
-        off_btn = Button(box, "熄灭", lambda i=index: self.app.monitor_off(i),
-                         kind="link", height=18, pad_bg=UI["card"], font_size=8)
-        on_btn = Button(box, "显示", lambda i=index: self.app.monitor_on(i),
-                        kind="link", height=18, pad_bg=UI["card"], font_size=8)
-        # 先 pack 的在最右边：于是视觉上是「熄灭」「显示」，控件顺序也是这个序
-        on_btn.pack(side="right")
-        off_btn.pack(side="right", padx=(0, 4))
-        if method == "topology" and primary:
-            # Windows 不允许把主屏从拓扑里移除（实测 rc=87），置灰而不是藏起来
-            off_btn.set_enabled(False)
+        if self._row_is_off(index):
+            Button(box, "显示", lambda i=index: self.app.monitor_on(i),
+                   kind="link", height=18, font_size=8).pack(side="right")
+        else:
+            Button(box, "熄灭", lambda i=index: self.app.monitor_off(i),
+                   kind="link", height=18, font_size=8).pack(side="right")
         return box
 
     def set_row_text(self, i, text):
@@ -5537,6 +5574,7 @@ class App:
         self.mon_info = []
         self.topo_inactive = []           # 拓扑模式下断开的物理屏（GUI 灰显行）
         self._row_action = False          # 本次动作来自行内逐台按钮（不改勾选）
+        self._screen_states = {}          # 逐台亮灭（只有 DDC 模式需要，决定行内按钮）
         # 走查 E2-03：models 键被 _load_model_cache 统一 str() 存盘，但一个
         # 手工编辑/旧版残留的非数字键会让 int(k) 抛 ValueError，windowed 下
         # stderr=None → 用户只看到"程序打不开"。跳过坏键，不拖垮 GUI。
@@ -6035,6 +6073,12 @@ class App:
             self.status_var.set("检测失败：%s" % result)
             return
         states, bright = result
+        self._screen_states = {s["index"]: s["state"] for s in states
+                               if isinstance(s, dict) and "index" in s and "state" in s}
+        # 启动早期可能还没建面板；建了才让它按最新亮灭重画行内按钮
+        panel = getattr(self, "mon_panel", None)
+        if panel is not None:
+            panel.refresh_buttons()
         if not states:
             # 轻量刷新（只读亮度）：不动亮灭结论，只更新提示行
             if bright and self._last_verdict:
@@ -6110,8 +6154,25 @@ class App:
             return
         if (self.cfg.get("screen_off_method") == "topology"
                 and index < len(self.mon_info) and self.mon_info[index][3]):
-            # Windows 不允许把主屏从拓扑里移除（实测 rc=87），提前说清楚
-            self.status_var.set("拓扑模式不能断开主屏（Windows 限制）；要关主屏请改用「DDC」")
+            # 拓扑模式移不走主屏（Windows 实测 rc=87）。但"熄灭这块屏"这件事
+            # 本身是能做到的 —— 只是要换 DDC 待机，而它有个唤不回的历史风险，
+            # 所以必须由用户在这里点头，且只这一次，不写进配置（pitfalls N-04）。
+            if not self.msg.askyesno(
+                    "主屏不能从桌面移除",
+                    "「拓扑断开」只能移除副屏，Windows 不允许把主屏从桌面摘掉"
+                    "（实测 rc=87）。\n\n"
+                    "要改用「单屏待机」把主屏面板熄灭吗？\n"
+                    "· 桌面仍保留主屏，只是面板黑掉\n"
+                    "· 风险：个别面板待机后唤不回，只能按显示器电源键\n"
+                    "· 唤醒：点这一行的「显示」，或顶部的「点亮屏幕」\n\n"
+                    "（这次授权只管当下这一下，不会写进设置。）"):
+                return
+            self._busy_action = "off"
+            self._row_action = True
+            self.status_var.set("正在用单屏待机熄灭主屏 %d…" % index)
+            # allow_undeclared=True 来自上面这次显式确认
+            self.run_bg(lambda: screen_off_many([index], True),
+                        self._finish_screen_off, busy=True)
             return
         self._busy_action = "off"
         self._row_action = True
@@ -6126,19 +6187,11 @@ class App:
         if why:
             self.status_var.set(why)
             return
-        method = self.cfg.get("screen_off_method")
-        if method == "topology":
-            anchors = selection_anchors([index])
-            if not anchors:
-                self.status_var.set("拿不到这块屏的锚点，无法单独接回")
-                return
-            job = lambda: screen_on_cfg(self.cfg, [index], anchors=anchors)
-        else:
-            job = lambda: screen_wake_entry(self.cfg, [index])
         self._busy_action = "on"
         self._row_action = True
         self.status_var.set("正在点亮显示器 %d…" % index)
-        self.run_bg(job, self._finish_screen_on, busy=True)
+        self.run_bg(lambda: screen_on_row(self.cfg, index),
+                    self._finish_screen_on, busy=True)
 
     def _queue_screen_action(self, action):
         """忙时点击/热键：给可见反馈，并记下最后一次请求，结束后补执行一次。
