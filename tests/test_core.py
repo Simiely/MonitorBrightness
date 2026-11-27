@@ -92,8 +92,8 @@ class TempConfigCase(unittest.TestCase):
 class ConfigTest(TempConfigCase):
     def test_atomic_roundtrip_and_no_temp_left(self):
         cfg = mb.default_config()
-        cfg["slots"] = [{"time": "08:30", "level": 80, "screen": "on"},
-                        {"time": "21:00", "level": 0, "screen": "off"}]
+        cfg["slots"] = [{"time": "08:30", "level": 80, "screen": "on", "days": []},
+                        {"time": "21:00", "level": 0, "screen": "off", "days": []}]
         ok, msg = mb.save_config(cfg)
         self.assertTrue(ok, msg)
         self.assertFalse(glob.glob(os.path.join(self.tmp, ".tmp-*")),
@@ -175,7 +175,8 @@ class TimeTest(unittest.TestCase):
             {"time": "21:00", "level": 200, "screen": "auto"},
         ])
         self.assertEqual([s["time"] for s in got], ["09:05", "21:00"])
-        self.assertEqual(got[0], {"time": "09:05", "level": 80, "screen": "off"})
+        self.assertEqual(got[0], {"time": "09:05", "level": 80, "screen": "off",
+                                  "days": []})
         self.assertEqual(got[1]["level"], 100)
         self.assertEqual(got[1]["screen"], "")
 
@@ -1341,6 +1342,101 @@ class SessionEventsTest(TempConfigCase):
         got = mb.read_session_events(3)
         self.assertEqual(len(got), 3)
         self.assertIn("事件 59", got[-1])
+
+
+class WeekdayScheduleTest(unittest.TestCase):
+    """v2.02.0：定时档位可以只在指定星期生效（days：1=周一 … 7=周日，空=每天）。"""
+
+    def test_normalize_days(self):
+        self.assertEqual(mb.normalize_days(None), [])
+        self.assertEqual(mb.normalize_days([1, 3, 5]), [1, 3, 5])
+        self.assertEqual(mb.normalize_days([7, 1, 1, 9]), [1, 7])   # 去重排序丢非法
+        self.assertEqual(mb.normalize_days([1, 2, 3, 4, 5, 6, 7]), [])  # 全 7 天=每天
+        self.assertEqual(mb.normalize_days("bad"), [])
+
+    def test_days_label(self):
+        self.assertEqual(mb.days_label([]), "每天")
+        self.assertEqual(mb.days_label([1, 2, 3, 4, 5]), "工作日")
+        self.assertEqual(mb.days_label([6, 7]), "周末")
+        self.assertEqual(mb.days_label([1, 3, 5]), "周一,三,五")
+
+    def test_slots_for_weekday_filters(self):
+        slots = [{"time": "08:30", "level": 80, "screen": "", "days": [1, 2, 3, 4, 5]},
+                 {"time": "20:00", "level": 30, "screen": "", "days": []}]
+        sat = mb.slots_for_weekday(slots, 6)
+        self.assertEqual([s["time"] for s in sat], ["20:00"])   # 周六只有每天档
+        wed = mb.slots_for_weekday(slots, 3)
+        self.assertEqual([s["time"] for s in wed], ["08:30", "20:00"])
+        # 全都不生效时退回全部，避免无档可判
+        only_work = [s for s in slots if s["days"]]
+        self.assertEqual(len(mb.slots_for_weekday(only_work, 6)), 1)
+
+    def test_trigger_line_daily_vs_weekly(self):
+        daily = mb._ps_trigger_line({"time": "08:30", "days": []})
+        self.assertIn("-Daily", daily)
+        self.assertNotIn("DaysOfWeek", daily)
+        weekly = mb._ps_trigger_line({"time": "08:30", "days": [1, 3, 5]})
+        self.assertIn("-Weekly", weekly)
+        self.assertIn("Monday,Wednesday,Friday", weekly)
+        self.assertIn("-WeeksInterval 1", weekly)
+        # 全 7 天按每天注册，与旧版注册结果一致
+        all_days = mb._ps_trigger_line({"time": "08:30", "days": [1, 2, 3, 4, 5, 6, 7]})
+        self.assertIn("-Daily", all_days)
+
+    def test_xml_fingerprint_parses_daily_and_weekly(self):
+        xml = """
+        <Triggers>
+          <CalendarTrigger>
+            <StartBoundary>2026-11-27T08:30:00</StartBoundary>
+            <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+          </CalendarTrigger>
+          <CalendarTrigger>
+            <StartBoundary>2026-11-27T20:00:00</StartBoundary>
+            <ScheduleByWeek>
+              <DaysOfWeek><Saturday /><Sunday /></DaysOfWeek>
+              <WeeksInterval>1</WeeksInterval>
+            </ScheduleByWeek>
+          </CalendarTrigger>
+        </Triggers>
+        """
+        fp = mb._xml_trigger_fingerprint(xml)
+        self.assertEqual(fp, [(510, frozenset()), (1200, frozenset({6, 7}))])
+
+    def test_config_fingerprint_matches_equivalent_xml(self):
+        """配置"每天"与任务的 Daily 触发器必须判为一致，否则每次启动都重建。"""
+        slots = [{"time": "08:30", "level": 80, "screen": "", "days": []}]
+        xml = """<CalendarTrigger>
+          <StartBoundary>2026-11-27T08:30:00</StartBoundary>
+          <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+        </CalendarTrigger>"""
+        self.assertEqual(mb._slot_trigger_fingerprint(slots),
+                         mb._xml_trigger_fingerprint(xml))
+
+    def test_next_run_respects_weekday(self):
+        """周五 20:30 时，"仅周一"的档不能报成"明天"。"""
+        now = datetime(2026, 11, 27, 20, 30)          # 周五
+        self.assertEqual(
+            mb._next_run_text([510], now=now, days_by_min={510: frozenset({1})}),
+            "周一 08:30")
+        self.assertEqual(
+            mb._next_run_text([510], now=now,
+                              days_by_min={510: frozenset({1, 2, 3, 4, 5})}),
+            "周一 08:30")
+        # 每天的行为与旧版一致
+        self.assertEqual(
+            mb._next_run_text([510], now=now, days_by_min={510: frozenset()}),
+            "明天 08:30")
+        self.assertEqual(mb._next_run_text([1260], now=now), "今天 21:00")
+        # 周六的档 = 明天
+        self.assertEqual(
+            mb._next_run_text([540], now=now, days_by_min={540: frozenset({6})}),
+            "明天 09:00")
+
+    def test_days_by_min_from_fp(self):
+        fp = [(510, frozenset({1, 2})), (510, frozenset({3})), (1260, frozenset())]
+        got = mb._days_by_min_from_fp(fp)
+        self.assertEqual(got[510], frozenset({1, 2, 3}))
+        self.assertEqual(got[1260], frozenset())
 
 
 class SelectionAnchorsTest(unittest.TestCase):

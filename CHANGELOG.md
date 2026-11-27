@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · v2.02.0：定时档位可以只在指定星期生效
+
+用户要求："希望计划任务可以选择星期几。"
+
+- **数据**：档位新增 `days`（1=周一 … 7=周日，空=每天）。`normalize_days`
+  统一归一并把"选满 7 天"折叠成空，所以**旧配置无需迁移**（没有这个字段=每天）。
+- **触发器**：`days` 非空时注册 `New-ScheduledTaskTrigger -Weekly -WeeksInterval 1
+  -DaysOfWeek Monday,Wednesday,...`；空则仍是 `-Daily`，与旧版注册结果逐字一致。
+  已用真实任务计划验证：注册出的 XML 是 `ScheduleByWeek/DaysOfWeek`，与解析器匹配。
+- **执行**：`apply_schedule` 先按 `datetime.now().isoweekday()` 过滤档位再判档。
+  这是第二道防线——登录校准任务和卸载残留任务不经过 Weekly 触发器。
+- **任务比对**：`task_match_reason` 新增触发星期比对（`_slot_trigger_fingerprint`
+  vs `_xml_trigger_fingerprint`），改星期会触发重建；"全 7 天"与"每天"判为等价，
+  避免每次启动都误重建。
+- **下次运行**：`_next_run_text` 支持 `days_by_min`，按真实星期推算（周五看
+  "仅周一"的档显示「周一 08:30」，不再说成"明天"）。
+- **UI**：`SlotEditor` 新增「重复」7 按钮（`WeekdayPicker`），选中高亮；
+  下方实时显示「生效于：工作日」。时间段行只在非"每天"时标出星期。
+- 单测 170 → 178（`WeekdayScheduleTest` 8 项）。
+
 ### 2026-11-27 · v2.01.25：「记住」按钮加就地回执
 
 用户反馈："记住显示器没有反馈，不知道是否成功。"

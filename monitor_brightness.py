@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.25"    # 「记住」按钮就地回执（设置弹层挡住状态卡）
+APP_VERSION = "2.02.0"     # 定时档位可按星期生效（Weekly 触发器 + 执行时二次判断）
 
 
 def _app_dir():
@@ -215,7 +215,54 @@ UI = {
 # 加一个设置要同时改 默认值表 / 校验 / 建控件 / 读表单 / 拼注册脚本 五六处。
 # 现在只有这里声明一次，其余地方一律派生。
 #   kind: indices 显示器序号列表 | hhmm 时间 | level 亮度 0-100 | flag 开关
-DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': ''}, {'time': '21:00', 'level': 0, 'screen': ''}]
+DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': '', 'days': []},
+                 {'time': '21:00', 'level': 0, 'screen': '', 'days': []}]
+
+# 星期：ISO 编号 1=周一 … 7=周日。
+# `days` 空列表 = 每天（兼容没有这个字段的旧配置）。
+WEEKDAY_NAMES_PS = ("Monday", "Tuesday", "Wednesday", "Thursday",
+                    "Friday", "Saturday", "Sunday")
+WEEKDAY_LABELS = ("一", "二", "三", "四", "五", "六", "日")
+WEEKDAY_PRESETS = (("每天", []), ("工作日", [1, 2, 3, 4, 5]),
+                   ("周末", [6, 7]))
+
+
+def normalize_days(value):
+    """把各种写法规整成 1-7 的有序去重列表；选满 7 天归一成 []（=每天）。"""
+    out = set()
+    if isinstance(value, (list, tuple, set)):
+        for d in value:
+            try:
+                n = int(d)
+            except Exception:
+                continue
+            if 1 <= n <= 7:
+                out.add(n)
+    return [] if len(out) >= 7 else sorted(out)
+
+
+def days_label(days):
+    """给界面看的一句话：每天 / 工作日 / 周末 / 周一,三,五。"""
+    days = normalize_days(days)
+    if not days:
+        return "每天"
+    if days == [1, 2, 3, 4, 5]:
+        return "工作日"
+    if days == [6, 7]:
+        return "周末"
+    return "周" + ",".join(WEEKDAY_LABELS[d - 1] for d in days)
+
+
+def slot_matches_weekday(slot, weekday):
+    """这一档在指定星期（1=周一）该不该执行；days 空 = 每天。"""
+    days = normalize_days(slot.get("days"))
+    return not days or weekday in days
+
+
+def slots_for_weekday(slots, weekday):
+    """只留下今天生效的档位；万一全都不生效，退回全部（避免无档可判）。"""
+    keep = [s for s in slots if slot_matches_weekday(s, weekday)]
+    return keep or list(slots)
 
 # 每个时间段可携带的屏幕动作：""（不变）/ off（到点熄灭）/ on（到点点亮）
 SCREEN_ACTIONS = (("", "不变"), ("off", "熄灭"), ("on", "点亮"))
@@ -617,7 +664,8 @@ def _coerce_slots(value):
             scr = str(item.get("screen", "")).strip().lower()
             if scr not in ("", "off", "on"):
                 scr = ""
-            out.append({"time": t, "level": lv, "screen": scr})
+            out.append({"time": t, "level": lv, "screen": scr,
+                        "days": normalize_days(item.get("days"))})
     if not out:                      # 至少一档，否则调度无从判定
         out = [dict(d) for d in DEFAULT_SLOTS]
     return sorted(out, key=lambda x: parse_hhmm(x["time"], (0, 0)))
@@ -3629,12 +3677,18 @@ def apply_schedule(cfg=None):
     本函数只由计划任务（--apply-schedule）与用户显式操作触发。
     """
     cfg = cfg or load_config()
-    slot = active_slot_dict(cfg.get("slots", []), _minutes())
+    # v2.02.0：按星期过滤档位。`days` 空 = 每天（旧配置行为不变）。
+    # 触发器层已经按星期注册，这里再判一次是防"登录校准"或残留任务
+    # 在非指定星期被唤起——那两条路径不经过 Weekly 触发器。
+    _wd = datetime.now().isoweekday()
+    _slots = slots_for_weekday(cfg.get("slots", []), _wd)
+    slot = active_slot_dict(_slots, _minutes())
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
     dlog("sch.decide", slot=slot, level=level, screen=screen, targets=targets,
-         method=cfg.get("screen_off_method"))
+         method=cfg.get("screen_off_method"), weekday=_wd,
+         slot_days=slot.get("days") or [])
     # D3：拓扑模式的 off 跳过亮度（inactive 时 DDC 读不到/写不进）；
     # on 的亮度由 screen_on_cfg 在「按当前拓扑接回 → 回读」之后写。
     topo = cfg.get("screen_off_method") == "topology"
@@ -3725,8 +3779,23 @@ def task_signature(cfg):
     return "%s|%s|%s" % (os.path.normcase(os.path.abspath(exe)), arg, times)
 
 
+def _ps_trigger_line(slot):
+    """一档 → 一条 PowerShell 触发器语句。
+
+    v2.02.0：`days` 非空且不是全 7 天时用 `-Weekly`（任务计划程序里能直接看到
+    "只在周一、三、五"）；空 = 每天，仍用 `-Daily`，与旧版注册结果完全一致。
+    """
+    days = normalize_days(slot.get("days"))
+    at = _ps_quote(slot["time"])
+    if not days:
+        return "  (New-ScheduledTaskTrigger -Daily -At %s)" % at
+    names = ",".join(WEEKDAY_NAMES_PS[d - 1] for d in days)
+    return ("  (New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 "
+            "-DaysOfWeek %s -At %s)" % (names, at))
+
+
 def build_register_script(cfg):
-    """生成注册脚本：一条定时任务挂 N 个 Daily 触发器（每档一个），可选登录补跑任务。
+    """生成注册脚本：一条定时任务挂 N 个触发器（每档一个）、可选登录补跑任务。
 
     v1.9.0 起：任务已存在时优先 Set-ScheduledTask **原地更新**（保留上次运行记录），
     失败才回退到 Unregister + Register。旧实现每次都先删后建，会把 LastRunTime
@@ -3751,7 +3820,7 @@ def build_register_script(cfg):
         "$triggers = @(",
     ]
     for i, x in enumerate(slots):
-        lines.append("  (New-ScheduledTaskTrigger -Daily -At %s)" % _ps_quote(x["time"]))
+        lines.append(_ps_trigger_line(x))
     lines += [
         ")",
         "$old = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue" % TASK_SCHEDULE,
@@ -3863,6 +3932,53 @@ def _same_path(a, b):
         return str(a).strip().strip('"').lower() == str(b).strip().strip('"').lower()
 
 
+def _slot_trigger_fingerprint(slots):
+    """配置侧触发器指纹：[(当日分钟, 星期frozenset)]，全 7 天归成空集。"""
+    out = []
+    for s in slots or []:
+        days = frozenset(normalize_days(s.get("days")))
+        out.append((parse_hhmm(s.get("time"), (0, 0)), days))
+    return sorted(out)
+
+
+def _xml_trigger_fingerprint(xml_text):
+    """任务 XML 侧触发器指纹。
+
+    一个 `<CalendarTrigger>` 里若有 `<DaysOfWeek>` 就是 Weekly，否则是 Daily
+    （空集）。选满 7 天与"每天"等价，统一归成空集，避免每次启动都误判要重建。
+    """
+    out = []
+    for block in re.finditer(r"<CalendarTrigger>(.*?)</CalendarTrigger>",
+                             xml_text or "", re.S):
+        body = block.group(1)
+        m = re.search(r"<StartBoundary>([^<]+)</StartBoundary>", body)
+        if not m:
+            continue
+        mins = _boundary_to_minutes(m.group(1).strip())
+        if mins is None:
+            continue
+        days = set()
+        dw = re.search(r"<DaysOfWeek>(.*?)</DaysOfWeek>", body, re.S)
+        if dw:
+            for i, name in enumerate(WEEKDAY_NAMES_PS, start=1):
+                if re.search(r"<%s\s*/>" % name, dw.group(1)):
+                    days.add(i)
+        out.append((mins, frozenset() if len(days) >= 7 else frozenset(days)))
+    return sorted(out)
+
+
+def _fp_text(fp):
+    """指纹 → 人话，只用于不一致时的事件/状态文案。"""
+    if not fp:
+        return "无触发器"
+    parts = []
+    for mins, days in fp:
+        d = ("每天" if not days
+             else "周" + ",".join(WEEKDAY_LABELS[n - 1] for n in sorted(days)))
+        parts.append("%02d:%02d(%s)" % (mins // 60, mins % 60, d))
+    return " ".join(parts)
+
+
 def task_match_reason(cfg, xml_text=None):
     """任务是否与当前进程/配置一致；一致返回空串，否则返回人话原因。"""
     if xml_text is None:
@@ -3888,6 +4004,12 @@ def task_match_reason(cfg, xml_text=None):
         have = ",".join("%02d:%02d" % (m // 60, m % 60) for m in bounds) or "无"
         want = ",".join("%02d:%02d" % (m // 60, m % 60) for m in wanted) or "无"
         return "触发时间不一致（任务：%s，配置：%s）" % (have, want)
+    # v2.02.0：星期也要比对，否则用户改了「只在工作日」不会重建任务
+    have_fp = _xml_trigger_fingerprint(xml_text)
+    want_fp = _slot_trigger_fingerprint(cfg.get("slots", []))
+    if have_fp != want_fp:
+        return "触发星期不一致（任务：%s，配置：%s）" % (
+            _fp_text(have_fp), _fp_text(want_fp))
     return ""
 
 
@@ -3977,34 +4099,80 @@ def _settings_block(xml_text):
     return m.group(1) if m else ""
 
 
+def _boundary_to_minutes(b):
+    """'2026-11-27T08:30:00' → 510（当日分钟）；解析失败返回 None。"""
+    b = (b or "").strip()
+    parts = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", b)
+    if not parts:
+        return None
+    y, mo, d, h, mi, sec = (int(v) for v in parts.groups())
+    try:
+        dt = (datetime(y, mo, d, h, mi, sec, tzinfo=timezone.utc).astimezone()
+              if b.endswith("Z") else datetime(y, mo, d, h, mi, sec))
+    except Exception:
+        return None
+    return dt.hour * 60 + dt.minute
+
+
 def _boundary_minutes_all(xml_text):
     """任务 XML 里全部触发器的 StartBoundary（本地当日分钟列表）。"""
     out = []
     for m in re.finditer(r"<StartBoundary>([^<]+)</StartBoundary>", xml_text or ""):
-        b = m.group(1).strip()
-        parts = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", b)
-        if not parts:
-            continue
-        y, mo, d, h, mi, sec = (int(v) for v in parts.groups())
-        try:
-            dt = (datetime(y, mo, d, h, mi, sec, tzinfo=timezone.utc).astimezone()
-                  if b.endswith("Z") else datetime(y, mo, d, h, mi, sec))
-        except Exception:
-            continue
-        out.append(dt.hour * 60 + dt.minute)
+        mins = _boundary_to_minutes(m.group(1))
+        if mins is not None:
+            out.append(mins)
     return out
 
 
-def _next_run_text(minutes_list, now=None):
-    """多触发器取「离现在最近的下一次」；没有未来的（都被错过）取最早的一档（明天）。"""
+def _next_run_text(minutes_list, now=None, days_by_min=None):
+    """多触发器取「离现在最近的下一次」。
+
+    v2.02.0：`days_by_min` 可选，{当日分钟: 星期集合}。给了就按真实星期推算
+    （周一档在周五要显示"周一 08:30"，不能再说"明天"）；空集合 = 每天，
+    行为与旧版完全一致。
+    """
     if not minutes_list:
         return ""
     now_dt = now if now is not None else datetime.now()
+    today = now_dt.isoweekday()
     now_min = now_dt.hour * 60 + now_dt.minute
-    future = [m for m in minutes_list if m > now_min]
-    target = min(future) if future else min(minutes_list)
-    day = "今天" if target > now_min else "明天"
-    return "%s %02d:%02d" % (day, target // 60, target % 60)
+    best = None                      # (距今天数, 当日分钟)
+    for m in minutes_list:
+        days = frozenset((days_by_min or {}).get(m) or ())
+        for delta in range(0, 8):    # 今天起 7 天内必有至少一次
+            wd = (today - 1 + delta) % 7 + 1
+            if days and wd not in days:
+                continue
+            if delta == 0 and m <= now_min:
+                continue
+            cand = (delta, m)
+            if best is None or cand < best:
+                best = cand
+            break
+    if best is None:
+        return ""
+    delta, m = best
+    if delta == 0:
+        day = "今天"
+    elif delta == 1:
+        day = "明天"
+    else:
+        day = "周" + WEEKDAY_LABELS[(today - 1 + delta) % 7]
+    return "%s %02d:%02d" % (day, m // 60, m % 60)
+
+
+def _days_by_min_from_fp(fingerprint):
+    """[(分钟, 星期frozenset)] → {分钟: 星期集合}；"每天"给空集合。"""
+    out = {}
+    for mins, days in fingerprint or []:
+        prev = out.get(mins)
+        if prev is None:
+            out[mins] = set(days)
+        else:
+            prev |= set(days)
+            if not prev:
+                out[mins] = set()
+    return {k: frozenset(v) for k, v in out.items()}
 
 
 def query_task_status_local():
@@ -4033,7 +4201,9 @@ def query_task_status_local():
             out.append("%s=%s||SWA=%s" % (name, state, swa))
         else:
             bounds = _boundary_minutes_all(txt)
-            nxt = _next_run_text(bounds)
+            nxt = _next_run_text(
+                bounds, days_by_min=_days_by_min_from_fp(
+                    _xml_trigger_fingerprint(txt)))
             out.append("%s=%s|%s|SWA=%s|TRIG=%s"
                        % (name, state, nxt, swa,
                           ",".join(str(m) for m in sorted(bounds))))
@@ -4161,7 +4331,9 @@ def _rebuild_report(cfg, out, before_xml):
     if not nxt:
         minutes = sorted({parse_hhmm(t, (0, 0)) for t in times})
         if minutes:
-            nxt = _next_run_text(minutes)
+            nxt = _next_run_text(
+                minutes, days_by_min=_days_by_min_from_fp(
+                    _slot_trigger_fingerprint(slots)))
     lines.append("• 下次运行：%s" % (_short_dt(nxt) if nxt
                                     else "未取到（点「检测」刷新）"))
     changed = _rebuild_changes(before_xml, cfg)
@@ -5098,6 +5270,54 @@ class Slider(tk.Canvas):
         self._draw()
 
 
+class WeekdayPicker(tk.Frame):
+    """周一到周日 7 个小按钮（多选）。
+
+    v2.02.0：定时档位可以只在指定星期生效。选满 7 天等价于「每天」，
+    内部统一存空列表（`normalize_days` 负责归一），所以旧配置/旧任务
+    不需要迁移。
+    """
+
+    def __init__(self, parent, days=None, bg=None, on_change=None):
+        bg = bg or parent.cget("bg")
+        super().__init__(parent, bg=bg)
+        self._days = set(normalize_days(days))
+        self._on_change = on_change
+        self._labels = []
+        for i, text in enumerate(WEEKDAY_LABELS, start=1):
+            lab = tk.Label(self, text=text, width=2, bd=0, cursor="hand2",
+                           bg=UI["fill"], fg=UI["text2"],
+                           font=_ui_font(9, bold=False))
+            lab.pack(side="left", padx=(0, 4))
+            lab.bind("<Button-1>", lambda _e, n=i: self._toggle(n))
+            self._labels.append(lab)
+        self._paint(notify=False)
+
+    def _toggle(self, n):
+        if n in self._days:
+            self._days.discard(n)
+        else:
+            self._days.add(n)
+        self._paint()
+
+    def _paint(self, notify=True):
+        for i, lab in enumerate(self._labels, start=1):
+            on = i in self._days
+            lab.configure(bg=UI["accent"] if on else UI["fill"],
+                          fg="#ffffff" if on else UI["text2"])
+        # 构造阶段不通知：此时调用方还没把 picker 挂到 self 上
+        if notify and self._on_change is not None:
+            self._on_change()
+
+    def get(self):
+        """返回归一后的 1-7 列表；空 = 每天。"""
+        return normalize_days(sorted(self._days))
+
+    def set(self, days):
+        self._days = set(normalize_days(days))
+        self._paint()
+
+
 class Segmented(tk.Canvas):
     """分段控件（互斥选择）。用整块 Canvas 画，避免 ttk 按钮的方角。"""
 
@@ -5869,7 +6089,17 @@ class SlotEditor(Sheet):
         labels = [lab for _v, lab in SCREEN_ACTIONS]
         cur = SCREEN_LABEL_BY_VALUE.get(slot.get("screen", ""), "不变")
         self.screen_seg = Segmented(box, labels, index=labels.index(cur))
-        self.screen_seg.pack(fill="x", pady=(4, 0))
+        self.screen_seg.pack(fill="x", pady=(4, 10))
+
+        # v2.02.0：这一档只在勾选的星期生效；一个都不勾 = 每天
+        Label(box, "重复", size=9, color=UI["text2"], bg=UI["card"]).pack(anchor="w")
+        # 先建 hint 再建 picker：picker 构造时就会触发一次 on_change 回调
+        self.days_hint = Label(box, "", size=8, color=UI["text3"], bg=UI["card"])
+        self.days_picker = WeekdayPicker(box, slot.get("days"),
+                                         on_change=self._refresh_days_hint)
+        self.days_picker.pack(anchor="w", pady=(4, 0))
+        self.days_hint.pack(anchor="w", pady=(4, 0))
+        self._refresh_days_hint()
 
         if on_delete is not None:
             del_btn = Button(box, "删除这个时间段", self._do_delete, kind="secondary",
@@ -5879,6 +6109,13 @@ class SlotEditor(Sheet):
         self.ok_btn.set_text("保存")
         self.ok_btn._command = self._do_save
         self.show()
+
+    def _refresh_days_hint(self):
+        """把当前星期选择翻成一句话（每天 / 工作日 / 周一,三,五）。"""
+        hint = getattr(self, "days_hint", None)
+        if hint is None:
+            return
+        hint.configure(text="生效于：" + days_label(self.days_picker.get()))
 
     def _do_save(self):
         t = self.time_field.get_time()
@@ -5891,6 +6128,7 @@ class SlotEditor(Sheet):
             lv = 50
         idx = self.screen_seg.get()
         self._on_save({"time": t, "level": lv,
+                       "days": self.days_picker.get(),
                        "screen": SCREEN_VALUE_BY_LABEL.get(
                            [lab for _v, lab in SCREEN_ACTIONS][idx], "")})
         self.close()
@@ -5935,6 +6173,11 @@ class _SlotRow(Button):
                        fill=t_fg, font=_ui_font(11, bold=True))
         cv.create_text(78, h / 2, text="%d%%" % clamp_level(slot.get("level", 0)),
                        anchor="w", fill=s_fg, font=_ui_font(9))
+        # v2.02.0：只在"不是每天"时才标出来——每天都标一遍纯属噪音
+        days = normalize_days(slot.get("days"))
+        if days:
+            cv.create_text(132, h / 2, text=days_label(days), anchor="w",
+                           fill=s_fg, font=_ui_font(8))
         act = slot.get("screen", "")
         if act:
             label = "同时熄灭" if act == "off" else "同时点亮"
@@ -6082,7 +6325,8 @@ class SchedulePanel:
             self.render()
             self._notify_changed()
 
-        self._editor = SlotEditor(self.app, {"time": t, "level": 50, "screen": ""}, save)
+        self._editor = SlotEditor(self.app, {"time": t, "level": 50, "screen": "",
+                                             "days": []}, save)
 
     def _notify_changed(self):
         """时间段增删改后立刻落盘；定时已启用时由 App 去重写任务计划。
@@ -7391,7 +7635,9 @@ class App:
                                           "熄" if x.get("screen") == "off" else
                                           "亮" if x.get("screen") == "on" else "")
                            for x in slots)
-        nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots])
+        nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots],
+                             days_by_min=_days_by_min_from_fp(
+                                 _slot_trigger_fingerprint(slots)))
         # v2.01.0：用**上次实际探测**的结果，不再读配置里的记账；
         # 没探测过就老实说"未检测"，不猜。
         st = {"on": "亮着", "off": "已熄灭"}.get(
@@ -7530,8 +7776,11 @@ class App:
             self.status_var.set(task_msg)
         else:
             # 配置正确：只报「已就绪 + 下次运行」，不做任何业务动作
+            _slots_now = self.cfg.get("slots") or []
             nxt = _next_run_text([parse_hhmm(s.get("time"), (0, 0))
-                                  for s in self.cfg.get("slots") or []])
+                                  for s in _slots_now],
+                                 days_by_min=_days_by_min_from_fp(
+                                     _slot_trigger_fingerprint(_slots_now)))
             self.status_var.set(("定时任务已就绪，下次运行 %s" % nxt) if nxt
                                 else "定时任务已就绪")
         self._refresh_events()
