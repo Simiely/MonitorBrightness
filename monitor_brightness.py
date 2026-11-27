@@ -3116,6 +3116,15 @@ def cli_set(spec, value):
 
 
 def cli_apply_schedule():
+    # 走查 P-02 补充：注销任务失败时任务可能残留，但配置已 enabled=False。
+    # 到这里必须再确认一次用户意图，否则"已关闭定时"仍会熄屏。
+    try:
+        cfg = load_config()
+        if not cfg.get("enabled"):
+            _out("定时已关闭（enabled=false），本次不执行档位")
+            sys.exit(0)
+    except Exception:
+        pass                      # 读不到配置时照旧执行，避免升级为阻断
     try:
         level, screen, ok, errs = apply_schedule()
         for i, e in errs:
@@ -4467,7 +4476,7 @@ class SchedulePanel:
         self.probe_task_btn.pack(side="right")
         # 显式重建入口：v1.9.2 之前只有改开关/改时间段才会写任务，
         # 用户想"按现在配置再来一遍"时没有按钮可点。
-        self.apply_btn = Button(st, "应用", app.apply_schedule, kind="secondary",
+        self.apply_btn = Button(st, "应用", app.rebuild_schedule_tasks, kind="secondary",
                                 width=52, height=22, pad_bg=UI["card"])
         self.apply_btn.pack(side="right", padx=(0, 6))
         self.task_next = Label(st, "", size=8, color=UI["text3"], bg=UI["card"])
@@ -5197,8 +5206,11 @@ class App:
             return
         v = screen_verdict(self.cfg, states)
         if v.get("woke_by_input"):
-            # 只做内存记账（旁路）：这里不落盘，避免在探测回调里加同步 IO
+            # 走查 P-03：这里以前只改内存不落盘，GUI 说"亮着"但磁盘仍"off"，
+            # 下次 CLI 进程读到相反结论。save_config 只写小 JSON、不碰硬件，
+            # 放在 Tk 线程做是安全的（DDC 读才必须在后台线程）。
             mark_screen_state(self.cfg, "on")
+            save_config(self.cfg)
         if v["state"] != "off":
             vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
             if vals and len(set(vals)) == 1:
@@ -5472,9 +5484,8 @@ class App:
         if self.sch_panel.schedule_enabled():
             self.cancel_schedule()
         else:
-            self.sch_panel.set_enabled_flag(True)
-            self.cfg["enabled"] = True
-            save_config(self.cfg)
+            if not self._set_schedule_enabled(True, persist=True):
+                return
             self.status_var.set("正在写入任务计划…")
             self.run_bg(lambda: register_tasks(self.cfg),
                         self._finish_tray_register, busy=True)
@@ -5484,10 +5495,7 @@ class App:
             result = (False, str(result))
         ok, out = result
         if not ok:
-            self.msg.showerror("注册任务失败", out or "未知错误")
-            self.status_var.set("注册任务失败")
-            self.sch_panel.set_enabled_flag(False)
-            self.cfg["enabled"] = False
+            self._rollback_schedule(False, "注册任务失败", out)
             return
         self.refresh_task_status()
         self.status_var.set("定时已启用")
@@ -5607,8 +5615,8 @@ class App:
             result = (False, str(result))
         ok, out = result
         if not ok:
-            self.status_var.set("重写任务计划失败：%s" % out)
-            self.msg.showerror("重写任务计划失败", out or "未知错误")
+            # 走查 P-04：与面板/托盘失败统一回滚策略（原来只提示不回滚）
+            self._rollback_schedule(False, "重写任务计划失败", out)
             return
         _write_event_log("时间段已更新，任务计划已重写")
         self.refresh_task_status()
@@ -5631,21 +5639,23 @@ class App:
             return
         idx, ids = selection_payload(self.selected_indices())
         part = {"monitors": idx, "monitor_ids": ids,
-                "monitor_anchors": selection_anchors(idx), "enabled": True,
+                "monitor_anchors": selection_anchors(idx),
                 "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True)),
                 "slots": slots}
         self.cfg.update(part)
-        ok, msg = save_config(self.cfg)
-        if not ok:
-            self.msg.showerror("保存失败", msg)
+        if not self._set_schedule_enabled(True, persist=True):
             return
         self.status_var.set("正在写入任务计划…")
         before_xml = _read_task_xml()          # 留一份重建前定义，用于比对变化
         self.run_bg(lambda: register_tasks(self.cfg),
                     lambda r: self._finish_register(r, part, before_xml), busy=True)
 
-    def apply_schedule(self):
-        """「应用」按钮：按当前面板内容强制重建任务计划（成功弹确认窗）。"""
+    def rebuild_schedule_tasks(self):
+        """「应用」按钮：按当前面板内容强制重建任务计划（成功弹确认窗）。
+
+        走查 P-05：原名 apply_schedule 与模块级同名函数（按当前时间套档位）
+        混淆——按钮点的是"重建任务"，CLI --apply-schedule 跑的是"套档位"。
+        """
         if not self.sch_panel.schedule_enabled():
             self.msg.showinfo("提示", "请先勾选「启用每日定时」")
             return
@@ -5678,8 +5688,8 @@ class App:
             result = (False, str(result))
         ok, out = result
         if not ok:
-            self.msg.showerror("重建任务计划失败", out or "未知错误")
-            self.status_var.set("重建任务计划失败")
+            # 走查 P-04：与其余入口统一回滚策略
+            self._rollback_schedule(False, "重建任务计划失败", out)
             return
         self.refresh_task_status()
         self.status_var.set("任务计划已重建")
@@ -5690,21 +5700,40 @@ class App:
             result = (False, str(result))
         ok, out = result
         if not ok:
-            self.msg.showerror("注册任务失败", out or "未知错误")
-            self.status_var.set("注册任务失败")
-            # 开关是"切换即注册"：注册失败要把开关拨回去，别让界面说谎
-            self.cfg["enabled"] = False
-            save_config(self.cfg)
-            self.sch_panel.set_enabled_flag(False)
+            # 开关是"切换即注册"：注册失败统一回滚（改状态 + 落盘 + 界面）
+            self._rollback_schedule(False, "注册任务失败", out)
             return
         self.refresh_task_status()
         self.status_var.set("定时已启用")
         self._announce_rebuilt(part, out, before_xml, "定时已保存")
 
+    def _set_schedule_enabled(self, enabled, persist=True):
+        """定时开关状态的**唯一**写入者：改内存 + 落盘 + 同步界面开关。
+
+        走查 P-01/P-02/P-04：以前 6 个入口各自写 cfg["enabled"]，
+        有的落盘有的不落盘，失败回滚策略四种不同。所有入口统一走这里。
+        返回 (是否成功)。落盘失败时回滚内存，不让界面说谎。
+        """
+        want = bool(enabled)
+        old = bool(self.cfg.get("enabled"))
+        self.cfg["enabled"] = want
+        if persist:
+            ok, msg = save_config(self.cfg)
+            if not ok:
+                self.cfg["enabled"] = old
+                self.msg.showerror("保存失败", msg)
+                return False
+        self.sch_panel.set_enabled_flag(want)
+        return True
+
+    def _rollback_schedule(self, to_enabled, title, out):
+        """任务写入失败时的**唯一**回滚者：改状态 + 落盘 + 提示。"""
+        self._set_schedule_enabled(to_enabled, persist=True)
+        self.msg.showerror(title, out or "未知错误")
+        self.status_var.set("%s（已恢复开关）" % title)
+
     def cancel_schedule(self):
-        self.cfg["enabled"] = False
-        save_config(self.cfg)
-        self.sch_panel.set_enabled_flag(False)
+        self._set_schedule_enabled(False, persist=True)
         self.status_var.set("正在取消定时任务…")
         self.run_bg(unregister_tasks, self._finish_unregister, busy=True)
 
@@ -5719,8 +5748,15 @@ class App:
         if isinstance(result, Exception):
             result = (False, str(result))
         ok, out = result
+        if not ok:
+            # 走查 P-02：注销失败必须把开关恢复为 True 并落盘，
+            # 否则磁盘说"已关闭"但任务残留、继续熄屏（cli_apply_schedule
+            # 现在也会因 enabled=false 拒绝执行，双保险）。
+            self._rollback_schedule(True, "取消定时任务失败", out)
+            self.refresh_task_status()
+            return
         self.refresh_task_status()
-        self.status_var.set("已取消定时任务" if ok else "取消定时任务时出现问题：%s" % out)
+        self.status_var.set("已取消定时任务")
 
     def refresh_task_status(self):
         if self._task_querying:

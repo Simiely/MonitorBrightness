@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · 场景走查第 1 轮（scenario-walkthrough v3）
+
+- 按仓库 `workbuddy-skills` 的走查方法，产出 `docs/walkthrough/`：
+  能力清单（52 项 C-ID）/ 17 条素材剧本 + 覆盖矩阵 / 走查报告 / 坑库。
+- **4 个🔴真缺陷 + 1 个命名混淆，全部修复并收敛到单点归属**：
+  - P-01 托盘注册失败不落盘 → `_set_schedule_enabled` 单点写入 + `_rollback_schedule` 单点回滚；
+  - P-02 注销失败残留任务继续熄屏 → 失败恢复 `enabled=True` 并落盘 + `cli_apply_schedule` 执行前复核 `enabled`；
+  - P-03 屏幕状态 GUI/CLI 分歧 → 探测发现唤醒也落盘；
+  - P-04 6 入口 4 种失败处理 → 5 个失败回调统一回滚，全仓 `cfg["enabled"]=` 只剩单点函数内 2 处；
+  - P-05 `App.apply_schedule` 与模块同名 → 改名 `rebuild_schedule_tasks`。
+- 回归 **69 tests OK**（原 62 + 7 项走查回归）；REPO CHECK PASS；
+  `enabled=True` 时定时正常执行（用户已验收路径零改动）。
+- 残余 13 项 🟡/⚪ 风险记录在 `docs/walkthrough/report.md`，按 skill 停止准则需第 2 轮收敛。
+
 ## [2.00.1] - 2026-11-27
 
 > v2 首个版本：新增**拓扑显示方案**（把副屏从 Windows 桌面断开/接回，串流时只留 VDD）。

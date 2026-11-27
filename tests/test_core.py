@@ -614,7 +614,7 @@ class AddButtonRegression(TempConfigCase):
         fake.slots_saved = []
         fake.refresh_task_status = lambda: None
         fake.schedule_toggled = lambda value: None
-        fake.apply_schedule = lambda: None
+        fake.rebuild_schedule_tasks = lambda: None
 
         def on_slots_changed(slots):
             fake.slots_saved = list(slots)
@@ -726,6 +726,9 @@ class RebuildNoticeRegression(TempConfigCase):
         fake.run_bg = lambda *a, **k: None
         fake._finish_auto_checks = lambda result: None
         fake._announce_rebuilt = lambda *a: mb.App._announce_rebuilt(fake, *a)
+        # 走查修复：失败回滚统一走真方法，FakeApp 需提供 save_config 依赖
+        fake._set_schedule_enabled = types.MethodType(mb.App._set_schedule_enabled, fake)
+        fake._rollback_schedule = types.MethodType(mb.App._rollback_schedule, fake)
         return fake, cfg
 
     @staticmethod
@@ -976,6 +979,109 @@ class TopologyGuiTest(TempConfigCase):
             self.assertEqual(len(buttons), 1)
         finally:
             root.destroy()
+
+
+class WalkthroughFixTest(TempConfigCase):
+    """场景走查第 1 轮 P-01/P-02/P-03/P-04/P-05 的回归测试。"""
+
+    class _Var:
+        def __init__(self):
+            self._v = ""
+
+        def set(self, v):
+            self._v = v
+
+        def get(self):
+            return self._v
+
+    def _app_stub(self, enabled=True, save_ok=True):
+        fake = type("F", (), {})()
+        fake.cfg = mb.default_config()
+        fake.cfg["enabled"] = enabled
+        fake.status_var = self._Var()
+        fake.flags = []
+        fake.sch_panel = types.SimpleNamespace(
+            set_enabled_flag=lambda v: fake.flags.append(v))
+        saved = []
+
+        def fake_save(cfg):
+            saved.append(dict(cfg))
+            return (True, "") if save_ok else (False, "disk fail")
+
+        fake.msg = types.SimpleNamespace(
+            showerror=lambda *a: None, showinfo=lambda *a: None,
+            showwarning=lambda *a: None)
+        fake._set_schedule_enabled = types.MethodType(mb.App._set_schedule_enabled, fake)
+        fake._rollback_schedule = types.MethodType(mb.App._rollback_schedule, fake)
+        return fake, fake_save, saved
+
+    def test_schedule_enabled_single_writer_persists(self):
+        fake, fake_save, saved = self._app_stub()
+        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+            ok = mb.App._set_schedule_enabled(fake, False, persist=True)
+        self.assertTrue(ok)
+        self.assertFalse(fake.cfg["enabled"])
+        self.assertEqual(fake.flags, [False])
+        self.assertEqual(saved[-1]["enabled"], False)   # 落盘了（P-01）
+
+    def test_schedule_enabled_persist_failure_rolls_back_memory(self):
+        fake, fake_save, _ = self._app_stub(enabled=True, save_ok=False)
+        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+            ok = mb.App._set_schedule_enabled(fake, False, persist=True)
+        self.assertFalse(ok)
+        self.assertTrue(fake.cfg["enabled"])            # 内存回滚
+        self.assertEqual(fake.flags, [])                # 界面没说谎
+
+    def test_tray_register_failure_uses_unified_rollback(self):
+        fake, fake_save, saved = self._app_stub(enabled=True)
+        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+            mb.App._finish_tray_register(fake, (False, "boom"))
+        self.assertFalse(fake.cfg["enabled"])
+        self.assertEqual(fake.flags, [False])
+        self.assertTrue(any(not c["enabled"] for c in saved))  # P-01 修复
+
+    def test_cancel_failure_restores_enabled(self):
+        fake, fake_save, saved = self._app_stub(enabled=True)
+        fake.refresh_task_status = lambda: None
+        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+            mb.App._finish_unregister(fake, (False, "still running"))
+        self.assertTrue(fake.cfg["enabled"])     # P-02：失败后配置与任务一致
+        self.assertEqual(fake.flags, [True])
+
+    def test_cli_apply_schedule_skips_when_disabled(self):
+        cfg = mb.default_config()
+        cfg["enabled"] = False
+        with unittest.mock.patch.object(mb, "load_config", return_value=cfg), \
+                unittest.mock.patch.object(mb, "apply_schedule") as apply:
+            with self.assertRaises(SystemExit) as cm:
+                mb.cli_apply_schedule()
+        self.assertEqual(cm.exception.code, 0)
+        apply.assert_not_called()               # P-02 护栏：残留任务不执行
+
+    def test_wake_detection_persists_state(self):
+        fake, fake_save, saved = self._app_stub()
+        fake._probing = True
+        fake._brighting = True
+        fake.monitors = [{"index": 0}]
+        fake.sch_panel = types.SimpleNamespace(
+            set_enabled_flag=lambda v: None,
+            set_hint_default=lambda t: None)
+        fake.status_card = types.SimpleNamespace(
+            render=lambda p: None, set_actions_enabled=lambda e: None)
+        fake._last_verdict = {}
+        fake._fit_window = lambda: None
+        fake._status_payload = lambda s, h: {"state": s, "hint": h}
+        with unittest.mock.patch.object(mb, "screen_verdict",
+                                        return_value={"state": "on", "woke_by_input": True,
+                                                      "text": "t", "detail": "d"}), \
+                unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+            mb.App._render_states(fake, ([{"index": 0}], {}))
+        self.assertEqual(fake.cfg["screen_state"], "on")
+        self.assertTrue(any(c["screen_state"] == "on" for c in saved))  # P-03
+
+    def test_rebuild_name_is_distinct_from_module_apply(self):
+        self.assertTrue(callable(mb.App.rebuild_schedule_tasks))
+        self.assertFalse(hasattr(mb.App, "apply_schedule"))  # P-05：不再同名
 
 
 class ApplyCallbackTest(unittest.TestCase):

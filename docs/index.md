@@ -25,6 +25,7 @@
 | [architecture-review.md](architecture-review.md) | 架构复盘：模块边界与耦合点 |
 | [rollback-classification.md](rollback-classification.md) | 回滚分类：哪些改动可回滚、哪些不可 |
 | [rootcause-latency.md](rootcause-latency.md) | 延迟根因分析：从测量到定位 |
+| [走查](walkthrough/) | 场景走查：能力清单 / 素材剧本 / 走查报告 / 坑库（scenario-walkthrough v3） |
 
 ## 边界
 
