@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "1.9.7"
+APP_VERSION = "2.00.1"     # 拓扑显示方案正式版（v2 首个版本；E1–E4 全部落地）
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
