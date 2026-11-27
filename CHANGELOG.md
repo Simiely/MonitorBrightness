@@ -10,7 +10,6 @@
 - 只查链接与入口，**不要求 frontmatter**
 - 10 个相对链接纳入检查
 - **不新增 `requirements.txt`**：本仓是 Python 应用但无依赖声明，只含文档依赖的清单会误导；CI 改为显式安装
-- `docs/` 下三篇分析文档目前没有入口，补链接另行处理
 - 验收：`REPO CHECK: PASS`（ERROR=0）、`KIT LOCK: PASS (v2.7.2, spec=2.1.3)`
 
 ## [1.9.7] - 2026-11-04
