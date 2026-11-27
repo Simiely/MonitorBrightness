@@ -23,7 +23,7 @@
   （按上游口径先手工替换带 BOM 的 `update-repo-kit.ps1`，再跑安装器；
   `schema/taxonomy.json` 的 version 同步，否则 fleet 审计报 skew）
 - **CI**：新增 `tests` job（windows-latest）跑 35 项回归 + Tk 探针 + `skipped` 假绿拦截；
-  观察期 `continue-on-error`，连续 3 次绿后转硬门禁
+  不设 `continue-on-error`（它会让失败的 job 仍报绿，观察期等于盲区）
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层

@@ -41,11 +41,13 @@ jobs:
   # 回归测试必须跑在 Windows：monitor_brightness.py 顶层就 import tkinter 与
   # ctypes.wintypes，ubuntu 上连 import 都过不去。
   #
-  # 观察期：先 continue-on-error（红了不拦合并），连续 3 次绿后改成 false。
+  # 不加 continue-on-error：官方文档写明它「让工作流在 job 失败时仍然通过」，
+  # 等于红了也显示绿，只有点进日志才看得到 —— 观察期是盲的，比没有更糟。
+  # 本仓直推 main、不走 PR，required status check 本来也不生效，
+  # 所以这里让它红就是红。
   tests:
     name: tests / windows
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
