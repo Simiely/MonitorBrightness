@@ -8,8 +8,15 @@ import builtins
 import sys
 
 
+# Python 自动注入的模块级名字不是 builtins 的属性，轻量扫描要单独认。
+_MODULE_DUNDERS = {
+    "__file__", "__name__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__annotations__", "__cached__",
+}
+
+
 def collect(tree):
-    defined = set(dir(builtins))
+    defined = set(dir(builtins)) | _MODULE_DUNDERS
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(node.name)

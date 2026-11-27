@@ -691,6 +691,14 @@ class TaskTest(TempConfigCase):
         self.assertIn("上次 11-04 08:30（成功）", info2["detail"])
         self.assertEqual(info2["next"], "下次 11-04 21:00")
 
+    def test_read_task_xml_reexport(self):
+        """R3-2 把 _read_task_xml 搬进 schedule.py 后，主文件 GUI 仍要能取到它。
+
+        这个回归锁专门防「逐字搬移但漏了再导出」：单测靠 patch_any 能过，
+        但真实点击「启用每日定时」会在 mb._read_task_xml 上 NameError。
+        """
+        self.assertIs(mb._read_task_xml, schedule_mod._read_task_xml)
+
 
 class AddButtonRegression(TempConfigCase):
     """点击「＋ 添加时间段」→ 立即创建弹窗、跑事件循环即可见 → 在弹窗里完成一次添加。

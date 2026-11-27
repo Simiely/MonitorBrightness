@@ -52,13 +52,13 @@ MAIN_IMPORT = '''from schedule import (                              # noqa: E40
     TASK_CATCHUP, TASK_SCHEDULE, TASK_SHORT, _LEGACY_TASKS, _NO_WINDOW, TASKS_DIR,
     _as_ok_errs, _boundary_minutes_all, _boundary_to_minutes, _days_by_min_from_fp,
     _fp_text, _next_run_text, _ps, _ps_quote, _ps_script, _ps_trigger_line,
-    _rebuild_changes, _rebuild_report, _runtime_fields, _same_path, _settings_block,
-    _slot_trigger_fingerprint, _task_action, _task_definition, _task_info_next,
-    _task_result_text, _xml_flag, _xml_trigger_fingerprint, apply_schedule,
-    build_query_script, build_register_script, build_runtime_query_script,
-    build_unregister_script, ensure_task_registration, query_task_runtime,
-    query_task_status, query_task_status_local, register_tasks, task_match_reason,
-    task_signature, task_summary, task_target, unregister_tasks,
+    _read_task_xml, _rebuild_changes, _rebuild_report, _runtime_fields, _same_path,
+    _settings_block, _slot_trigger_fingerprint, _task_action, _task_definition,
+    _task_info_next, _task_result_text, _xml_flag, _xml_trigger_fingerprint,
+    apply_schedule, build_query_script, build_register_script,
+    build_runtime_query_script, build_unregister_script, ensure_task_registration,
+    query_task_runtime, query_task_status, query_task_status_local, register_tasks,
+    task_match_reason, task_signature, task_summary, task_target, unregister_tasks,
 )
 '''
 
