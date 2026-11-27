@@ -67,6 +67,13 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
+# v2.03.0 P3 试点：纯决策函数已搬到 domain/decisions.py（不碰 Tk / Win32）。
+# 这里重新导出，主文件内 19 处 `_short_dev` 引用和测试里的 `mb.xxx` 都不用改。
+from domain.decisions import (                       # noqa: E402
+    _short_dev, ccd_friendly_name, is_vdd_index, plan_model_updates,
+    restore_selection, short_dev,
+)
+
 # Pillow 只有 GUI 需要（抗锯齿圆角贴图）。**必须有守卫**：
 # 缺 Pillow 时 CLI（--set / --apply-schedule / --diag / --selftest）照常工作，
 # GUI 在 main() 里给一句明确报错后退出，不能因为 import 失败把整个程序拖死。
@@ -3362,9 +3369,7 @@ def current_level(cfg=None, now=None):
     return active_slot(_slot_minutes(cfg), _minutes(now))[1]
 
 
-def _short_dev(name):
-    """'\\\\.\\DISPLAY1' / 'DISPLAY1' -> 'display1'（大小写、前缀都归一）。"""
-    return str(name or "").split("\\")[-1].strip().lower()
+# _short_dev 已搬到 domain/decisions.py（v2.03.0 P3），顶部 import 重新导出。
 
 
 def selection_anchors(indices, targets=None):
@@ -6690,18 +6695,6 @@ def auto_relight_minutes(cfg):
         return 0
 
 
-def restore_selection(prev, count):
-    """刷新后界面上要勾哪些屏。
-
-    **启动时全选**（v2.01.10 起）：用户打开程序最常见的目的就是"把所有屏
-    一起调一下"。刷新时（`prev` 非空）保留用户当前的勾选，不打断他。
-    定时任务的目标是另一套解析（`resolve_monitors` 读 monitor_anchors），
-    不受这里影响。
-    """
-    keep = [i for i in (prev or []) if 0 <= i < count]
-    if keep:
-        return keep
-    return list(range(count))
 
 
 def tray_tooltip_text(cfg, last_verdict, title):
@@ -6723,45 +6716,10 @@ def tray_tooltip_text(cfg, last_verdict, title):
     return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (title, brief, nxt, st))[:120]
 
 
-def is_vdd_index(index, monitors, vdd_devs):
-    """这一行是不是虚拟显示器（归串流软件管，不给逐台按钮）。"""
-    if index < 0 or index >= len(monitors or []):
-        return False
-    dev = _short_dev(monitors[index].get("dev"))
-    return bool(vdd_devs and dev in vdd_devs)
 
 
-def ccd_friendly_name(index, monitors, ccd_names):
-    """这块屏在 CCD 里的友好名，查不到返回空串。
-
-    DDC 枚举出来的 `desc` 恒为 "Generic PnP Monitor"（真机实测），拿它当名字
-    会让 VDD 显示成物理屏的通用名。CCD 的 `monitorFriendlyDeviceName` 才是
-    用户看到的 "VDD by MTT" / "R27qe Gen2"。
-    """
-    if index < 0 or index >= len(monitors or []):
-        return ""
-    dev = _short_dev(monitors[index].get("dev"))
-    return (ccd_names or {}).get(dev) or ""
 
 
-def plan_model_updates(models, current, count):
-    """型号缓存里**需要刷到界面上**的行：[(index, name)]。
-
-    跳过：读型号抛出的异常、空名、与现有相同、下标越界。
-    v2.03.0 P2：原逻辑混在 `_apply_models` 里，UI 刷新和判断缠在一起。
-    """
-    if not isinstance(models, dict):
-        return []
-    out = []
-    for i, name in models.items():
-        try:
-            idx = int(i)
-        except Exception:
-            continue
-        if not name or idx < 0 or idx >= count or current.get(idx) == name:
-            continue
-        out.append((idx, name))
-    return sorted(out)
 
 
 class App:
