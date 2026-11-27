@@ -445,9 +445,14 @@ def load_config():
         # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）。
         # v1.9.0 起 key 里带 EDID 短哈希（dev#uid），旧 dev-only 键不再播种：
         # 换面板后不会沿用旧缓存，代价只是首次重新实测一次。
-        for _dev, _caps in (raw.get("caps") or {}).items():
-            if isinstance(_caps, str) and _caps and "#" in str(_dev):
-                _CAPS_CACHE.setdefault(_dev, _caps)
+        # 走查 E2-02：caps 是程序自己写的缓存，但手工编辑/旧版残留可能写成
+        # list/str/int。原来只防 falsy，类型错时 .items() 抛 AttributeError，
+        # 被外层 except 当成"整份配置读坏"→ 用户所有设置回落默认值。
+        _caps_raw = raw.get("caps")
+        if isinstance(_caps_raw, dict):
+            for _dev, _caps in _caps_raw.items():
+                if isinstance(_caps, str) and _caps and "#" in str(_dev):
+                    _CAPS_CACHE.setdefault(_dev, _caps)
         for key in SETTING_BY_KEY:
             if key in raw:
                 cfg[key] = coerce_setting(key, raw[key])
@@ -481,14 +486,38 @@ def _atomic_write_text(path, text):
         raise
 
 
+def _merge_runtime_state(payload):
+    """走查 E1-02：保存前合并磁盘上**更新**的屏幕状态三字段。
+
+    GUI 的 self.cfg 只在启动时 load_config 一次；定时任务（CLI 进程）在 GUI
+    运行期间可能写过 screen_state。整文件覆盖会把 CLI 刚写的状态打回旧值。
+    screen_state_at 是 "MM-DD HH:MM"，字典序即时间序——谁新用谁。
+    刚 mark_screen_state() 的调用方时间戳最新，自然用内存值，不受影响。
+    """
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+        if not isinstance(disk, dict):
+            return
+        disk_at = str(disk.get("screen_state_at") or "")
+        mem_at = str(payload.get("screen_state_at") or "")
+        if disk_at and disk_at > mem_at:
+            for key in ("screen_state", "screen_state_at", "screen_off_tick"):
+                if key in disk:
+                    payload[key] = disk[key]
+    except Exception:
+        pass                      # 读不到磁盘配置时保持内存值，不阻断保存
+
+
 def save_config(cfg):
-    """保存配置：原子写（断电/并发读都不会读到半个文件）。"""
+    """保存配置：原子写 + 屏幕状态字段按磁盘最新值合并（防跨进程回退）。"""
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
         if _CAPS_CACHE:
             payload["caps"] = dict(_CAPS_CACHE)
         payload["version"] = CONFIG_VERSION
+        _merge_runtime_state(payload)
         _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
     except Exception as e:
@@ -2413,7 +2442,10 @@ def apply_schedule(cfg=None):
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
-    if screen in ("off", "on") and ok:
+    # 走查 E1-01：屏幕状态只能由**屏幕动作自己**的成功决定。
+    # 原来用合并后的 ok（亮度成功也算），会出现"亮度写成功但熄屏失败 →
+    # 状态记成 off、任务报成功、屏幕实际亮着"的三重不一致。
+    if screen in ("off", "on") and sok:
         mark_screen_state(cfg, screen)
         if internal:
             save_config(cfg)
@@ -3591,7 +3623,9 @@ def _aa_circle(dia, fill):
     return ph
 
 
-from PIL import Image, ImageDraw, ImageTk  # noqa: E402  （延迟到 Tk 场景可用处）
+# 走查 E2-01：此处曾有第二句模块级 `from PIL import ...`，击穿了文件顶部的
+# PIL_OK 守卫——缺 Pillow 时连 CLI（--set / --apply-schedule）都在 import 阶段
+# 崩掉。图片符号统一由顶部 try/except 提供，缺依赖时 GUI 在 main() 里报错退出。
 
 
 class Card(tk.Canvas):
@@ -4747,7 +4781,15 @@ class App:
         self.monitors = []
         self.mon_info = []
         self.topo_inactive = []           # 拓扑模式下断开的物理屏（GUI 灰显行）
-        self.mon_models = {int(k): v for k, v in self.cfg.get("models", {}).items()}
+        # 走查 E2-03：models 键被 _load_model_cache 统一 str() 存盘，但一个
+        # 手工编辑/旧版残留的非数字键会让 int(k) 抛 ValueError，windowed 下
+        # stderr=None → 用户只看到"程序打不开"。跳过坏键，不拖垮 GUI。
+        self.mon_models = {}
+        for k, v in self.cfg.get("models", {}).items():
+            try:
+                self.mon_models[int(k)] = v
+            except (TypeError, ValueError):
+                continue
         self._read_queue = queue.Queue()
         self._bg_tasks = 0
         self._busy = False
@@ -4756,6 +4798,7 @@ class App:
         self._task_querying = False
         self._hotkeys_on = False
         self._relight_pending = False
+        self._relight_timer = None       # 走查 E1-05：自动复亮 timer 句柄（可取消）
         self._hotkey_tid = None
         self._last_verdict = {"state": self.cfg.get("screen_state", "on"), "detail": ""}
         self.status_var = tk.StringVar(value="就绪")
@@ -5021,6 +5064,18 @@ class App:
         self._poll_read_queue()
 
     def _poll_read_queue(self):
+        # 走查 E1-03：hotkey 分支直接调 screen_on/off → run_bg 内又同步调
+        # _poll_read_queue，每次重入都会多挂一条 after(150)，链数随热键次数
+        # 线性增长且永不回落。用 _polling 护栏保证同时只有一条链。
+        if getattr(self, "_polling", False):
+            return
+        self._polling = True
+        try:
+            self._poll_read_queue_inner()
+        finally:
+            self._polling = False
+
+    def _poll_read_queue_inner(self):
         while True:
             try:
                 kind, payload, _extra = self._read_queue.get_nowait()
@@ -5311,8 +5366,12 @@ class App:
         mins = self._auto_relight_minutes()
         if ok and mins > 0:
             self._relight_pending = True
-            threading.Timer(mins * 60,
-                            lambda: self._read_queue.put(("hotkey", "on", None))).start()
+            # 走查 E1-05：必须持有 timer 句柄，手动点亮/再次熄灭时取消旧的，
+            # 否则残留 timer 会在用户已手动点亮后触发一次"无缘无故的点亮"。
+            self._cancel_relight_timer()
+            self._relight_timer = threading.Timer(
+                mins * 60, lambda: self._read_queue.put(("hotkey", "on", None)))
+            self._relight_timer.start()
         if self.cfg.get("screen_off_method") == "topology":
             # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
             self.refresh_monitors(silent=True)
@@ -5359,10 +5418,21 @@ class App:
         self.run_bg(lambda: screen_wake_entry(self.cfg, targets),
                     self._finish_screen_on, busy=True)
 
+    def _cancel_relight_timer(self):
+        """走查 E1-05：取消尚未触发的自动复亮 timer，并同步轮询标志。"""
+        timer = getattr(self, "_relight_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._relight_timer = None
+        self._relight_pending = False
+
     def _finish_screen_on(self, result):
         ok, errs = _as_ok_errs(result)
         info = take_wake_info()
-        self._relight_pending = False
+        self._cancel_relight_timer()
         if ok:
             mark_screen_state(self.cfg, "on")
             self._remember_selection()
@@ -5400,26 +5470,47 @@ class App:
         if self._hotkeys_on:
             return
         self._hotkeys_on = True
+        # 走查 E2-06：tid 提前到线程启动前写入，避免"开→立刻关"时
+        # _stop_hotkey_listener 看到 None 不发 WM_QUIT、旧线程泄漏。
+        self._hotkey_tid = None
+        ready = threading.Event()
 
         def listener():
             user32 = ctypes.windll.user32
             mods = 0x0001 | 0x0002 | 0x0004 | 0x4000
             ids = {1: ("off", 0x4F), 2: ("on", 0x50)}
+            registered = []
+            self._hotkey_tid = threading.get_ident()
+            ready.set()
             for hid, (_act, vk) in ids.items():
                 if not user32.RegisterHotKey(None, hid, mods, vk):
+                    # 走查 E1-04：第 2 个失败必须回滚第 1 个，
+                    # 否则系统里留下指向已退出线程的全局热键。
+                    for done in registered:
+                        try:
+                            user32.UnregisterHotKey(None, done)
+                        except Exception:
+                            pass
                     self._hotkeys_on = False
+                    self._hotkey_tid = None
                     self._read_queue.put(("hotkey_error",
                                           "热键注册失败（可能被其他程序占用）", None))
                     return
-            self._hotkey_tid = threading.get_ident()
+                registered.append(hid)
             msg = ctypes.wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == 0x0312 and msg.wParam in ids:
                     self._read_queue.put(("hotkey", ids[msg.wParam][0], None))
-            for hid in ids:
-                user32.UnregisterHotKey(None, hid)
+            # E2-06：只注销自己注册的 hid；关→开极快时旧线程的 unregister
+            # 不会误伤新线程刚注册的同一个 hid（系统按 hid 独立持有）。
+            for hid in registered:
+                try:
+                    user32.UnregisterHotKey(None, hid)
+                except Exception:
+                    pass
 
         threading.Thread(target=listener, daemon=True).start()
+        ready.wait(timeout=2)         # 等 tid 就绪，让随后的 stop 能发 WM_QUIT
         self.status_var.set("熄屏热键已启用（Ctrl+Alt+Shift+O / P）")
 
     def _stop_hotkey_listener(self):

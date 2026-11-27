@@ -259,6 +259,7 @@ class BusyQueueTest(TempConfigCase):
         order = []
         fake = type("F", (), {})()
         fake._dispatch_pending_screen = types.MethodType(mb.App._dispatch_pending_screen, fake)
+        fake._poll_read_queue_inner = types.MethodType(mb.App._poll_read_queue_inner, fake)
         fake._read_queue = __import__("queue").Queue()
         fake._bg_tasks = 1
         fake._busy = True
@@ -979,6 +980,103 @@ class TopologyGuiTest(TempConfigCase):
             self.assertEqual(len(buttons), 1)
         finally:
             root.destroy()
+
+
+class WalkthroughRound2Test(TempConfigCase):
+    """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
+
+    def test_schedule_state_uses_screen_action_result_only(self):
+        """E1-01：亮度成功但熄屏失败，不得记成 off。"""
+        cfg = mb.default_config()
+        cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80, "screen": "off"}])
+        marks = []
+        with unittest.mock.patch.object(mb, "active_slot_dict",
+                                        return_value={"level": 80, "screen": "off"}), \
+                unittest.mock.patch.object(mb, "set_brightness_many", return_value=([0], [])), \
+                unittest.mock.patch.object(mb, "screen_off_cfg",
+                                           return_value=([], [(-1, "DDC 写失败")])), \
+                unittest.mock.patch.object(mb, "mark_screen_state",
+                                           side_effect=lambda c, s: marks.append(s)):
+            level, screen, ok, errs = mb.apply_schedule(cfg)
+        self.assertEqual(marks, [])              # 关键：不能记账
+        self.assertEqual(ok, [0])                # 亮度成功仍保留在返回值里
+        self.assertTrue(errs)                    # 屏幕动作错误必须上报
+
+    def test_save_config_merges_newer_disk_state(self):
+        """E1-02：GUI 陈旧内存保存时，磁盘上 CLI 写的新状态不能被覆盖。"""
+        cfg = mb.default_config()
+        ok, _ = mb.save_config(cfg)              # 先写一份基线
+        self.assertTrue(ok)
+        disk = dict(cfg)
+        disk["screen_state"] = "off"
+        disk["screen_state_at"] = "11-27 21:00"
+        disk["screen_off_tick"] = 12345
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(disk, f)
+        stale = dict(cfg)                        # GUI 内存：旧状态
+        stale["tray_enabled"] = False            # 用户刚改的无关设置
+        ok, _ = mb.save_config(stale)
+        with open(mb.CONFIG_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["screen_state"], "off")      # CLI 的新账保住
+        self.assertEqual(saved["screen_off_tick"], 12345)
+        self.assertFalse(saved["tray_enabled"])              # GUI 的改动生效
+
+    def test_save_config_uses_memory_when_memory_is_newer(self):
+        """反向：刚 mark_screen_state 的内存值更新，必须写进磁盘。"""
+        cfg = mb.default_config()
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict(cfg, screen_state="off", screen_state_at="11-27 21:00"), f)
+        cfg["screen_state"] = "on"
+        cfg["screen_state_at"] = "11-27 21:05"
+        mb.save_config(cfg)
+        with open(mb.CONFIG_FILE, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["screen_state"], "on")
+
+    def test_caps_type_error_does_not_wipe_config(self):
+        """E2-02：caps 类型写错不应把整份配置判为读坏。"""
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"caps": ["bad"], "monitors": [1], "enabled": True}, f)
+        cfg = mb.load_config()
+        self.assertEqual(mb.CONFIG_LOAD_ERROR, "")
+        self.assertEqual(cfg["monitors"], [1])   # 设置没被重置
+        self.assertTrue(cfg["enabled"])
+
+    def test_models_bad_key_is_skipped(self):
+        """E2-03：models 非数字键不得让 GUI 构造崩溃。"""
+        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"models": {"abc": "Dell", "1": "OK"}}, f)
+        cfg = mb.load_config()
+        parsed = {}
+        for k, v in cfg.get("models", {}).items():
+            try:
+                parsed[int(k)] = v
+            except (TypeError, ValueError):
+                continue
+        self.assertEqual(parsed, {1: "OK"})
+
+    def test_cancel_relight_timer(self):
+        """E1-05：手动点亮要取消尚未触发的自动复亮 timer。"""
+        fake = type("F", (), {})()
+        timer = unittest.mock.Mock()
+        fake._relight_timer = timer
+        fake._relight_pending = True
+        mb.App._cancel_relight_timer(fake)
+        timer.cancel.assert_called_once()
+        self.assertFalse(fake._relight_pending)
+        self.assertIsNone(fake._relight_timer)
+
+    def test_poll_reentry_guard(self):
+        """E1-03：重复轮询不得重入内层，避免累积 after 链。"""
+        calls = []
+        fake = type("F", (), {})()
+        fake._polling = True
+        fake._poll_read_queue_inner = lambda: calls.append("inner")
+        mb.App._poll_read_queue(fake)
+        self.assertEqual(calls, [])              # 重入被挡住
+        fake._polling = False
+        mb.App._poll_read_queue(fake)
+        self.assertEqual(calls, ["inner"])       # 正常调用放行
 
 
 class WalkthroughFixTest(TempConfigCase):

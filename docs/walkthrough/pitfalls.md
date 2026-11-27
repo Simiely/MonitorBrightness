@@ -42,6 +42,26 @@
 - **预防**：回归测试断言 `App` 不再有 `apply_schedule` 属性。
 - **相关**：`SchedulePanel:4479`、`App.rebuild_schedule_tasks:5653`。
 
+## 第 2 轮探索会话新增（E1/E2 编号）
+
+### E1-01 · 定时记账把亮度成功当屏幕动作成功 ✅ verified
+- **现象**：档位 off 时亮度写成功、熄屏失败 → 状态记 off、任务报成功、屏幕亮着。
+- **原因**：`apply_schedule` 用合并后的 `ok`（含亮度成功）判断记不记账。
+- **解决**：改用 `sok`（屏幕动作自己的成功）；`cli_apply_schedule` 退出码仍反映合并结果。
+- **预防**：回归测试 `test_schedule_state_uses_screen_action_result_only`。
+
+### E1-02 · GUI 陈旧内存覆盖 CLI 新状态 ✅ verified
+- **现象**：GUI 开着的几小时里定时任务写了 `screen_state=off`，用户改个无关设置保存 → 状态被打回 on。
+- **原因**：`self.cfg` 只在启动时 load 一次；`save_config` 整文件覆盖、无版本合并。
+- **解决**：`save_config` 前按 `screen_state_at` 合并磁盘更新的三字段（谁新用谁）。
+- **预防**：双向回归测试（磁盘新用磁盘 / 内存新用内存）。
+
+### E1-03/04/05/06 · 轮询链累积 / 热键泄漏 / Timer 残留 / 快照过期
+- 前三项已修（`_polling` 护栏、注册失败回滚、timer 句柄可取消）；快照过期保留待用户决策。
+
+### E2-01/02/03 · 缺 Pillow CLI 崩 / caps 类型错丢配置 / models 坏键 GUI 崩 ✅ verified
+- 均为"容错边界"类：模块级冗余 import 删除、类型守卫、跳过坏键。三项都有回归测试。
+
 ## 根因沉淀（写给未来的自己）
 
 这 5 个坑的共同根因是**同一职责多处写入**：定时开关 6 入口、屏幕状态 5 源、回调重名。

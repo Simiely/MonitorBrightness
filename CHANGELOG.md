@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · 场景走查第 2 轮（探索会话 + 收敛）
+
+- 2 个 SBTM 探索会话（状态残留 / 少用入口）发现 16 项，新增 7 项回归测试 → **76 tests OK**。
+- **2 个🔴已修复**：
+  - E1-01 定时"亮度成功但熄屏失败"仍记 off/报成功 → 记账改用屏幕动作自己的 `sok`；
+  - E1-02 GUI 陈旧内存整文件覆盖 CLI 刚写的屏幕状态 → `save_config` 按时间戳合并磁盘新值。
+- 另修 5 项🟡：轮询链重入护栏、热键注册失败回滚、自动复亮 Timer 可取消、
+  缺 Pillow 时 CLI 启动崩溃、caps 类型错误丢整份配置、models 坏键让 GUI 崩溃、热键 stop/restart 竞态。
+- **保留 4 项需用户决策**（交互/CLI 语义/低风险）：拓扑快照过期、`load_config` 读中写盘、
+  `--force` 在 disabled 被忽略、`ddc_allow_undeclared` 单向阀门。详见 `docs/walkthrough/report.md`。
+- 验收：76 tests OK、REPO CHECK PASS。
+
 ### 2026-11-27 · 场景走查第 1 轮（scenario-walkthrough v3）
 
 - 按仓库 `workbuddy-skills` 的走查方法，产出 `docs/walkthrough/`：
