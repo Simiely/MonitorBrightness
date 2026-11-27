@@ -22,3 +22,8 @@ dist_v*/
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# 运行期日志（v2.01.5 起写在程序同目录，源码运行时就落在仓库根）
+*.log
+*.log.1
+MonitorBrightness_诊断包_*.zip
