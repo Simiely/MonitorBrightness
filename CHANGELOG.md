@@ -3,7 +3,30 @@
 本文件记录项目所有值得注意的变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased] · 2026-11-17
+## [Unreleased]
+
+### 2026-11-27 · 按单项目规范 2.1.5 整理文档维护
+
+- **文档拆分（阈值触发，先复制后删）**
+  - `README.md` 264 → 118 行：余下内容进 `docs/使用指南.md`（定时机制 / 完整 CLI /
+    完整 FAQ / 备选方案），主文件只留 环境要求 · 快速开始 · 高频 FAQ 4 条 · 文档索引
+  - `DEVELOPMENT.md` 367 → 60 行：架构细节进 `docs/架构.md`，
+    13 个历史问题拆成 `docs/问题记录/`（一坑一篇，模板与 knowledge-base 一致）
+  - 新增 `docs/index.md` 作为文档总索引
+- **修文档失真**（`REPO CHECK` 查不出这类问题）
+  - 架构图里的 `monitorcontrol`（v1.7.0 起已直连 dxva2）、`apply_slot()` /
+    `catch_up_decision()`（v1.9.4 已删）、6 个不存在的函数名
+  - 坑位条数「15 / 16 条」→ 实际 **60 条**
+  - 删掉「`docs/` 下三篇分析文档目前没有入口」—— README 早已链上
+- `AGENTS.md` 新增「边界」节：声明 link-only 只查链接 / 锚点，语义正确性靠人审
+- **机器层**：repo-kit 2.7.2 → **2.9.1**，spec 2.1.3 → **2.1.5**
+  （按上游口径先手工替换带 BOM 的 `update-repo-kit.ps1`，再跑安装器；
+  `schema/taxonomy.json` 的 version 同步，否则 fleet 审计报 skew）
+- **CI**：新增 `tests` job（windows-latest）跑 35 项回归 + Tk 探针 + `skipped` 假绿拦截；
+  观察期 `continue-on-error`，连续 3 次绿后转硬门禁
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
+
+### 2026-11-17 · 接入单项目规范机器层
 
 - 接入 knowledge-base 的**单项目规范**（spec 2.1.3 / repo-kit 2.7.2，profile `link-only`）
 - 新增 `schema/taxonomy.json`、`tools/repo-kit/`、`tools/update-repo-kit.ps1`、`schema/kit.lock.json` 与 CI
