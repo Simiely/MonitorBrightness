@@ -8,6 +8,7 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import cli as cli_mod
 import contextlib
 import ctypes
 import glob
@@ -43,7 +44,7 @@ import service as svc_mod
 # mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
 _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
-                  schedule_mod, sched_report_mod)
+                  schedule_mod, sched_report_mod, cli_mod)
 
 
 _UNSET = object()
