@@ -527,7 +527,9 @@ class SettingsSheet(Sheet):
                          command=lambda i: app.apply_off_method(OFF_METHODS[i]))
         mode.pack(fill="x", pady=(5, 0))
         tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
+        self._build_off_behavior(off, app, cfg)
 
+    def _build_off_behavior(self, off, app, cfg):
         def _relight(p):
             spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
             spin.set(cfg.get("screen_auto_relight_min", 0))
