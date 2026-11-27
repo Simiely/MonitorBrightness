@@ -143,7 +143,7 @@ def main():
     print("③ 补齐后 modes：%d → %d 条，sourceModeIdx=%s"
           % (sim_mc, cur_mc, plan[0]["sourceModeIdx"]))
     sm = cur_modes[plan[0]["sourceModeIdx"]].sourceMode
-    print("   合成内容：%dx%d pf=%d pos=(%d,%d)"
+    print("   合成内容：%dx%d pf=%d pos=(%d,%d)  ← 没记位置：落在桌面最右边"
           % (sm.width, sm.height, sm.pixelFormat, sm.position.x, sm.position.y))
 
     done = mb._ccd_apply_plan_on(sim_paths, plan)
@@ -157,12 +157,41 @@ def main():
                                & ~(mb._SDC_APPLY | mb._SDC_SAVE_TO_DATABASE))
     print("   rc=%d %s" % (rc2, _ERR.get(rc2, "")))
 
+    # ---- ⑥ 带上"断开前的位置"，看会不会摆回原处 ----
+    # 真实的 topology_off 会在断开前把位置写进 cfg["monitor_positions"]，
+    # 这里用**当前**位置当那份记录（它就是断开前那一刻的值）。
+    print("\n⑥ 再算一次：这次带着「断开前的位置」")
+    want = mb._ccd_capture_positions([victim["anchor"]], paths, modes, mc, rows)
+    print("   记录到的位置：%s" % want)
+    plan2, _e2, _n2 = mb.topology_plan_on(
+        [victim["anchor"]], sim_rows, mb._ccd_mode_entries(sim_modes, sim_mc))
+    sim2 = clone_paths(sim_paths, pc)          # 还没被 ④ 改过
+    p2 = sim2[p_idx]
+    p2.flags &= ~mb._CCD_PATH_ACTIVE
+    p2.sourceInfo.modeInfoIdx = mb._CCD_MODE_IDX_INVALID
+    p2.targetInfo.modeInfoIdx = mb._CCD_MODE_IDX_INVALID
+    cur2, cur2_mc = mb._ccd_fill_missing_source_modes(
+        u32, sim2, sim_modes, sim_mc, sim_rows, plan2, want=want)
+    sm2 = cur2[plan2[0]["sourceModeIdx"]].sourceMode
+    got = (int(sm2.position.x), int(sm2.position.y))
+    exp = (want.get(victim["anchor"]) or [None, None])[:2]
+    print("   合成位置：%s   期望（原位置）：%s  %s"
+          % (got, tuple(exp), "✅ 一致" if got == tuple(exp) else "❌ 不一致"))
+    mb._ccd_apply_plan_on(sim2, plan2)
+    rc3 = u32.SetDisplayConfig(pc, ctypes.byref(clone_paths(sim2, pc)),
+                               cur2_mc, ctypes.byref(cur2),
+                               (mb._CCD_APPLY_FLAGS | _SDC_VALIDATE)
+                               & ~(mb._SDC_APPLY | mb._SDC_SAVE_TO_DATABASE))
+    print("   校验 rc=%d %s（摆回原位也要 Windows 认）" % (rc3, _ERR.get(rc3, "")))
+
     print("\n结论")
-    if rc2 == 0:
-        print("  ✅ 物理屏断开后接回的提交形态，Windows 认。"
-              "（本次只用 SDC_VALIDATE，桌面一个像素都没动）")
+    pos_ok = got == tuple(exp)
+    if rc2 == 0 and rc3 == 0 and pos_ok:
+        print("  ✅ 物理屏断开后接回的提交形态，Windows 认；并且位置能摆回原处。"
+              "（全程 SDC_VALIDATE，桌面一个像素都没动）")
         return 0
-    print("  ❌ 还被拒。需要看是哪一步：对照上面 ①~④ 的中间值。")
+    print("  ❌ 有问题：断开=%d 接回=%d 带位置接回=%d 位置一致=%s"
+          % (rc, rc2, rc3, pos_ok))
     return 1
 
 

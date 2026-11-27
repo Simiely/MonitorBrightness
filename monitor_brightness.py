@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.2"     # 接回时现造 source mode；修回滚快照的堆越界
+APP_VERSION = "2.01.3"     # 接回摆回原位；每行独立的熄灭/显示按钮
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
@@ -191,6 +191,12 @@ SETTINGS = (
     # 拓扑模式的显示器锚点（显卡 LUID + EDID mfr/prod + connectorInstance）。
     # E1 只读层先声明；E2 才做旧 monitors/monitor_ids 的迁移。
     {"key": "monitor_anchors", "kind": "anchors", "default": []},
+    # 每块屏"断开那一刻"的桌面位置与尺寸，只为接回时摆回原位。
+    # **这不是状态账**：它记的是摆放偏好，而且每次断开前都按当下的真实值
+    # 重写一遍 —— 用户在 Windows 里挪过屏，这里就跟着变，不会与现实脱节。
+    # 断开之后这个信息就再也读不到了（Windows 会把该屏的 mode 项摘掉），
+    # 所以只能在断开前抓一次。
+    {"key": "monitor_positions", "kind": "positions", "default": {}},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 6
@@ -234,7 +240,29 @@ def coerce_setting(key, value):
             if len(out) >= 32:
                 break
         return out
+    if kind == "positions":
+        return _coerce_positions(value)
     return normalize_indices(value)
+
+
+def _coerce_positions(value):
+    """{锚点: [x, y, w, h]}；坏项直接丢掉，不让一个坏值毁掉整份配置。"""
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for k, v in value.items():
+        if not isinstance(v, (list, tuple)) or len(v) != 4:
+            continue
+        try:
+            nums = [int(round(float(n))) for n in v]
+        except Exception:
+            continue
+        if nums[2] <= 0 or nums[3] <= 0:      # 宽高必须为正
+            continue
+        out[str(k)] = nums
+        if len(out) >= 16:                    # 换过的屏会留下旧锚点，封个顶
+            break
+    return out
 
 
 def _coerce_levels(value, fallback):
@@ -1716,13 +1744,9 @@ def _ccd_live_size(rows, paths, modes):
     return 1920, 1080
 
 
-def _ccd_free_origin(rows, paths, modes):
-    """当前桌面最右边的 x —— 新接回的屏放这里。
-
-    **不是"顺手放右边"，是必需**：把新屏放在 (0,0) 和现有屏重叠，实测
-    `SetDisplayConfig` 直接 rc=87。所以位置必须自己算，而且必须不重叠。
-    """
-    right = 0
+def _ccd_layout_rects(rows, paths, modes):
+    """当前桌面上每块活动屏的 (x, y, w, h)。"""
+    out = []
     for r in rows or []:
         if not (r.get("active") and r.get("connected")):
             continue
@@ -1733,8 +1757,34 @@ def _ccd_free_origin(rows, paths, modes):
         if src >= len(modes):
             continue
         sm = modes[src].sourceMode
-        right = max(right, int(sm.position.x) + int(sm.width))
-    return right
+        if sm.width and sm.height:
+            out.append((int(sm.position.x), int(sm.position.y),
+                        int(sm.width), int(sm.height)))
+    return out
+
+
+def _ccd_free_origin(rows, paths, modes):
+    """当前桌面最右边的 x —— 接回时"没记住原位置"的兜底落点。"""
+    rects = _ccd_layout_rects(rows, paths, modes)
+    return max([r[0] + r[2] for r in rects] or [0])
+
+
+def _ccd_place(want_xy, w, h, rects):
+    """给一块要接回的屏决定桌面位置：优先摆回**原位置**，重叠才退回最右边。
+
+    **重叠必须避免**：实测把新屏放在 (0,0) 与主屏重叠，`SetDisplayConfig`
+    直接 rc=87，接不回来。所以"摆回原位"和"不重叠"冲突时，宁可换位置。
+
+    原位置来自 `cfg["monitor_positions"]`（断开前抓的一次快照），没有就用
+    桌面最右边 —— 与 Windows 自己点「扩展这些显示器」的行为一致。
+    """
+    if want_xy is not None:
+        x, y = int(want_xy[0]), int(want_xy[1])
+        clash = any(x < rx + rw and rx < x + w and y < ry + rh and ry < y + h
+                    for rx, ry, rw, rh in rects)
+        if not clash:
+            return x, y
+    return max([rx + rw for rx, _ry, rw, _rh in rects] or [0]), 0
 
 
 def _ccd_append_source_mode(modes, mc, adapter_low, adapter_high, source_id,
@@ -1771,35 +1821,69 @@ def _ccd_append_source_mode(modes, mc, adapter_low, adapter_high, source_id,
     return out, i
 
 
-def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan):
+def _ccd_capture_positions(anchors, paths, modes, mc, rows):
+    """记下这些屏**此刻**的桌面位置与尺寸，供下次接回摆回原位。
+
+    只在"断开之前"调用 —— 断开之后 Windows 会把该屏的 mode 项摘掉，
+    位置就再也读不到了。
+
+    为什么这不是"状态账"：它存的是摆放偏好，且每次断开前都按当下的真实值
+    重写。用户在 Windows 里把屏挪到左边，这里下一次就变成左边，不会像
+    "上次操作结果"那样越用越离谱。
+    """
+    want = set(anchors or [])
+    out = {}
+    for r in rows or []:
+        if r.get("anchor") not in want or not r.get("active") or r.get("vdd"):
+            continue
+        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
+        if idx == _CCD_MODE_IDX_INVALID:
+            continue
+        src = (idx >> 16) & 0xFFFF
+        if src >= int(mc or 0) or src >= len(modes):
+            continue
+        sm = modes[src].sourceMode
+        if not (sm.width and sm.height):
+            continue
+        out[r["anchor"]] = [int(sm.position.x), int(sm.position.y),
+                            int(sm.width), int(sm.height)]
+    return out
+
+
+def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan, want=None):
     """给 plan 里 source mode 已缺失的项**现造**一条补进 modes 数组。
 
     真实断开后这是常态而非异常（Windows 会把断开屏的 SOURCE mode 从 modes
     数组里摘掉），所以不能报错，只能自己补。返回 (新 modes 数组, 新计数)。
 
-    尺寸：该屏的首选分辨率，查不到就抄一块正在用的屏；
-    位置：桌面最右边，多块时依次往右排（重叠会被 Windows 拒，见
-    `_ccd_append_source_mode` 的实测矩阵）。
+    尺寸：`want` 里记着就照记着的（保真），否则问首选分辨率，再不行抄一块
+    正在用的屏；
+    位置：`want` 里记着就摆回原位（不与现有屏重叠的前提下），否则桌面最右边。
     """
     need = [it for it in plan if it.get("makeSourceMode")]
     if not need:
         return modes, mc
-    x = _ccd_free_origin(rows, paths, modes)
+    want = want or {}
+    rects = _ccd_layout_rects(rows, paths, modes)
     for it in need:
-        size = (_ccd_preferred_size(u32, it["tgtAdapterLow"],
-                                    it["tgtAdapterHigh"], it["tgtId"])
-                or _ccd_live_size(rows, paths, modes))
-        w, h = size
+        saved = want.get(it["anchor"])
+        if saved and len(saved) == 4:
+            w, h = int(saved[2]), int(saved[3])
+        else:
+            w, h = (_ccd_preferred_size(u32, it["tgtAdapterLow"],
+                                        it["tgtAdapterHigh"], it["tgtId"])
+                    or _ccd_live_size(rows, paths, modes))
+        x, y = _ccd_place(saved[:2] if saved else None, w, h, rects)
+        rects.append((x, y, w, h))
         modes, idx = _ccd_append_source_mode(
-            modes, mc, it["luidLow"], it["luidHigh"], it["srcId"], w, h, x, 0)
+            modes, mc, it["luidLow"], it["luidHigh"], it["srcId"], w, h, x, y)
         mc += 1
-        x += w
         it["sourceModeIdx"] = idx
         it["makeSourceMode"] = False
         _write_event_log(
             "拓扑接回：%s 的 source mode 已不在 modes 数组里"
-            "（断开后被 Windows 摘掉），现造一条 %dx%d 补在第 %d 位"
-            % (it["anchor"], w, h, idx))
+            "（断开后被 Windows 摘掉），现造一条 %dx%d 放在 (%d,%d) 补在第 %d 位"
+            % (it["anchor"], w, h, x, y, idx))
     return modes, mc
 
 
@@ -1835,8 +1919,12 @@ def _ccd_apply_plan_on(paths, plan):
     return done
 
 
-def topology_off(indices):
+def topology_off(indices, cfg=None):
     """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
+
+    `cfg` 给了就把这些屏**此刻**的桌面位置写进 `monitor_positions`，供下次
+    接回摆回原位（断开之后这个信息就读不到了）。这是摆放偏好而非状态账：
+    每次断开前都按当下真实值重写。
 
     返回 (成功下标列表, [(下标, 错误), ...])，与 screen_off_many 同形状。
     """
@@ -1865,6 +1953,16 @@ def topology_off(indices):
     # v2.01.0 起不再落盘：快照一旦落盘就会被当成"状态"，接回时恢复旧快照
     # 会把用户其后在 Windows 设置里做的改动一起覆盖掉（设计纠偏，见 topology_plan_on）。
     snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
+
+    # 断开之后 Windows 会把这块屏的 mode 项摘掉，位置就再也读不到了，
+    # 所以趁现在把"它此刻摆在哪"记下来，接回时才能摆回原位。
+    if cfg is not None:
+        pos = _ccd_capture_positions(anchors, paths, modes, mc, raw_rows)
+        if pos:
+            merged = dict(cfg.get("monitor_positions") or {})
+            merged.update(pos)
+            cfg["monitor_positions"] = _coerce_positions(merged)
+            save_config(cfg)
 
     for i in range(len(paths)):
         info = next((x for x in raw_rows if x["pathIndex"] == i), None)
@@ -1979,7 +2077,7 @@ def _ccd_query_raw_rows():
     return list(raw[4]) if raw else []
 
 
-def topology_on(anchors):
+def topology_on(anchors, cfg=None):
     """拓扑接回：把 anchors 里的屏加回**当前**拓扑（声明式，无历史快照）。
 
     步骤：现读拓扑 → 现算要动哪几条 path / 哪个 mode → 提交 → 有界回读。
@@ -2034,8 +2132,11 @@ def topology_on(anchors):
                 item["targetModeIdx"] = item["desktopModeIdx"] = None
         # 真实断开后 Windows 会把这块屏的 SOURCE mode 从 modes 数组里摘掉，
         # 空手引用必然 rc=87；这里现造一条补进数组末尾。
+        # 位置优先摆回"断开前那一刻"的原位（cfg.monitor_positions），
+        # 没记过、或会和现有屏重叠，才退回桌面最右边。
         cur_modes, cur_mc = _ccd_fill_missing_source_modes(
-            u32, paths, modes, mc, raw_rows, plan)
+            u32, paths, modes, mc, raw_rows, plan,
+            want=(cfg or {}).get("monitor_positions"))
         restored = _ccd_apply_plan_on(paths, plan)
         rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
         if rc == 0:
@@ -2316,7 +2417,7 @@ def screen_off_cfg(cfg, indices):
     if cfg.get("screen_off_method") == "ddc":
         return screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
     if cfg.get("screen_off_method") == "topology":
-        return topology_off(indices)
+        return topology_off(indices, cfg)
     if not screen_off_system():
         return [], [(-1, "系统级熄灭下发失败")]
     return _system_ok_targets(indices), []
@@ -2328,7 +2429,7 @@ def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
         return screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
     if cfg.get("screen_off_method") == "topology":
         want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
-        ok, errs, restored = topology_on(want)
+        ok, errs, restored = topology_on(want, cfg)
         if errs:
             return ok, errs
         # 断开的屏在接回后才回到 EnumDisplayMonitors；用「接回后」的下标写亮度，
@@ -4486,6 +4587,7 @@ class MonitorPanel:
         self.inner = card.inner
         self.mon_vars = {}
         self.mon_rows = {}
+        self.mon_text = {}
         self._suspend = False
         self._empty = Label(self.inner, "（未检测到支持 DDC/CI 的显示器）",
                             size=8, color=UI["text3"])
@@ -4508,6 +4610,7 @@ class MonitorPanel:
             for w in self.inner.winfo_children():
                 w.destroy()
             self.mon_vars, self.mon_rows = {}, {}
+            self.mon_text = {}
             if not self.app.monitors:
                 Label(self.inner, "（未检测到支持 DDC/CI 的显示器）",
                       size=8, color=UI["text3"]).pack(anchor="w", pady=4)
@@ -4520,8 +4623,12 @@ class MonitorPanel:
                 self.mon_vars[i] = var
                 chk = ttk.Checkbutton(row, variable=var, text="")
                 chk.pack(side="left", padx=(0, 8), pady=7)
+                # 逐台按钮先于文本 pack：文本是 expand 的，后 pack 的侧边控件
+                # 在窄窗口里会被挤掉。顺序：勾选 / 按钮(右) / 文本(左,撑满)。
+                btns = self._row_buttons(row, i)
                 txt = tk.Frame(row, bg=UI["card"])
                 txt.pack(side="left", fill="x", expand=True)
+                self.mon_text[i] = txt
                 info = self.app.mon_info[i] if i < len(self.app.mon_info) else None
                 model = self.app.mon_models.get(i)
                 Label(txt, model or ("显示器 %d" % i), size=9, bg=UI["card"]).pack(anchor="w")
@@ -4532,35 +4639,61 @@ class MonitorPanel:
                 Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
                 self.mon_rows[i] = row
             # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置 →
-            # 屏幕，那里连虚拟显示器都会画出来）。物理屏给「启用」按钮；
+            # 屏幕，那里连虚拟显示器都会画出来）。物理屏给「显示」按钮；
             # VDD 只显示不给按钮——它归串流软件管，本程序断/接它没有意义。
             for extra in (getattr(self.app, "topo_inactive", None) or []):
                 row = tk.Frame(self.inner, bg=UI["card"])
                 row.pack(fill="x")
                 tk.Frame(row, bg=UI["fill_off"], width=3).pack(
                     side="left", fill="y", padx=(6, 0), pady=7)
+                is_vdd = bool(extra.get("vdd"))
+                if not is_vdd:
+                    Button(row, "显示",
+                           lambda a=extra["anchor"]: self.app.topology_enable(a),
+                           kind="link", height=18, pad_bg=UI["card"],
+                           font_size=8).pack(side="right", padx=(0, 8))
                 txt = tk.Frame(row, bg=UI["card"])
                 txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
-                is_vdd = bool(extra.get("vdd"))
                 Label(txt, extra.get("friendly") or "断开的显示器",
                       size=9, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
                 Label(txt, ("虚拟显示器 · 由串流软件管理，本程序不启用也不断开"
                             if is_vdd else
-                            "已断开 · 设备仍连接（点「启用」接回）"),
+                            "已断开 · 设备仍连接（点「显示」接回，位置会回到原处）"),
                       size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
-                if not is_vdd:
-                    Button(row, "启用",
-                           lambda a=extra["anchor"]: self.app.topology_enable(a),
-                           kind="link", height=18, pad_bg=UI["card"],
-                           font_size=8).pack(side="right", padx=(0, 8))
         finally:
             self._suspend = False
 
+    def _row_buttons(self, row, index):
+        """给一行活动显示器装「熄灭 / 显示」。返回容器或 None。
+
+        系统级熄灭是**整组广播**，没有"只关一块"这回事 —— 那种模式下
+        一个按钮都不放，免得点了没反应还以为是程序坏了。
+        """
+        method = self.app.cfg.get("screen_off_method")
+        if method not in ("ddc", "topology"):
+            return None
+        box = tk.Frame(row, bg=UI["card"])
+        box.pack(side="right", padx=(6, 10))
+        # 拓扑模式断不开主屏（Windows 不让移除主屏），那一行就不给「熄灭」
+        primary = bool(self.app.mon_info[index][3]) if index < len(self.app.mon_info) else False
+        off_btn = None
+        if not (method == "topology" and primary):
+            off_btn = Button(box, "熄灭", lambda i=index: self.app.monitor_off(i),
+                             kind="link", height=18, pad_bg=UI["card"], font_size=8)
+        on_btn = Button(box, "显示", lambda i=index: self.app.monitor_on(i),
+                        kind="link", height=18, pad_bg=UI["card"], font_size=8)
+        # 先 pack 的在最右边：于是视觉上是「熄灭」「显示」，控件顺序也是这个序
+        on_btn.pack(side="right")
+        if off_btn is not None:
+            off_btn.pack(side="right", padx=(0, 4))
+        return box
+
     def set_row_text(self, i, text):
-        row = self.mon_rows.get(i)
-        if row is None:
+        # 行里现在有「勾选 / 按钮 / 文本」三段，不能再按下标猜 —— 直接记住文本容器
+        txt = self.mon_text.get(i)
+        if txt is None:
             return
-        labels = [w for w in row.winfo_children()[1].winfo_children()]
+        labels = txt.winfo_children()
         if labels:
             labels[0].config(text=text)
 
@@ -5016,9 +5149,11 @@ class SettingsSheet(Sheet):
                          index=OFF_METHODS.index(cfg.get("screen_off_method", "system")),
                          command=lambda i: app.apply_off_method(OFF_METHODS[i]))
         mode.pack(fill="x", pady=(6, 0))
-        Label(wrap, "系统级：整组熄灭、一定唤得回，但键鼠会点亮。\n"
+        Label(wrap, "系统级：整组熄灭、一定唤得回，但键鼠会点亮。"
+                    "这种模式没有逐台按钮（本来就是整组广播）。\n"
                     "单屏待机：键鼠不点亮（远程防窥用），个别面板唤不回。\n"
-                    "拓扑断开：把选中的副屏从桌面移除（串流用），主屏不动。",
+                    "拓扑断开：把选中的副屏从桌面移除（串流用），主屏不动；"
+                    "接回时会摆回原位置。",
               size=8, color=UI["text3"], bg=pbg, justify="left").pack(anchor="w", pady=(6, 0))
         tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
 
@@ -5117,6 +5252,7 @@ class App:
         self.monitors = []
         self.mon_info = []
         self.topo_inactive = []           # 拓扑模式下断开的物理屏（GUI 灰显行）
+        self._row_action = False          # 本次动作来自行内逐台按钮（不改勾选）
         # 走查 E2-03：models 键被 _load_model_cache 统一 str() 存盘，但一个
         # 手工编辑/旧版残留的非数字键会让 int(k) 抛 ValueError，windowed 下
         # stderr=None → 用户只看到"程序打不开"。跳过坏键，不拖垮 GUI。
@@ -5644,6 +5780,52 @@ class App:
         self.cfg["monitor_anchors"] = selection_anchors(idx)
 
     # ---------- 熄屏 / 点亮 ----------
+    def _row_action_blocker(self):
+        """逐台按钮能不能用？不能用就返回一句原因。"""
+        method = self.cfg.get("screen_off_method")
+        if method not in ("ddc", "topology"):
+            return "「系统级」熄灭是整组广播，不能只动一块；改成「DDC」或「拓扑」才有逐台按钮"
+        if self._busy:
+            return "正在处理上一个操作，请稍候"
+        return ""
+
+    def monitor_off(self, index):
+        """行内「熄灭」：只熄灭这一块，不动别的。"""
+        why = self._row_action_blocker()
+        if why:
+            self.status_var.set(why)
+            return
+        if (self.cfg.get("screen_off_method") == "topology"
+                and index < len(self.mon_info) and self.mon_info[index][3]):
+            # Windows 不允许把主屏从拓扑里移除（实测 rc=87），提前说清楚
+            self.status_var.set("拓扑模式不能断开主屏（Windows 限制）；要关主屏请改用「DDC」")
+            return
+        self._busy_action = "off"
+        self._row_action = True
+        self.status_var.set("正在熄灭显示器 %d…" % index)
+        self.run_bg(lambda: screen_off_cfg(self.cfg, [index]),
+                    self._finish_screen_off, busy=True)
+
+    def monitor_on(self, index):
+        """行内「显示」：只点亮这一块。"""
+        why = self._row_action_blocker()
+        if why:
+            self.status_var.set(why)
+            return
+        method = self.cfg.get("screen_off_method")
+        if method == "topology":
+            anchors = selection_anchors([index])
+            if not anchors:
+                self.status_var.set("拿不到这块屏的锚点，无法单独接回")
+                return
+            job = lambda: screen_on_cfg(self.cfg, [index], anchors=anchors)
+        else:
+            job = lambda: screen_wake_entry(self.cfg, [index])
+        self._busy_action = "on"
+        self._row_action = True
+        self.status_var.set("正在点亮显示器 %d…" % index)
+        self.run_bg(job, self._finish_screen_on, busy=True)
+
     def _queue_screen_action(self, action):
         """忙时点击/热键：给可见反馈，并记下最后一次请求，结束后补执行一次。
 
@@ -5690,10 +5872,13 @@ class App:
                     self._finish_screen_off, busy=True)
 
     def _finish_screen_off(self, result):
+        row_action, self._row_action = getattr(self, "_row_action", False), False
         ok, errs = _as_ok_errs(result)
         if ok:
-            self._remember_selection()
-            save_config(self.cfg)
+            # 行内逐台操作不碰"勾选"：用户点的是这一行，不是改选择
+            if not row_action:
+                self._remember_selection()
+            save_config(self.cfg)          # 拓扑断开时顺手记下了原位置
             self.status_var.set("已熄灭显示器")
             self.status_card.render(self._status_payload(
                 "off", "键鼠输入不会点亮它；点「点亮屏幕」恢复"))
@@ -5766,11 +5951,13 @@ class App:
         self._relight_pending = False
 
     def _finish_screen_on(self, result):
+        row_action, self._row_action = getattr(self, "_row_action", False), False
         ok, errs = _as_ok_errs(result)
         info = take_wake_info()
         self._cancel_relight_timer()
         if ok:
-            self._remember_selection()
+            if not row_action:
+                self._remember_selection()
             save_config(self.cfg)
             self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
             self.status_card.render(self._status_payload("on", "亮度与定时均正常"))

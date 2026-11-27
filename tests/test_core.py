@@ -1024,6 +1024,7 @@ class TopologyGuiTest(TempConfigCase):
                 read_current=lambda: None,
                 on_monitor_toggle=lambda: None,
                 select_none=lambda: None, select_all=lambda: None,
+                monitor_off=lambda i: None, monitor_on=lambda i: None,
                 topology_enable=lambda anchor: None)
             panel = mb.MonitorPanel(fake)
             fake.mon_panel = panel
@@ -1042,12 +1043,89 @@ class TopologyGuiTest(TempConfigCase):
             # 第三块屏（虚拟显示器）也要出现在列表里
             self.assertTrue(any("VDD by MTT" in t for t in texts), texts)
             self.assertTrue(any("虚拟显示器" in t for t in texts), texts)
-            buttons = [w for row in panel.inner.winfo_children()
-                       for w in row.winfo_children()
-                       if getattr(w, "_text", None) == "启用"]
-            self.assertEqual(len(buttons), 1, "只有物理屏给「启用」，虚拟屏不给")
+            btns = [_row_button_texts(row) for row in panel.inner.winfo_children()]
+            # 活动行给「熄灭/显示」，断开的物理屏给「显示」，虚拟屏什么都不给
+            self.assertEqual(btns[0], ["熄灭", "显示"], btns)
+            self.assertEqual(btns[1], ["显示"], btns)
+            self.assertEqual(btns[2], [], btns)
         finally:
             root.destroy()
+
+    def test_panel_hides_row_buttons_for_group_wide_method(self):
+        """系统级熄灭是整组广播：一个逐台按钮都不该有，免得点了没反应。"""
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            cfg = mb.default_config()
+            cfg["screen_off_method"] = "system"
+            fake = types.SimpleNamespace(
+                body=tk.Frame(root), cfg=cfg,
+                monitors=[{"index": 0, "dev": "DISPLAY1"}],
+                mon_info=[("DISPLAY1", 2560, 1440, True)], mon_models={},
+                topo_inactive=[], refresh_monitors=lambda silent=False: None,
+                read_current=lambda: None, on_monitor_toggle=lambda: None,
+                select_none=lambda: None, select_all=lambda: None,
+                monitor_off=lambda i: None, monitor_on=lambda i: None,
+                topology_enable=lambda anchor: None)
+            panel = mb.MonitorPanel(fake)
+            fake.mon_panel = panel
+            panel.rebuild([])
+            got = [_row_button_texts(row)
+                   for row in panel.inner.winfo_children()]
+            self.assertNotIn("熄灭", got)
+            self.assertNotIn("显示", got)
+        finally:
+            root.destroy()
+
+    def test_primary_row_has_no_off_button_in_topology_mode(self):
+        """拓扑模式断不开主屏（Windows 不让移除），那一行就不给「熄灭」。"""
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            cfg = mb.default_config()
+            cfg["screen_off_method"] = "topology"
+            fake = types.SimpleNamespace(
+                body=tk.Frame(root), cfg=cfg,
+                monitors=[{"index": 0, "dev": "DISPLAY1"},
+                          {"index": 1, "dev": "DISPLAY2"}],
+                mon_info=[("DISPLAY1", 2560, 1440, True),
+                          ("DISPLAY2", 2560, 1440, False)], mon_models={},
+                topo_inactive=[], refresh_monitors=lambda silent=False: None,
+                read_current=lambda: None, on_monitor_toggle=lambda: None,
+                select_none=lambda: None, select_all=lambda: None,
+                monitor_off=lambda i: None, monitor_on=lambda i: None,
+                topology_enable=lambda anchor: None)
+            panel = mb.MonitorPanel(fake)
+            fake.mon_panel = panel
+            panel.rebuild([])
+            rows = [_row_button_texts(row)
+                    for row in panel.inner.winfo_children()]
+            self.assertNotIn("熄灭", rows[0])        # 主屏
+            self.assertIn("熄灭", rows[1])           # 副屏
+        finally:
+            root.destroy()
+
+
+def _row_button_texts(row):
+    """递归取一行里「熄灭 / 显示」按钮的文字，按出现顺序。
+
+    按钮包在一个 box 里，不是行的直接子控件 —— 别按下标猜。
+    """
+    out, queue = [], list(row.winfo_children())
+    while queue:
+        w = queue.pop(0)
+        if getattr(w, "_text", None) in ("熄灭", "显示"):
+            out.append(w._text)
+        queue.extend(w.winfo_children())
+    return out
 
 
 class WalkthroughRound2Test(TempConfigCase):
@@ -1825,6 +1903,120 @@ class TopologySnapshotShapeTest(_TopoFixture):
                          bytes(mb._ccd_slice_bytes(paths, 1))[:16])
         self.assertEqual(len(bytes.fromhex(snap["modesHex"])),
                          3 * ctypes.sizeof(mb._CcdModeInfo))
+
+
+class TopologyPositionTest(_TopoFixture):
+    """v2.01.3：接回要摆回**原位置**，不能每次都跳到最右边。
+
+    断开之后 Windows 会把该屏的 mode 项摘掉，位置就再也读不到，所以只能在
+    断开前抓一次（`monitor_positions`）。这不是状态账：每次断开前都按当下
+    真实值重写，用户挪过屏这里就跟着变。
+    """
+
+    def _raw_with_pos(self):
+        (paths, modes, pc, mc, rows), _ = self._raw()
+        paths[1].sourceInfo.modeInfoIdx = (3 << 16) | 0xFFFF
+        modes[3].sourceMode.width = 1920
+        modes[3].sourceMode.height = 1080
+        modes[3].sourceMode.position.x = -1920
+        modes[3].sourceMode.position.y = 0
+        return paths, modes, pc, mc, rows
+
+    def test_coerce_positions_drops_bad_entries(self):
+        got = mb._coerce_positions({
+            "A": [1, 2, 3, 4], "B": [0, 0, 0, 100], "C": "x",
+            "D": [1, 2, 3], "E": [1.4, 2.6, 100, 200]})
+        self.assertEqual(sorted(got), ["A", "E"])
+        self.assertEqual(got["E"], [1, 3, 100, 200])
+        self.assertEqual(mb._coerce_positions(None), {})
+        self.assertEqual(mb.default_config()["monitor_positions"], {})
+
+    def test_place_prefers_saved_position_when_free(self):
+        rects = [(0, 0, 2560, 1440)]
+        self.assertEqual(mb._ccd_place((-1920, 0), 1920, 1080, rects), (-1920, 0))
+
+    def test_place_falls_back_to_right_edge_on_overlap(self):
+        """重叠必须避开：实测把新屏放在主屏位置，SetDisplayConfig 直接 rc=87。"""
+        rects = [(0, 0, 2560, 1440)]
+        self.assertEqual(mb._ccd_place((0, 0), 1920, 1080, rects), (2560, 0))
+
+    def test_place_without_saved_goes_right(self):
+        self.assertEqual(mb._ccd_place(None, 1920, 1080, [(0, 0, 2560, 1440)]),
+                         (2560, 0))
+
+    def test_off_captures_position_before_disconnecting(self):
+        cfg = self._cfg(screen_off_method="topology")
+        patches = self._base_patches(lambda *a, **k: self._raw_with_pos())
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            ok, errs = mb.topology_off([1], cfg)
+        self.assertEqual(errs, [])
+        self.assertEqual(cfg["monitor_positions"],
+                         {"A2": [-1920, 0, 1920, 1080]})
+
+    def test_off_without_cfg_does_not_write_config(self):
+        """没给 cfg 时不能顺手往配置里塞东西（CLI 不该有副作用）。"""
+        patches = self._base_patches(lambda *a, **k: self._raw_with_pos())
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            ok, errs = mb.topology_off([1])
+        self.assertEqual(errs, [])
+        self.assertEqual(mb.load_config().get("monitor_positions"), {})
+
+    def test_on_reuses_saved_position_when_synthesizing(self):
+        cfg = self._cfg(screen_off_method="topology")
+        cfg["monitor_positions"] = {"A2": [-1920, 0, 1920, 1080]}
+        seen = {}
+
+        def fake_apply(u32, paths, modes, pc, mc):
+            sm = modes[6].sourceMode
+            seen["rect"] = (int(sm.position.x), int(sm.position.y),
+                            int(sm.width), int(sm.height))
+            return 0
+
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a, **k: self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
+                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                                           return_value=(2560, 1440)), \
+                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "_write_event_log"):
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(errs, [])
+        # 记过位置就用记的（连尺寸一起），不去问首选分辨率
+        self.assertEqual(seen["rect"], (-1920, 0, 1920, 1080))
+
+    def test_on_without_saved_position_uses_preferred_and_right_edge(self):
+        cfg = self._cfg(screen_off_method="topology")
+        seen = {}
+
+        def fake_apply(u32, paths, modes, pc, mc):
+            sm = modes[6].sourceMode
+            seen["rect"] = (int(sm.position.x), int(sm.position.y),
+                            int(sm.width), int(sm.height))
+            return 0
+
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a, **k: self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
+                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                                           return_value=(2560, 1440)), \
+                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "_write_event_log"):
+            mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(seen["rect"], (0, 0, 2560, 1440))
 
 
 class TopologyScheduleTest(_TopoFixture):
