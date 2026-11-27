@@ -6653,6 +6653,76 @@ class HelpSheet(Sheet):
         self.show()
 
 
+# ============================================================
+# 十、界面决策纯函数（v2.03.0 P2：从 App 里抽出的业务判断）
+#
+# 这些原先都是 App 的方法，但只依赖 cfg / 少量入参，不碰任何控件。
+# 抽出来的目的：能单独测（不需要 Tk），且 App 只留一行转发。
+# **不改变任何行为**——逻辑逐字搬移。
+# ============================================================
+def status_payload(cfg, state, hint):
+    """动作刚结束时的即时显示。
+
+    v2.01.0：只有拓扑模式"动作完成 = 拓扑回读确认"才算知道结果；
+    ddc / system 读不到可信的亮灭，一律先显示未知，随后的「检测」
+    会用真实读数覆盖。宁可短暂不显示，也不给假结论。
+    """
+    if cfg.get("screen_off_method") != "topology":
+        return {"state": "unknown", "hint": hint}
+    return {"state": state, "hint": hint}
+
+
+def row_action_blocker(cfg, busy):
+    """逐台按钮能不能用？不能用就返回一句原因。"""
+    method = cfg.get("screen_off_method")
+    if method not in ("ddc", "topology"):
+        return "「系统级」熄灭是整组广播，不能只动一块；改成「DDC」或「拓扑」才有逐台按钮"
+    if busy:
+        return "正在处理上一个操作，请稍候"
+    return ""
+
+
+def auto_relight_minutes(cfg):
+    """熄灭后自动点亮的分钟数；非法值一律当 0（不自动）。"""
+    try:
+        return max(0, min(120, int(cfg.get("screen_auto_relight_min", 0))))
+    except Exception:
+        return 0
+
+
+def restore_selection(prev, count):
+    """刷新后界面上要勾哪些屏。
+
+    **启动时全选**（v2.01.10 起）：用户打开程序最常见的目的就是"把所有屏
+    一起调一下"。刷新时（`prev` 非空）保留用户当前的勾选，不打断他。
+    定时任务的目标是另一套解析（`resolve_monitors` 读 monitor_anchors），
+    不受这里影响。
+    """
+    keep = [i for i in (prev or []) if 0 <= i < count]
+    if keep:
+        return keep
+    return list(range(count))
+
+
+def tray_tooltip_text(cfg, last_verdict, title):
+    """托盘悬停文案：定时摘要 + 下次运行 + 屏幕状态（最多 120 字）。"""
+    if not cfg.get("enabled"):
+        return "%s\n定时未启用" % title
+    slots = cfg.get("slots", [])
+    brief = "  ".join("%s→%d%%%s" % (x.get("time"), x.get("level", 0),
+                                      "熄" if x.get("screen") == "off" else
+                                      "亮" if x.get("screen") == "on" else "")
+                       for x in slots)
+    nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots],
+                         days_by_min=_days_by_min_from_fp(
+                             _slot_trigger_fingerprint(slots)))
+    # v2.01.0：用**上次实际探测**的结果，不再读配置里的记账；
+    # 没探测过就老实说"未检测"，不猜。
+    st = {"on": "亮着", "off": "已熄灭"}.get(
+        (last_verdict or {}).get("state"), "未检测")
+    return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (title, brief, nxt, st))[:120]
+
+
 class App:
     """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
@@ -7042,18 +7112,8 @@ class App:
             self.read_current()
 
     def _restore_selection(self, prev):
-        """界面上要勾哪些屏。
-
-        **启动时全选**（v2.01.10 起）：用户打开程序最常见的目的就是"把所有屏
-        一起调一下"，默认只勾一块还得先手动补。刷新时（`prev` 非空）保留用户
-        当前的勾选，不打断他正在做的事。
-        定时任务的目标是另一套解析（`resolve_monitors` 读 monitor_anchors），
-        不受这里影响。
-        """
-        keep = [i for i in prev if i < len(self.monitors)]
-        if keep:
-            return keep
-        return list(range(len(self.monitors)))
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return restore_selection(prev, len(self.monitors))
 
     def refresh_monitors(self, silent=False):
         prev = self.selected_indices()
@@ -7401,15 +7461,8 @@ class App:
         self.status_card.set_hint_default("%s · %d 台显示器" % (b, len(self.monitors)))
 
     def _status_payload(self, state, hint):
-        """动作刚结束时的即时显示。
-
-        v2.01.0：只有拓扑模式"动作完成 = 拓扑回读确认"才算知道结果；
-        ddc / system 读不到可信的亮灭，一律先显示未知，随后的「检测」
-        会用真实读数覆盖。宁可短暂不显示，也不给假结论。
-        """
-        if self.cfg.get("screen_off_method") != "topology":
-            return {"state": "unknown", "hint": hint}
-        return {"state": state, "hint": hint}
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return status_payload(self.cfg, state, hint)
 
     def _remember_selection(self):
         idx, ids = selection_payload(self.selected_indices())
@@ -7419,13 +7472,8 @@ class App:
 
     # ---------- 熄屏 / 点亮 ----------
     def _row_action_blocker(self):
-        """逐台按钮能不能用？不能用就返回一句原因。"""
-        method = self.cfg.get("screen_off_method")
-        if method not in ("ddc", "topology"):
-            return "「系统级」熄灭是整组广播，不能只动一块；改成「DDC」或「拓扑」才有逐台按钮"
-        if self._busy:
-            return "正在处理上一个操作，请稍候"
-        return ""
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return row_action_blocker(self.cfg, self._busy)
 
     def monitor_off(self, index):
         """行内「熄灭」：只熄灭这一块，不动别的。"""
@@ -7648,10 +7696,8 @@ class App:
         self.probe_screens()
 
     def _auto_relight_minutes(self):
-        try:
-            return max(0, min(120, int(self.cfg.get("screen_auto_relight_min", 0))))
-        except Exception:
-            return 0
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return auto_relight_minutes(self.cfg)
 
     def _stop_tray(self):
         if self.tray is not None:
@@ -7673,21 +7719,8 @@ class App:
         return img
 
     def _tray_tooltip_text(self):
-        if not self.cfg.get("enabled"):
-            return "%s\n定时未启用" % APP_TITLE
-        slots = self.cfg.get("slots", [])
-        brief = "  ".join("%s→%d%%%s" % (x.get("time"), x.get("level", 0),
-                                          "熄" if x.get("screen") == "off" else
-                                          "亮" if x.get("screen") == "on" else "")
-                           for x in slots)
-        nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots],
-                             days_by_min=_days_by_min_from_fp(
-                                 _slot_trigger_fingerprint(slots)))
-        # v2.01.0：用**上次实际探测**的结果，不再读配置里的记账；
-        # 没探测过就老实说"未检测"，不猜。
-        st = {"on": "亮着", "off": "已熄灭"}.get(
-            (self._last_verdict or {}).get("state"), "未检测")
-        return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (APP_TITLE, brief, nxt, st))[:120]
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return tray_tooltip_text(self.cfg, self._last_verdict, APP_TITLE)
 
     def _tray_update_tooltip(self):
         if self.tray is not None:

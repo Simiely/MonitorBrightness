@@ -1552,6 +1552,59 @@ class AppMethodTest(TempConfigCase):
         self.assertIsNone(fake._schedule_reg_timer, "失败不能排重建")
 
 
+class UiDecisionTest(unittest.TestCase):
+    """v2.03.0 P2：从 App 抽出的界面决策纯函数（不碰 Tk，可独立测）。"""
+
+    def test_status_payload_only_trusts_topology(self):
+        cfg = {"screen_off_method": "topology"}
+        self.assertEqual(mb.status_payload(cfg, "off", "h"),
+                         {"state": "off", "hint": "h"})
+        cfg["screen_off_method"] = "ddc"
+        self.assertEqual(mb.status_payload(cfg, "off", "h"),
+                         {"state": "unknown", "hint": "h"})
+        cfg["screen_off_method"] = "system"
+        self.assertEqual(mb.status_payload(cfg, "on", "h")["state"], "unknown")
+
+    def test_row_action_blocker(self):
+        self.assertIn("整组广播",
+                      mb.row_action_blocker({"screen_off_method": "system"}, False))
+        self.assertEqual(mb.row_action_blocker({"screen_off_method": "ddc"}, True),
+                         "正在处理上一个操作，请稍候")
+        self.assertEqual(mb.row_action_blocker({"screen_off_method": "ddc"}, False), "")
+        self.assertEqual(mb.row_action_blocker({"screen_off_method": "topology"}, False), "")
+
+    def test_restore_selection(self):
+        # 启动：全选
+        self.assertEqual(mb.restore_selection([], 3), [0, 1, 2])
+        # 刷新：保留用户勾选
+        self.assertEqual(mb.restore_selection([1], 3), [1])
+        # 越界过滤（屏变少了）
+        self.assertEqual(mb.restore_selection([0, 5], 2), [0])
+        # 全越界 → 退回全选
+        self.assertEqual(mb.restore_selection([9], 2), [0, 1])
+        self.assertEqual(mb.restore_selection(None, 2), [0, 1])
+
+    def test_auto_relight_minutes_clamps(self):
+        for raw, want in ((0, 0), (45, 45), (120, 120), (500, 120), (-3, 0),
+                          ("x", 0), (None, 0)):
+            self.assertEqual(mb.auto_relight_minutes(
+                {"screen_auto_relight_min": raw}), want, repr(raw))
+
+    def test_tray_tooltip_text(self):
+        cfg = mb.default_config()
+        cfg["enabled"] = False
+        self.assertIn("定时未启用", mb.tray_tooltip_text(cfg, None, "MB"))
+        cfg["enabled"] = True
+        cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80,
+                                          "screen": "off"}])
+        txt = mb.tray_tooltip_text(cfg, {"state": "off"}, "MB")
+        self.assertIn("08:30", txt)
+        self.assertIn("已熄灭", txt)
+        self.assertLessEqual(len(txt), 120)
+        # 没探测过就老实说未检测
+        self.assertIn("未检测", mb.tray_tooltip_text(cfg, None, "MB"))
+
+
 class RegisterScriptTest(unittest.TestCase):
     """v2.03.0 P0：build_register_script 原为零覆盖。
 
