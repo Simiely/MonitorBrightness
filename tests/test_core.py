@@ -1331,6 +1331,26 @@ class SessionEventsTest(TempConfigCase):
         self.assertIn("事件 59", got[-1])
 
 
+class SelectionAnchorsTest(unittest.TestCase):
+    """勾选 → 锚点。aliases 是陷阱：每块屏的 aliases 都含 DISPLAY1~4。"""
+
+    def test_aliases_do_not_leak_other_screens(self):
+        targets = [{"index": 0, "dev": "DISPLAY1", "primary": True},
+                   {"index": 1, "dev": "DISPLAY2", "primary": False}]
+        rows = [
+            {"anchor": "A1", "gdi": "\\\\.\\DISPLAY1", "vdd": False,
+             "aliases": ["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"]},
+            {"anchor": "A2", "gdi": "\\\\.\\DISPLAY2", "vdd": False,
+             "aliases": ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY1"]},
+            {"anchor": "V1", "gdi": "\\\\.\\DISPLAY92", "vdd": True, "aliases": []},
+        ]
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+            self.assertEqual(mb.selection_anchors([0], targets), ["A1"])
+            self.assertEqual(mb.selection_anchors([1], targets), ["A2"])
+            self.assertEqual(mb.selection_anchors([0, 1], targets), ["A1", "A2"])
+            self.assertEqual(mb.selection_anchors([], targets), [])   # 空=全部，不锚死
+
+
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 
@@ -1676,25 +1696,53 @@ class TopologyActionTest(_TopoFixture):
         self.assertEqual(mb.coerce_setting("screen_off_method", "topology"), "topology")
         self.assertEqual(mb.default_config()["screen_off_method"], "ddc")
 
-    def test_plan_refuses_primary_vdd_and_single_active(self):
+    def test_plan_hands_over_primary_to_other_physical_screen(self):
+        """只断主屏时，接班屏优先**物理屏**（用户看得见），而不是虚拟屏。"""
         rows = [dict(r) for r in self.ROWS_RAW]
-        anchors, errs, noop = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
-        self.assertEqual(anchors, ["A2"])
-        self.assertFalse(errs)
+        plan, errs, noop = mb.topology_plan_off([0], rows, ["DISPLAY1"])
+        self.assertEqual(errs, [])
         self.assertFalse(noop)
-        anchors, errs, _ = mb.topology_plan_off([2], rows, ["DISPLAY1"])
-        self.assertEqual(anchors, [])
-        self.assertTrue(any("没有可断开的副屏" in e for e in errs))
-        rows[0]["active"] = False
-        anchors, errs, _ = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
-        self.assertEqual(anchors, [])
-        self.assertTrue(any("只剩 1 块" in e for e in errs))
+        self.assertEqual(plan["off"], ["A1"])
+        self.assertEqual(plan["heir"], "A2")
+        self.assertTrue(plan["heir_active"])
+
+    def test_plan_hands_over_primary_to_vdd_when_all_physical_off(self):
+        """全部物理屏都断开 → 交给虚拟显示器（串流的形态）。"""
+        rows = [dict(r) for r in self.ROWS_RAW]
+        plan, errs, _ = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
+        self.assertEqual(errs, [])
+        self.assertEqual(plan["off"], ["A1", "A2"])
+        self.assertEqual(plan["heir"], "V1")
+        self.assertFalse(plan["heir_active"])       # 它当前断着，要先接回
+
+    def test_plan_refuses_when_nothing_left_to_carry_primary(self):
+        """断开后一块屏都不剩 = 黑屏，必须拒绝（没有虚拟屏可接班时）。"""
+        rows = [dict(r) for r in self.ROWS_RAW if not r["vdd"]]
+        plan, errs, _ = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
+        self.assertEqual(plan["off"], [])
+        self.assertTrue(any("一块屏都不剩" in e for e in errs))
+
+    def test_plan_never_targets_vdd(self):
+        rows = [dict(r) for r in self.ROWS_RAW]
+        plan, errs, _ = mb.topology_plan_off([2], rows, ["DISPLAY1"])
+        self.assertEqual(plan["off"], [])
+        self.assertTrue(any("没有可断开的屏" in e for e in errs))
+
+    def test_plan_honours_explicit_heir_and_rejects_missing_one(self):
+        rows = [dict(r) for r in self.ROWS_RAW]
+        plan, errs, _ = mb.topology_plan_off([0], rows, ["DISPLAY1"], heir="V1")
+        self.assertEqual(errs, [])
+        self.assertEqual(plan["heir"], "V1")
+        # 指了块不在候选里的（刚被拔掉）
+        bad, errs2, _ = mb.topology_plan_off([0], rows, ["DISPLAY1"], heir="A9")
+        self.assertTrue(errs2)
+        self.assertEqual(bad["off"], [])
 
     def test_plan_noop_when_target_already_inactive(self):
         rows = [dict(r) for r in self.ROWS_RAW]
         rows[1]["active"] = False
-        anchors, errs, noop = mb.topology_plan_off([1], rows, ["DISPLAY1"])
-        self.assertEqual(anchors, [])
+        plan, errs, noop = mb.topology_plan_off([1], rows, ["DISPLAY1"])
+        self.assertEqual(plan["off"], [])
         self.assertFalse(errs)
         self.assertTrue(noop)
 
@@ -1717,13 +1765,46 @@ class TopologyActionTest(_TopoFixture):
         with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
                 unittest.mock.patch.object(mb, "_ccd_make_snapshot",
                                            side_effect=fake_snap):
-            ok, errs = mb.topology_off([0, 1])
-        self.assertEqual(ok, [1])   # 主屏虽被勾选，护栏跳过，不算成功
+            ok, errs = mb.topology_off([1])
+        self.assertEqual(ok, [1])
         self.assertEqual(errs, [])
         self.assertEqual(apply.call_count, 1)
         self.assertEqual(seen["snap_anchors"], ["A2"])
         # 快照必须来自动作之前：ACTIVE 位还在，且路径未被置 INVALID
         self.assertEqual(seen["snap_paths"], seen["original"])
+
+    def test_off_hands_over_primary_then_removes_it(self):
+        """断开主屏 = 一次提交里「接班屏挪到 (0,0) + 原主屏摘掉」。
+
+        Windows 没有"设置主显示器"的 API，主屏就是 (0,0) 那块。真机验证过
+        （scripts/topology_handover_probe.py，SDC_VALIDATE）：这样提交 rc=0。
+        """
+        cfg = self._cfg(screen_off_method="topology")
+
+        def fake_query(u32=None):
+            (paths, modes, pc, mc, rows), _ = self._raw()
+            # A2 的 source mode 指向 modes[3]，原来摆在主屏左边
+            paths[1].sourceInfo.modeInfoIdx = (3 << 16) | 0xFFFF
+            modes[3].sourceMode.position.x = -2560
+            modes[0].sourceMode.width = 2560        # A1 自己的 source mode（用于记位置）
+            modes[0].sourceMode.height = 1440
+            return paths, modes, pc, mc, rows
+
+        patches = self._base_patches(fake_query)
+        with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5]:
+            ok, errs = mb.topology_off([0], cfg, heir="A2")
+        self.assertEqual(errs, [])
+        self.assertEqual(ok, [0])
+        args = apply.call_args[0]
+        paths, modes = args[1], args[2]
+        # 接班屏被平移到桌面原点 → 它就是新的主屏
+        self.assertEqual(int(modes[3].sourceMode.position.x), 0)
+        self.assertEqual(int(modes[3].sourceMode.position.y), 0)
+        # 原主屏被摘掉
+        self.assertFalse(paths[0].flags & mb._CCD_PATH_ACTIVE)
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0xFFFFFFFF)
+        # 位置记录按**平移后**的坐标存：接回时正好落在新主屏右边
+        self.assertEqual(cfg["monitor_positions"]["A1"][:2], [2560, 0])
 
     def test_off_rolls_back_once_when_verify_fails(self):
         def fake_query(u32=None):
@@ -1754,7 +1835,7 @@ class TopologyActionTest(_TopoFixture):
             ok, errs = mb.topology_off([2])          # VDD：永不作目标
         self.assertEqual(ok, [])
         self.assertEqual(apply.call_count, 0)
-        self.assertIn("没有可断开的副屏", errs[0][1])
+        self.assertIn("没有可断开的屏", errs[0][1])
 
     def test_on_plans_from_current_topology_then_writes_brightness(self):
         """接回 = 现读当前拓扑 → 现算 mode → 提交 → 回读 → 写亮度。"""

@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.7"     # 行内按钮按状态切换；主屏熄灭改问一句
+APP_VERSION = "2.01.8"     # 断开主屏前先交接主屏角色（纯拓扑，不碰面板电源）
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -1727,11 +1727,15 @@ def _ccd_restore_from_bytes(u32, snap):
     return _ccd_apply(u32, paths, modes, snap["pathCount"], snap["modeCount"])
 
 
-def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=None):
+def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=None,
+                    allow_vdd=False):
     """有界轮询回读；**目标每一个**都达到 expect_active 才算成功。
 
     v2.01.0 修：原来只要"存在的那些都符合"就返回 True，多屏接回时
     少接回来一块也会报成功。现在要求 wanted 全部出现在回读结果里且状态一致。
+
+    `allow_vdd=True` 给"交接主屏给虚拟显示器"用：平时 VDD 不算目标，
+    但那一刻它就是接班屏，必须看到它 ACTIVE。
     """
     probe = probe or ccd_probe_topology
     deadline = time.monotonic() + max(0.0, float(timeout))
@@ -1739,7 +1743,8 @@ def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=N
     while True:
         try:
             rows = [r for r in probe()
-                    if r.get("anchor") in wanted and not r.get("vdd")]
+                    if r.get("anchor") in wanted
+                    and (allow_vdd or not r.get("vdd"))]
         except Exception:
             rows = []
         got = {r.get("anchor") for r in rows}
@@ -1751,13 +1756,27 @@ def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=N
         time.sleep(0.1)
 
 
-def topology_plan_off(indices, rows, primary_gdis=None, dev_to_index=None):
-    """纯函数：从勾选下标 + 拓扑行算出要断开的锚点。
+def topology_plan_off(indices, rows, primary_gdis=None, dev_to_index=None, heir=None):
+    """纯函数：算出把这些屏从拓扑里摘掉要动哪些 path，**必要时交接主屏**。
 
-    dev_to_index 由 enumerate_targets() 提供（GDI 名 → 界面下标），和 E2 的
-    selection_anchors 用的是同一套映射；没传时按 rows 自带的 index 匹配，便于单测。
-    护栏（D4）：VDD 永不作目标；主屏永不作目标；活动物理屏 ≤1 拒绝；
-    一次只断一块。返回 (anchors, errs, noop)。
+    Windows 没有"设置主显示器"的 API —— 主屏就是桌面原点 (0,0) 所在的那块屏，
+    而且不允许把它从拓扑里摘掉（实测 rc=87）。所以想断开主屏，只能先把 (0,0)
+    让给别人：接班屏平移到 (0,0)、其余屏跟着平移（相对布局不变），再摘原主屏。
+    这条路径在真机上验过（scripts/topology_handover_probe.py，SDC_VALIDATE 只读）：
+
+      | 做法 | rc |
+      |---|---|
+      | 只改 source mode 的 position | 0 |
+      | 接班屏移到 (0,0) + 摘掉原主屏 | 0 |
+      | VDD 当主屏 + 物理屏全摘（串流形态） | 0 |
+
+    护栏：VDD 永不作**断开目标**；断开后桌面必须还剩至少一块屏（否则黑屏）。
+
+    返回 (plan, errs, noop)，plan =
+      {"off": [锚点...],                 # 要摘掉的（可能包含当前主屏）
+       "heir": 锚点 or None,             # 接班当主屏的那块；None = 主屏不动
+       "heir_active": bool}              # False 表示它当前断着，需要先接回
+    平移量不在这里算 —— 要读 source mode，由 topology_off 按 hire 的位置算。
     """
     primary = {_short_dev(g) for g in (primary_gdis or [])}
     idx = set(normalize_indices(indices))
@@ -1765,39 +1784,59 @@ def topology_plan_off(indices, rows, primary_gdis=None, dev_to_index=None):
     if dev_to_index is not None:
         wanted_names = {_short_dev(name) for name, i in dev_to_index.items()
                         if i in idx} if idx else None
-    active_physical = 0
     selected = []
     for r in rows:
         if r.get("vdd") or not r.get("anchor"):
             continue
-        if r.get("active") and r.get("connected", True):
-            active_physical += 1
         if wanted_names is not None:
-            # 也只认 ACTIVE 的 source：aliases 里两块屏会互相混进 DISPLAYn，
+            # 只认 ACTIVE 的 source：aliases 里两块屏会互相混进 DISPLAYn，
             # 拿它做选择匹配会把「只勾主屏」误判成「勾了副屏」。
             if _short_dev(r.get("gdi")) not in wanted_names:
                 continue
         elif idx and r.get("index") not in idx:
             continue
-        # 主屏判定只看 ACTIVE 的那条 source（折叠后的 gdi）。
-        # 不能拿 aliases 比：同一块屏的多个 source 里会混进主屏的 DISPLAYn。
-        if _short_dev(r.get("gdi")) in primary:
-            continue                      # 主屏：实测 rc=87，永不尝试
         selected.append(r)
-    anchors = []
+
+    off = []
     for r in selected:
-        if r.get("active") and r.get("anchor") not in anchors:
-            anchors.append(r["anchor"])
-    if active_physical <= 1 and anchors:
-        return [], ["只剩 1 块活动物理屏，拒绝断开（会黑屏）"], False
-    if not anchors:
-        if selected and all(not r.get("active") for r in selected):
-            return [], [], True           # 目标已经 inactive：no-op
-        return [], ["没有可断开的副屏（主屏不可断、VDD 不作目标）"], False
-    if len(anchors) > 1:
-        return [], ["拓扑模式一次只能断开一块副屏（当前选中 %d 块），请只勾选一块"
-                    % len(anchors)], False
-    return anchors, [], False
+        if r.get("active") and r["anchor"] not in off:
+            off.append(r["anchor"])
+    if not off:
+        if selected:
+            return {"off": [], "heir": None, "heir_active": False}, [], True
+        return ({"off": [], "heir": None, "heir_active": False},
+                ["没有可断开的屏（VDD 不作目标，未连接的屏也断不了）"], False)
+
+    # 当前主屏（摆在 0,0 的那块）在不在这次要摘的名单里？
+    cur_primary = [r["anchor"] for r in rows
+                   if r.get("active") and r.get("connected")
+                   and _short_dev(r.get("gdi")) in primary]
+    must_handover = any(a in off for a in cur_primary)
+    if not must_handover:
+        return {"off": off, "heir": None, "heir_active": False}, [], False
+
+    # 候选接班屏：连着、且不在这次要摘的名单里
+    cands = [r for r in rows
+             if r.get("connected") and r.get("anchor")
+             and r["anchor"] not in off]
+    if heir:
+        if not any(r["anchor"] == heir for r in cands):
+            return ({"off": [], "heir": None, "heir_active": False},
+                    ["指定接班的屏不在了（可能刚被拔掉），请重新选择"], False)
+        pick = next(r for r in cands if r["anchor"] == heir)
+    else:
+        if not cands:
+            return ({"off": [], "heir": None, "heir_active": False},
+                    ["断开后桌面上就一块屏都不剩（会黑屏），Windows 不允许。\n"
+                     "先留一块屏当主显示器，或把虚拟显示器接上再试。"], False)
+        # 自动选：优先物理屏（用户看得见），再考虑虚拟屏
+        phys = [r for r in cands if not r.get("vdd")]
+        pick = (phys or cands)[0]
+
+    heir_active = bool(pick.get("active"))
+    # 平移量要读 source mode，纯函数里拿不到 —— 由 topology_off 按 hire 的位置算
+    return ({"off": off, "heir": pick["anchor"], "heir_active": heir_active},
+            [], False)
 
 
 def _fold_raw_rows(raw_rows):
@@ -2143,12 +2182,19 @@ def _ccd_apply_plan_on(paths, plan):
     return done
 
 
-def topology_off(indices, cfg=None):
+def topology_off(indices, cfg=None, heir=None):
     """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
 
+    如果这次要摘的屏里包含**当前主屏**，会先把主屏角色交接给 `heir`
+    （不指定就自动选：优先物理屏，其次虚拟屏）：接班屏平移到 (0,0)、
+    其余屏跟着平移（相对布局不变），再摘原主屏。交接的技术依据见
+    `topology_plan_off` 的注释与 scripts/topology_handover_probe.py。
+
+    这样"禁用所有物理屏、只留虚拟显示器"（串流场景）也能走纯拓扑操作，
+    全程不碰面板电源，没有 DDC 待机唤不回的风险。
+
     `cfg` 给了就把这些屏**此刻**的桌面位置写进 `monitor_positions`，供下次
-    接回摆回原位（断开之后这个信息就读不到了）。这是摆放偏好而非状态账：
-    每次断开前都按当下真实值重写。
+    接回摆回原位（记录的是平移后的坐标，接回时正好落在新主屏旁边）。
 
     返回 (成功下标列表, [(下标, 错误), ...])，与 screen_off_many 同形状。
     """
@@ -2159,7 +2205,7 @@ def topology_off(indices, cfg=None):
     if raw is None:
         return [], [(-1, "CCD 查询失败，未做任何改动")]
     paths, modes, pc, mc, raw_rows = raw
-    dlog("topo.off", indices=normalize_indices(indices), pc=pc, mc=mc,
+    dlog("topo.off", indices=normalize_indices(indices), pc=pc, mc=mc, heir=heir,
          active=[r["anchor"] for r in raw_rows if r.get("active")],
          connected=[r["anchor"] for r in raw_rows if r.get("connected")])
     try:
@@ -2169,29 +2215,93 @@ def topology_off(indices, cfg=None):
     primary = [t.get("dev") for t in targets if t.get("primary")]
     dev_to_index = {t.get("dev"): t.get("index") for t in targets}
     release_targets(targets)
-    anchors, errs, noop = topology_plan_off(
-        indices, _fold_raw_rows(raw_rows), primary, dev_to_index)
-    dlog("topo.off.plan", anchors=anchors, errs=errs, noop=noop, primary=primary)
+    plan, errs, noop = topology_plan_off(
+        indices, _fold_raw_rows(raw_rows), primary, dev_to_index, heir)
+    dlog("topo.off.plan", plan=plan, errs=errs, noop=noop, primary=primary)
     if errs:
         return [], [(-1, e) for e in errs]
     if noop:
         return list(normalize_indices(indices)), []
+    anchors = plan["off"]
+    heir_anchor = plan.get("heir")
+    heir_active = bool(plan.get("heir_active"))
 
     # D6：动作前拍一份**本进程内**的原始字节快照，只用于"这次操作失败就原样撤回"。
     # v2.01.0 起不再落盘：快照一旦落盘就会被当成"状态"，接回时恢复旧快照
     # 会把用户其后在 Windows 设置里做的改动一起覆盖掉（设计纠偏，见 topology_plan_on）。
     snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
 
+    # 接班屏已在拓扑里 → 算出"把它挪到 (0,0)"需要的平移量。
+    # 主屏就是 (0,0) 那块，所以平移接班屏到 (0,0) 就等于把主屏角色交给它；
+    # 其余屏跟着平移，相对布局完全不变（真机验证见 topology_plan_off 注释）。
+    shift = (0, 0)
+    if heir_anchor and heir_active:
+        row = next((r for r in raw_rows
+                    if r["anchor"] == heir_anchor and r.get("active")), None)
+        if row is not None:
+            idx = int(paths[row["pathIndex"]].sourceInfo.modeInfoIdx)
+            if idx != _CCD_MODE_IDX_INVALID:
+                s = (idx >> 16) & 0xFFFF
+                if s < mc:
+                    shift = (-int(modes[s].sourceMode.position.x),
+                             -int(modes[s].sourceMode.position.y))
+        dlog("topo.off.handover", heir=heir_anchor, heir_active=True, shift=list(shift))
+
     # 断开之后 Windows 会把这块屏的 mode 项摘掉，位置就再也读不到了，
     # 所以趁现在把"它此刻摆在哪"记下来，接回时才能摆回原位。
+    # 记的是**平移后**的坐标：接回时正好落在新主屏旁边，而不是跑到旧原点去。
     if cfg is not None:
         pos = _ccd_capture_positions(anchors, paths, modes, mc, raw_rows)
         if pos:
+            pos = {a: [v[0] + shift[0], v[1] + shift[1], v[2], v[3]]
+                   for a, v in pos.items()}
             merged = dict(cfg.get("monitor_positions") or {})
             merged.update(pos)
             cfg["monitor_positions"] = _coerce_positions(merged)
             save_config(cfg)
             dlog("topo.off.positions", captured=pos)
+
+    cur_modes, cur_mc = modes, mc
+
+    # 接班屏当前是断着的（虚拟显示器）→ 先把它接回，并直接放到 (0,0)
+    if heir_anchor and not heir_active:
+        p_on, e_on, n_on = topology_plan_on(
+            [heir_anchor], raw_rows, _ccd_mode_entries(modes, mc), allow_vdd=True)
+        if e_on:
+            dlog("topo.off.handover", heir=heir_anchor, errs=e_on)
+            return [], [(-1, e) for e in e_on]
+        if n_on:                       # 它其实已经亮着，按"在拓扑里"处理
+            heir_active = True
+        else:
+            cur_modes, cur_mc = _ccd_fill_missing_source_modes(
+                u32, paths, cur_modes, cur_mc, raw_rows, p_on, want={})
+            midx = p_on[0]["sourceModeIdx"]
+            cur_modes[midx].sourceMode.position.x = 0
+            cur_modes[midx].sourceMode.position.y = 0
+            _ccd_apply_plan_on(paths, p_on)
+            dlog("topo.off.handover", heir=heir_anchor, heir_active=False,
+                 synthMode=midx, size=[int(cur_modes[midx].sourceMode.width),
+                                       int(cur_modes[midx].sourceMode.height)])
+
+    # 其余屏跟着平移（按 mode 下标去重：同一块屏的多条 path 共用一条 mode 项）
+    if shift != (0, 0):
+        moved = set()
+        for r in raw_rows:
+            if not (r.get("active") and r.get("connected")):
+                continue
+            if r["anchor"] in anchors:
+                continue
+            idx = int(paths[r["pathIndex"]].sourceInfo.modeInfoIdx)
+            if idx == _CCD_MODE_IDX_INVALID:
+                continue
+            s = (idx >> 16) & 0xFFFF
+            if s in moved or s >= cur_mc:
+                continue
+            moved.add(s)
+            cur_modes[s].sourceMode.position.x = \
+                int(cur_modes[s].sourceMode.position.x) + shift[0]
+            cur_modes[s].sourceMode.position.y = \
+                int(cur_modes[s].sourceMode.position.y) + shift[1]
 
     for i in range(len(paths)):
         info = next((x for x in raw_rows if x["pathIndex"] == i), None)
@@ -2207,23 +2317,28 @@ def topology_off(indices, cfg=None):
         p.sourceInfo.statusFlags = 0
         p.targetInfo.statusFlags = 0
 
-    rc = _ccd_apply(u32, paths, modes, pc, mc)
+    rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
     if rc != 0:
         dlog("topo.off.fail", stage="apply", rc=rc)
-        return [], [(-1, "SetDisplayConfig 失败 rc=%d（未改动拓扑）" % rc)]
-    if not _ccd_wait_state(anchors, False):
+        return [], [(-1, "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc)]
+    ok_off = _ccd_wait_state(anchors, False)
+    ok_heir = (not heir_anchor) or _ccd_wait_state([heir_anchor], True, allow_vdd=True)
+    if not (ok_off and ok_heir):
         back = _ccd_restore_from_bytes(u32, snap)
         why = "回读未确认断开，已回滚"
+        if not ok_heir:
+            why = "主屏接班没生效，已回滚"
         if back != 0:
             why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
-        dlog("topo.off.fail", stage="verify", rollback=back)
+        dlog("topo.off.fail", stage="verify", rollback=back,
+             ok_off=ok_off, ok_heir=ok_heir)
         return [], [(-1, why)]
-    # 只报"真正被断开"的下标；主屏虽然在勾选里，但护栏跳过了它。
+    # 只报"真正被断开"的下标
     done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
                  if r["anchor"] in anchors and r["connected"] and r["active"]}
     done = sorted({i for name, i in dev_to_index.items()
                    if _short_dev(name) in done_devs})
-    dlog("topo.off.done", anchors=anchors, indices=done)
+    dlog("topo.off.done", anchors=anchors, indices=done, heir=heir_anchor)
     return done or list(normalize_indices(indices)), []
 
 
@@ -3004,7 +3119,10 @@ def selection_anchors(indices, targets=None):
     """给勾选的下标生成 CCD 稳定锚点（E2）。
 
     锚点来自 `ccd_probe_topology()`：显卡 LUID + EDID mfr/prod + connectorInstance。
-    QDC_ALL_PATHS 下同一块屏有多个 source（DISPLAY1/2/3/4），要按 short dev 匹配。
+    **只按 `gdi`（当前 ACTIVE 的 source 名）匹配，绝不用 `aliases`**：
+    QDC_ALL_PATHS 下每块屏的 aliases 都会列出 DISPLAY1~4 全部四个 source 名，
+    用它匹配等于"任何选中都命中所有屏"——v2.01.8 实测：只点一块屏的「显示」，
+    实际拿到了两块屏的锚点，于是"点亮这一块"变成了"接回全部"。
     取不到就返回 []，绝不把不确定的锚点写进配置。
     """
     idx = normalize_indices(indices)
@@ -3020,13 +3138,35 @@ def selection_anchors(indices, targets=None):
         for r in rows:
             if r["vdd"]:
                 continue
-            names = [_short_dev(r.get("gdi"))] + [_short_dev(a) for a in r.get("aliases", [])]
-            if wanted.intersection(names) and r["anchor"] not in out:
+            if _short_dev(r.get("gdi")) in wanted and r["anchor"] not in out:
                 out.append(r["anchor"])
         return out
     finally:
         if owned:
             release_targets(targets)
+
+
+def topology_heir_candidates(off_anchors=(), rows=None):
+    """能接班当主屏的屏：连着、且不在这次要断开的名单里。
+
+    物理屏排前面（用户看得见），虚拟屏排后面 —— 只有"全部物理屏都要断"
+    的时候才会轮到它，那正是串流场景。
+    """
+    rows = rows if rows is not None else ccd_probe_topology()
+    skip = set(off_anchors or ())
+    out, seen = [], set()
+    for r in rows:
+        anchor = r.get("anchor")
+        if not r.get("connected") or not anchor or anchor in skip or anchor in seen:
+            continue
+        seen.add(anchor)
+        out.append({"anchor": anchor,
+                    "friendly": r.get("friendly") or anchor,
+                    "vdd": bool(r.get("vdd")),
+                    "active": bool(r.get("active")),
+                    "gdi": r.get("gdi") or ""})
+    out.sort(key=lambda c: (c["vdd"], not c["active"]))
+    return out
 
 
 def resolve_monitors(cfg):
@@ -5426,6 +5566,38 @@ class SchedulePanel:
         self.apply_btn.set_enabled(enabled)
 
 
+class HeirSheet(Sheet):
+    """断开主屏前，选一块屏接班当主显示器。
+
+    Windows 没有"设置主显示器"的 API —— 主屏就是桌面原点 (0,0) 所在的那块；
+    把某块屏挪到 (0,0) 就等于让它当主屏，其余屏跟着平移，相对布局不变。
+    所以这个弹窗问的不是"要不要"，而是"交给谁"。
+    """
+
+    def __init__(self, app, candidates, going_off, on_pick):
+        super().__init__(app, "把主屏交给谁？",
+                         "先让下面某一块接任主屏，再把 %s 断开。\n"
+                         "接任者会挪到桌面原点（Windows 以原点认定主屏），其它屏跟着平移。"
+                         % going_off, width=430)
+        self._on_pick = on_pick
+        inner = self.section("可以接任的屏")
+        for c in candidates:
+            if c["vdd"]:
+                sub = "虚拟显示器 · 当前断着，会先接回来再断开物理屏"
+            else:
+                sub = "物理显示器 · %s · 会挪到桌面原点" % (c["gdi"] or "—")
+            self.row(inner, c["friendly"], sub,
+                     builder=lambda p, a=c["anchor"]: Button(
+                         p, "选它", lambda a=a: self._choose(a), kind="link",
+                         height=22, font_size=8).pack())
+        self.ok_btn.set_text("取消")
+        self.show()
+
+    def _choose(self, anchor):
+        self.close()
+        self._on_pick(anchor)
+
+
 class SettingsSheet(Sheet):
     """设置：托盘 / 自启 / 热键 / 熄灭方式 / 预设 / 关于（都是"不常改"的东西）。"""
 
@@ -5537,10 +5709,10 @@ class HelpSheet(Sheet):
             "系统级：整组一起灭，一定唤得回；任何键鼠输入都会点亮。",
             "DDC 单屏待机（默认）：键鼠不会点亮，适合远程防窥；唤醒靠四级兜底，"
             "个别面板仍可能唤不回。",
-            "拓扑断开：把选中的副屏从 Windows 桌面移除，串流时只留虚拟显示器；"
-            "主屏不会被断（Windows 实测 rc=87），VDD 永不作目标。",
-            "拓扑断开的「点亮」= 恢复动作前快照 → 回读 ACTIVE → 写亮度；"
-            "窗口位置不保证完全还原，首次使用请做一次串流回归。",
+            "拓扑断开：把选中的屏从 Windows 桌面移除，串流时只留虚拟显示器。",
+            "断开主屏时，会先问「把主屏交给谁」——让另一块屏挪到桌面原点接任主屏，"
+            "再把原主屏摘掉。全程纯拓扑操作，不碰面板电源。",
+            "全部物理屏都断开时，主屏交给虚拟显示器（串流形态）。",
         ])
         block("唤醒阶梯", [
             "0xD6=1 电源模式 → 写回亮度 → 输出重驱动（SC_MONITORPOWER 2→-1）"
@@ -6152,33 +6324,48 @@ class App:
         if why:
             self.status_var.set(why)
             return
-        if (self.cfg.get("screen_off_method") == "topology"
-                and index < len(self.mon_info) and self.mon_info[index][3]):
-            # 拓扑模式移不走主屏（Windows 实测 rc=87）。但"熄灭这块屏"这件事
-            # 本身是能做到的 —— 只是要换 DDC 待机，而它有个唤不回的历史风险，
-            # 所以必须由用户在这里点头，且只这一次，不写进配置（pitfalls N-04）。
-            if not self.msg.askyesno(
-                    "主屏不能从桌面移除",
-                    "「拓扑断开」只能移除副屏，Windows 不允许把主屏从桌面摘掉"
-                    "（实测 rc=87）。\n\n"
-                    "要改用「单屏待机」把主屏面板熄灭吗？\n"
-                    "· 桌面仍保留主屏，只是面板黑掉\n"
-                    "· 风险：个别面板待机后唤不回，只能按显示器电源键\n"
-                    "· 唤醒：点这一行的「显示」，或顶部的「点亮屏幕」\n\n"
-                    "（这次授权只管当下这一下，不会写进设置。）"):
+        if self.cfg.get("screen_off_method") == "topology":
+            anchors = selection_anchors([index])
+            if not anchors:
+                self.status_var.set("拿不到这块屏的锚点，无法单独断开")
                 return
-            self._busy_action = "off"
-            self._row_action = True
-            self.status_var.set("正在用单屏待机熄灭主屏 %d…" % index)
-            # allow_undeclared=True 来自上面这次显式确认
-            self.run_bg(lambda: screen_off_many([index], True),
-                        self._finish_screen_off, busy=True)
-            return
+            is_primary = (index < len(self.mon_info) and self.mon_info[index][3])
+            if is_primary:
+                # 主屏不能直接从拓扑里摘掉（Windows 实测 rc=87），但可以先把
+                # 主屏角色交给别人再摘 —— 全程纯拓扑操作，不碰面板电源。
+                self._ask_heir(index, anchors)
+                return
         self._busy_action = "off"
         self._row_action = True
         self.status_var.set("正在熄灭显示器 %d…" % index)
         self.run_bg(lambda: screen_off_cfg(self.cfg, [index]),
                     self._finish_screen_off, busy=True)
+
+    def _ask_heir(self, index, off_anchors):
+        """弹窗让用户挑一块屏接任主显示器。"""
+        cands = topology_heir_candidates(off_anchors)
+        if not cands:
+            self.msg.showwarning(
+                "没有屏可以接任主显示器",
+                "断开 %d 之后桌面上一块屏都不剩，Windows 不允许这样做（会黑屏）。\n\n"
+                "先把另一块显示器的线接上，或让虚拟显示器（串流）先用起来，再试。"
+                % index)
+            return
+        name = "显示器 %d" % index
+        if index < len(self.mon_models) and self.mon_models.get(index):
+            name = self.mon_models[index]
+
+        def picked(anchor):
+            self._busy_action = "off"
+            self._row_action = True
+            self.status_var.set("正在把主显示器交给另一块，然后断开 %s…" % name)
+            self.run_bg(lambda: topology_off([index], self.cfg, heir=anchor),
+                        self._finish_screen_off, busy=True)
+
+        try:
+            self._sheet = HeirSheet(self, cands, name, picked)
+        except Exception as e:
+            self.msg.showerror("打开选择框失败", "%s: %s" % (type(e).__name__, e))
 
     def monitor_on(self, index):
         """行内「显示」：只点亮这一块。"""
