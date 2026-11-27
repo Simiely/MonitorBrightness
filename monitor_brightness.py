@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.0"     # 设计纠偏：不再维护屏幕状态账；拓扑接回改为现读现算
+APP_VERSION = "2.01.1"     # 接回 rc=87 真机定论：source modeInfoIdx 绝不能是 INVALID
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
@@ -1550,8 +1550,9 @@ def _ccd_mode_entries(modes, mc):
 def _ccd_pick_mode(entries, info_type, ident):
     """按 (infoType, id) 找 mode 下标；找不到返回 None。
 
-    None 表示"这块屏的 mode 已不在当前 modes 数组里"（例如刚拔插过），
-    此时接回退化为 modeInfoIdx=INVALID，由 SDC_ALLOW_CHANGES 让 Windows 自己挑。
+    None 表示"这块屏的 mode 已不在当前 modes 数组里"（例如刚拔插过）。
+    **source mode 找不到就接不回来**（见 topology_plan_on 的护栏），
+    target/desktop 找不到则可以交给 Windows 定。
     """
     for i, t, ident_i in entries:
         if t == info_type and ident_i == int(ident):
@@ -1569,9 +1570,12 @@ def topology_plan_on(anchors, rows, mode_entries):
       - 只认 connected 的 path（拔了线的接不回来）；
       - VDD 永不作目标；
       - 已 ACTIVE 的锚点直接跳过（幂等：接两次和接一次结果一样）；
-      - source id 是 adapter 内独占资源，只挑没被其它 ACTIVE path 占用的。
+      - source id 是 adapter 内独占资源，只挑没被其它 ACTIVE path 占用的；
+      - **source mode 必须在当前 modes 数组里**，缺了就报错不硬提交——
+        置 INVALID 必 rc=87（真机矩阵，scripts/topology_repro87.py 步骤 6）。
 
-    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx。
+    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx；
+    sourceModeIdx 保证非 None，target/desktop 可能为 None（交给 Windows 定）。
     """
     wanted = [str(a) for a in (anchors or []) if a]
     rows = list(rows or [])
@@ -1594,11 +1598,18 @@ def topology_plan_on(anchors, rows, mode_entries):
             continue
         # 确定性：source id 最小 → pathIndex 最小。不依赖"上次用的是哪条"。
         pick = min(free, key=lambda r: (int(r["srcId"]), int(r["pathIndex"])))
+        smode = _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE, pick["srcId"])
+        if smode is None:
+            # 硬拦：source mode 缺失时任何提交都是 rc=87（真机矩阵，见
+            # scripts/topology_repro87.py 步骤 6）。宁可在计划阶段说清楚，
+            # 也不要打一条假的"降级"再失败。
+            errs.append("锚点 %s 的 source mode 不在当前 modes 数组里"
+                        "（刚拔插过？请重新插一次或重启，再接回）" % anchor)
+            continue
         plan.append({
             "pathIndex": int(pick["pathIndex"]), "anchor": anchor,
             "srcId": int(pick["srcId"]), "tgtId": int(pick["tgtId"]),
-            "sourceModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE,
-                                            pick["srcId"]),
+            "sourceModeIdx": smode,
             "targetModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_TARGET,
                                             pick["tgtId"]),
             "desktopModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_DESKTOP,
@@ -1609,21 +1620,31 @@ def topology_plan_on(anchors, rows, mode_entries):
 
 
 def _ccd_apply_plan_on(paths, plan):
-    """把接回计划就地写进 paths 数组。返回真正改动的锚点列表。"""
+    """把接回计划就地写进 paths 数组。返回真正改动的锚点列表。
+
+    ⚠️ **sourceInfo.modeInfoIdx 绝不能置 INVALID**（v2.01.1 真机定论）：
+    同一份数组只把这一个字段换成 0xFFFFFFFF，`SetDisplayConfig` 立刻
+    rc=87 ERROR_INVALID_PARAMETER；换成 targetInfo.modeInfoIdx=INVALID
+    反而 rc=0。所以"两个都交 Windows 挑"是错的，source 必须有有效值。
+    证据：scripts/topology_repro87.py 步骤 6（只用 SDC_VALIDATE，不改拓扑）。
+    """
     done = []
     for item in plan:
-        p = paths[item["pathIndex"]]
-        p.flags |= _CCD_PATH_ACTIVE
         s = item.get("sourceModeIdx")
+        if s is None:
+            # plan 阶段已经拦过；真走到这里只能跳过，硬写 INVALID 必然 rc=87。
+            # 注意必须在置 ACTIVE 之前判：半改的数组一旦提交就是 rc=87。
+            continue
         t = item.get("targetModeIdx")
         d = item.get("desktopModeIdx")
-        if None in (s, t, d):
-            # 模式查不到：置 INVALID，交给 SDC_ALLOW_CHANGES 由 Windows 挑
-            p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        p = paths[item["pathIndex"]]
+        p.flags |= _CCD_PATH_ACTIVE
+        p.sourceInfo.modeInfoIdx = ((int(s) << 16) | 0xFFFF) & 0xFFFFFFFF
+        if None in (t, d):
+            # 这块屏的 target/desktop mode 已不在 modes 数组里 → 交 Windows 定
             p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
         else:
-            p.sourceInfo.modeInfoIdx = ((s << 16) | 0xFFFF) & 0xFFFFFFFF
-            p.targetInfo.modeInfoIdx = ((t << 16) | d) & 0xFFFFFFFF
+            p.targetInfo.modeInfoIdx = ((int(t) << 16) | int(d)) & 0xFFFFFFFF
         p.sourceInfo.statusFlags = 0
         p.targetInfo.statusFlags = 0
         done.append(item["anchor"])
@@ -1693,19 +1714,27 @@ def topology_off(indices):
 
 
 def topology_inactive_rows(rows=None):
-    """给 GUI 用：拓扑里「设备还连着但 ACTIVE=0」的物理屏（断开的屏）。
+    """给 GUI 用：拓扑里「设备还连着但 ACTIVE=0」的屏——**全部**列出来。
 
-    VDD 永不显示（D4：不作目标）；ACTIVE 的屏由 enumerate_targets 那一行负责，
-    这里只返回多出来的、界面上原本看不到的行。纯函数，便于单测。
+    对齐 Windows 设置 → 屏幕：那里会把"断开但还接在机器上"的屏画出来，
+    虚拟显示器（VDD）也画。所以这里**不再排除 VDD**，只把 `vdd` 标记带出去，
+    由界面决定怎么呈现（VDD 不给「启用」按钮：它归串流软件管，
+    本程序断开/接回它是没有意义的，硬断还会让串流黑屏）。
+
+    纯函数，便于单测。VDD 仍然**永不作断开目标**——那是 topology_plan_off 的护栏，
+    和"能不能看见"是两件事。
     """
     rows = rows if rows is not None else ccd_probe_topology()
     out = []
     for r in rows:
-        if r.get("vdd") or r.get("active") or not r.get("anchor"):
+        if r.get("active") or not r.get("anchor"):
+            continue
+        if not r.get("connected", True):
             continue
         out.append({"anchor": r["anchor"],
                     "friendly": r.get("friendly") or "",
-                    "gdi": r.get("gdi") or ""})
+                    "gdi": r.get("gdi") or "",
+                    "vdd": bool(r.get("vdd"))})
     return out
 
 
@@ -1772,10 +1801,23 @@ def topology_on(anchors):
     步骤：现读拓扑 → 现算要动哪几条 path / 哪个 mode → 提交 → 有界回读。
     同一块屏接两次与接一次结果相同（已 ACTIVE 的锚点直接跳过）。
 
-    两级尝试（每级都重新现读，绝不复用被改过的数组）：
-      1) 用现算的 modeInfoIdx 提交（真机实测与 Windows 自己填的值逐位一致）；
-      2) 被拒时降级为 modeInfoIdx=INVALID，交给 SDC_ALLOW_CHANGES 让 Windows 挑。
-    第 2 级比第 1 级"少指定信息"，不会更差；两级都失败就报错，拓扑保持原样。
+    两档，每档都重新现读、绝不复用被改过的数组；**只有上一档被拒才降级**，
+    所以 events.log 里每一句"改用…重试"都是真的发生过（v2.01.1 修：原来那句
+    提示写在第一档里无条件输出，一次成功也被写成了"降级后成功"）：
+      1) 现算 source/target/desktop 三个 modeInfoIdx —— 忠于这块屏原来的
+         分辨率和桌面位置（`--verify` 证明与 Windows 自己填的逐位一致）。
+      2) source 仍用现算值，target/desktop 交 INVALID 让 Windows 定
+         （真机验证过：只把 target 置 INVALID 能过校验，rc=0）。
+
+    ⚠️ 两条真机定论（都用 SDC_VALIDATE 验的，没有一次改动拓扑；
+      scripts/topology_repro87.py 可复跑）：
+      - **sourceInfo.modeInfoIdx 一旦置 INVALID 就必然 rc=87**，加多少
+        ALLOW_CHANGES / PATH_PERSIST / FORCE_MODE_ENUMERATION 都救不回来。
+        所以"两个都交 Windows 挑"这条老路是死的，source mode 必须有有效值；
+        算不出 source mode 就由 topology_plan_on 在计划阶段直接报错。
+      - **全量提交（整份 QDC_ALL_PATHS 233 条）本身是合法的，rc=0**。
+        曾经怀疑"224 条未连接组合导致 87"并改成 SDC_TOPOLOGY_SUPPLIED 部分
+        提交——实测部分提交才是 87，那个方向是错的，已撤销。
 
     返回 (成功下标列表, [(下标, 错误), ...], restored_anchors)。
     亮度不在这里写：断开源在接回后才重新出现在 EnumDisplayMonitors 里，
@@ -1784,8 +1826,11 @@ def topology_on(anchors):
     u32 = _ccd_api()
     if u32 is None:
         return [], [(-1, "拓扑模式仅支持 Windows")], []
+    tries = ("full", "windows-picks-target")
+    labels = {"full": "现算 modeInfoIdx",
+              "windows-picks-target": "target/desktop 交 Windows 定"}
     last_err = "CCD 查询失败，未做任何改动"
-    for relax in (False, True):
+    for n, mode in enumerate(tries):
         raw = _ccd_query_raw(u32)
         if raw is None:
             return [], [(-1, last_err)], []
@@ -1794,21 +1839,21 @@ def topology_on(anchors):
                                             _ccd_mode_entries(modes, mc))
         if errs:
             return [], [(-1, e) for e in errs], []
-        if noop:
+        if noop:                       # 已经全亮：不提交、不写日志
             return [], [], []
-        if relax:
+        if mode != "full":
             for item in plan:
-                item["sourceModeIdx"] = item["targetModeIdx"] = \
-                    item["desktopModeIdx"] = None
-            _write_event_log("拓扑接回：现算 mode 被拒，降级为由 Windows 自选模式")
+                item["targetModeIdx"] = item["desktopModeIdx"] = None
         restored = _ccd_apply_plan_on(paths, plan)
         rc = _ccd_apply(u32, paths, modes, pc, mc)
-        if rc != 0:
-            last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
-            continue
-        if not _ccd_wait_state(restored, True):
-            return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
-        return topology_indices_for_anchors(restored), [], restored
+        if rc == 0:
+            if not _ccd_wait_state(restored, True):
+                return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
+            return topology_indices_for_anchors(restored), [], restored
+        last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
+        if n + 1 < len(tries):
+            _write_event_log("拓扑接回：%s 被拒 rc=%d，改用%s重试"
+                             % (labels[mode], rc, labels[tries[n + 1]]))
     return [], [(-1, last_err)], []
 
 
@@ -4294,8 +4339,9 @@ class MonitorPanel:
                         info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
                 Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
                 self.mon_rows[i] = row
-            # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置），
-            # 灰显 + 右侧「启用」按钮。VDD 永不显示；默认 ddc/system 路径没有这些行。
+            # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置 →
+            # 屏幕，那里连虚拟显示器都会画出来）。物理屏给「启用」按钮；
+            # VDD 只显示不给按钮——它归串流软件管，本程序断/接它没有意义。
             for extra in (getattr(self.app, "topo_inactive", None) or []):
                 row = tk.Frame(self.inner, bg=UI["card"])
                 row.pack(fill="x")
@@ -4303,14 +4349,18 @@ class MonitorPanel:
                     side="left", fill="y", padx=(6, 0), pady=7)
                 txt = tk.Frame(row, bg=UI["card"])
                 txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
+                is_vdd = bool(extra.get("vdd"))
                 Label(txt, extra.get("friendly") or "断开的显示器",
                       size=9, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
-                Label(txt, "已断开 · 设备仍连接（点「启用」接回）",
+                Label(txt, ("虚拟显示器 · 由串流软件管理，本程序不启用也不断开"
+                            if is_vdd else
+                            "已断开 · 设备仍连接（点「启用」接回）"),
                       size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
-                Button(row, "启用",
-                       lambda a=extra["anchor"]: self.app.topology_enable(a),
-                       kind="link", height=18, pad_bg=UI["card"],
-                       font_size=8).pack(side="right", padx=(0, 8))
+                if not is_vdd:
+                    Button(row, "启用",
+                           lambda a=extra["anchor"]: self.app.topology_enable(a),
+                           kind="link", height=18, pad_bg=UI["card"],
+                           font_size=8).pack(side="right", padx=(0, 8))
         finally:
             self._suspend = False
 

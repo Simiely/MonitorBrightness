@@ -955,7 +955,12 @@ class MonitorIdentityTest(unittest.TestCase):
 class TopologyGuiTest(TempConfigCase):
     """拓扑模式 GUI：断开的屏要列出来且可「启用」；VDD 永不显示。"""
 
-    def test_inactive_rows_exclude_vdd_and_active(self):
+    def test_inactive_rows_include_vdd_with_flag(self):
+        """对齐 Windows 设置→屏幕：断开的屏全列出来，虚拟屏也列（只带标记）。
+
+        VDD 仍然永不作**断开目标**（topology_plan_off 的护栏），
+        "能不能看见"和"能不能动它"是两件事。
+        """
         rows = [
             {"anchor": "A1", "active": True, "vdd": False, "friendly": "P1", "gdi": "DISPLAY1"},
             {"anchor": "A2", "active": False, "vdd": False, "friendly": "P2", "gdi": "DISPLAY2"},
@@ -963,7 +968,15 @@ class TopologyGuiTest(TempConfigCase):
             {"anchor": "", "active": False, "vdd": False, "friendly": "?", "gdi": ""},
         ]
         got = mb.topology_inactive_rows(rows)
-        self.assertEqual([r["anchor"] for r in got], ["A2"])
+        self.assertEqual([r["anchor"] for r in got], ["A2", "V1"])
+        self.assertFalse(got[0]["vdd"])
+        self.assertTrue(got[1]["vdd"])
+
+    def test_inactive_rows_skip_unplugged(self):
+        """真拔了线的（connected=False）不列——那不是"断开"，是没了。"""
+        rows = [{"anchor": "A3", "active": False, "connected": False,
+                 "vdd": False, "friendly": "P3", "gdi": ""}]
+        self.assertEqual(mb.topology_inactive_rows(rows), [])
 
     def test_enable_passes_anchor_to_current_topology(self):
         """v2.01.0：启用不再查历史快照，直接把这块屏交给「现读现算」的接回。"""
@@ -984,7 +997,8 @@ class TopologyGuiTest(TempConfigCase):
         self.assertIn("锚点", errs[0][1])
         on.assert_not_called()
 
-    def test_panel_renders_disconnected_row_with_enable_button(self):
+    def test_panel_renders_disconnected_rows_like_windows_settings(self):
+        """断开的物理屏给「启用」；虚拟屏也列出来但不给按钮。"""
         try:
             import tkinter as tk
         except Exception as e:                       # pragma: no cover
@@ -999,7 +1013,12 @@ class TopologyGuiTest(TempConfigCase):
                 body=tk.Frame(root), cfg=mb.default_config(),
                 monitors=[{"index": 0, "dev": "DISPLAY1"}],
                 mon_info=[("DISPLAY1", 2560, 1440, True)], mon_models={},
-                topo_inactive=[{"anchor": "A2", "friendly": "R27qe Gen2", "gdi": "DISPLAY2"}],
+                topo_inactive=[
+                    {"anchor": "A2", "friendly": "R27qe Gen2", "gdi": "DISPLAY2",
+                     "vdd": False},
+                    {"anchor": "V1", "friendly": "VDD by MTT", "gdi": "DISPLAY92",
+                     "vdd": True},
+                ],
                 refresh_monitors=lambda silent=False: None,
                 read_current=lambda: None,
                 on_monitor_toggle=lambda: None,
@@ -1019,10 +1038,13 @@ class TopologyGuiTest(TempConfigCase):
                                 pass
             self.assertTrue(any("已断开" in t for t in texts), texts)
             self.assertTrue(any("R27qe Gen2" in t for t in texts), texts)
+            # 第三块屏（虚拟显示器）也要出现在列表里
+            self.assertTrue(any("VDD by MTT" in t for t in texts), texts)
+            self.assertTrue(any("虚拟显示器" in t for t in texts), texts)
             buttons = [w for row in panel.inner.winfo_children()
                        for w in row.winfo_children()
                        if getattr(w, "_text", None) == "启用"]
-            self.assertEqual(len(buttons), 1)
+            self.assertEqual(len(buttons), 1, "只有物理屏给「启用」，虚拟屏不给")
         finally:
             root.destroy()
 
@@ -1290,8 +1312,12 @@ class ApplyCallbackTest(unittest.TestCase):
         self.assertEqual(seen["result"], ([0], []))
 
 
-class TopologyActionTest(TempConfigCase):
-    """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
+class _TopoFixture(TempConfigCase):
+    """拓扑动作层测试的共用夹具。
+
+    单独抽出来当基类（不含 test_*），是为了让下面两个测试类共享同一份
+    假拓扑而**不重复执行**彼此的用例。
+    """
 
     ROWS_RAW = [
         {"pathIndex": 0, "index": 0, "anchor": "A1", "active": True, "connected": True,
@@ -1359,6 +1385,9 @@ class TopologyActionTest(TempConfigCase):
                                        return_value=list(self.TARGETS)),
             unittest.mock.patch.object(mb, "release_targets"),
         )
+
+class TopologyActionTest(_TopoFixture):
+    """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
 
     def test_config_option_added_without_changing_default(self):
         self.assertIn("topology", mb.OFF_METHODS)
@@ -1451,7 +1480,7 @@ class TopologyActionTest(TempConfigCase):
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
                 unittest.mock.patch.object(mb, "_ccd_query_raw",
-                                           return_value=self._off_raw()), \
+                                           side_effect=lambda *a, **k: self._off_raw()), \
                 unittest.mock.patch.object(mb, "_ccd_apply",
                                            side_effect=lambda *a: calls.append("apply") or 0), \
                 unittest.mock.patch.object(mb, "_ccd_wait_state",
@@ -1474,7 +1503,7 @@ class TopologyActionTest(TempConfigCase):
         # 断开期间算出的 indices 只有主屏 [0]；接回后 A2 重新成为 [1]。
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
                 unittest.mock.patch.object(mb, "_ccd_query_raw",
-                                           return_value=self._off_raw()), \
+                                           side_effect=lambda *a, **k: self._off_raw()), \
                 unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
                 unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
                 unittest.mock.patch.object(mb, "topology_indices_for_anchors",
@@ -1505,7 +1534,7 @@ class TopologyActionTest(TempConfigCase):
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
                 unittest.mock.patch.object(mb, "_ccd_query_raw",
-                                           return_value=self._off_raw()), \
+                                           side_effect=lambda *a, **k: self._off_raw()), \
                 unittest.mock.patch.object(mb, "_ccd_apply", return_value=87), \
                 unittest.mock.patch.object(mb, "set_brightness_many") as bright:
             ok, errs = mb.screen_on_cfg(cfg, [1])
@@ -1517,7 +1546,7 @@ class TopologyActionTest(TempConfigCase):
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
                 unittest.mock.patch.object(mb, "_ccd_query_raw",
-                                           return_value=self._off_raw()), \
+                                           side_effect=lambda *a, **k: self._off_raw()), \
                 unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
                 unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=False), \
                 unittest.mock.patch.object(mb, "set_brightness_many") as bright:
@@ -1525,6 +1554,143 @@ class TopologyActionTest(TempConfigCase):
         self.assertEqual(ok, [])
         self.assertIn("回读未确认", errs[0][1])
         bright.assert_not_called()
+
+
+class TopologySubmitShapeTest(_TopoFixture):
+    """v2.01.1：钉住"提交什么形状"，这是 rc=87 的唯一开关。
+
+    三条真机定论（SDC_VALIDATE 验的，scripts/topology_repro87.py 可复跑）：
+      - sourceInfo.modeInfoIdx=INVALID → 必 87，补多少旗标都救不回来；
+      - targetInfo.modeInfoIdx=INVALID → rc=0，可以交 Windows 定；
+      - 整份 QDC_ALL_PATHS（233 条）全量提交 → rc=0，不是 rc=87 的原因。
+        曾经据此改过 SDC_TOPOLOGY_SUPPLIED 部分提交，实测那才是 87，已撤销。
+    """
+
+    class _Fn:
+        """够 `_ccd_apply` 用的假 SetDisplayConfig（能挂 argtypes、能记 flags）。"""
+
+        def __init__(self, rc=0):
+            self.argtypes = None
+            self.restype = None
+            self.seen = None
+            self.rc = rc
+
+        def __call__(self, *a):
+            self.seen = a
+            return self.rc
+
+    def _fake_u32(self, rc=0):
+        fn = self._Fn(rc)
+        return types.SimpleNamespace(SetDisplayConfig=fn), fn
+
+    def test_ccd_apply_always_uses_one_submit_mode(self):
+        """只有一种提交方式：SDC_USE_SUPPLIED 全量，且绝不带 SDC_TOPOLOGY_SUPPLIED。"""
+        u32, fn = self._fake_u32()
+        paths = (mb._CcdPathInfo * 2)()
+        mb._ccd_apply(u32, paths, (mb._CcdModeInfo * 1)(), 2, 1)
+        flags = fn.seen[-1]
+        self.assertTrue(flags & mb._SDC_USE_SUPPLIED)
+        self.assertFalse(flags & 0x00000010)      # SDC_TOPOLOGY_SUPPLIED
+        self.assertFalse(hasattr(mb, "_CCD_PARTIAL_FLAGS"))
+        self.assertFalse(hasattr(mb, "_ccd_plan_paths"))
+
+    def test_plan_rejects_when_source_mode_missing(self):
+        """source mode 查不到就没法提交（置 INVALID 必 87），计划阶段直接报错。"""
+        rows = self._off_raw()[4]
+        plan, errs, noop = mb.topology_plan_on(["A2"], rows, [])
+        self.assertEqual(plan, [])
+        self.assertFalse(noop)
+        self.assertIn("source mode", errs[0])
+
+    def test_plan_allows_missing_target_mode(self):
+        """target/desktop mode 查不到不算错，交 Windows 定。"""
+        rows = self._off_raw()[4]
+        entries = [(3, 1, 1)]                     # 只给 source(1,id=1)
+        plan, errs, _ = mb.topology_plan_on(["A2"], rows, entries)
+        self.assertEqual(errs, [])
+        self.assertEqual(plan[0]["sourceModeIdx"], 3)
+        self.assertIsNone(plan[0]["targetModeIdx"])
+        self.assertIsNone(plan[0]["desktopModeIdx"])
+
+    def test_apply_plan_never_writes_invalid_source(self):
+        """source mode 缺失时宁可不写这条 path，也不写 INVALID 去换 rc=87。"""
+        paths = (mb._CcdPathInfo * 1)()
+        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": None,
+                 "targetModeIdx": 4, "desktopModeIdx": 5}]
+        done = mb._ccd_apply_plan_on(paths, plan)
+        self.assertEqual(done, [])
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0)   # 没被动过
+        self.assertFalse(paths[0].flags & mb._CCD_PATH_ACTIVE)
+
+    def test_apply_plan_writes_invalid_target_only(self):
+        paths = (mb._CcdPathInfo * 1)()
+        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": 3,
+                 "targetModeIdx": None, "desktopModeIdx": None}]
+        mb._ccd_apply_plan_on(paths, plan)
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0x0003FFFF)
+        self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0xFFFFFFFF)
+
+    def test_on_falls_back_to_windows_target_choice(self):
+        """降级链只有两档：现算三元组 → source 现算 + target/desktop 交 Windows。"""
+        seq = []
+        logs = []
+
+        def fake_apply(u32, paths, modes, pc, mc):
+            seq.append((pc, int(paths[1].sourceInfo.modeInfoIdx),
+                        int(paths[1].targetInfo.modeInfoIdx)))
+            return 87 if len(seq) < 2 else 0
+
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a, **k: self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "_write_event_log",
+                                           side_effect=logs.append):
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(errs, [])
+        self.assertEqual(ok, [1, 1])
+        self.assertEqual(len(seq), 2)
+        # 两次都交整份数组（pc 不变），source mode 两次都是有效值
+        self.assertEqual(seq[0][0], seq[1][0])
+        self.assertNotEqual(seq[0][1], 0xFFFFFFFF)
+        self.assertNotEqual(seq[1][1], 0xFFFFFFFF)
+        self.assertEqual(seq[0][1], seq[1][1])
+        # 第一档给了 target mode，第二档交 Windows
+        self.assertNotEqual(seq[0][2], 0xFFFFFFFF)
+        self.assertEqual(seq[1][2], 0xFFFFFFFF)
+        # 降级必须真的被拒过一次才写日志
+        self.assertEqual(len(logs), 1)
+        self.assertIn("被拒 rc=87", logs[0])
+
+    def test_on_first_tier_success_writes_no_warning(self):
+        """回归：旧代码在第一档里无条件写"现算 mode 被拒"，一次成功也说降级过。"""
+        logs = []
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a, **k: self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "_write_event_log",
+                                           side_effect=logs.append):
+            mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(logs, [])
+
+
+class TopologyScheduleTest(_TopoFixture):
+    """D3：档位层与拓扑接回的边界——亮度只能由 screen_on_cfg 在接回**之后**写。"""
 
     def test_schedule_off_skips_brightness_in_topology_mode(self):
         cfg = self._cfg(screen_off_method="topology")
@@ -1607,13 +1773,11 @@ class TopologyPlanOnTest(unittest.TestCase):
         self.assertIn("没有空闲 source", errs[0])
 
     def test_plan_returns_none_mode_when_mode_gone(self):
-        """mode 数组里查不到这块屏：plan 仍然给出，但三个下标为 None（交给 Windows 挑）。"""
+        """source mode 缺失 → 计划阶段报错（置 INVALID 必 rc=87，不能硬提交）。"""
         plan, errs, _ = mb.topology_plan_on(["A2"], self.ROWS, [])
-        self.assertEqual(errs, [])
-        self.assertEqual(len(plan), 1)
-        self.assertIsNone(plan[0]["sourceModeIdx"])
-        self.assertIsNone(plan[0]["targetModeIdx"])
-        self.assertIsNone(plan[0]["desktopModeIdx"])
+        self.assertEqual(plan, [])
+        self.assertEqual(len(errs), 1)
+        self.assertIn("source mode", errs[0])
 
     def test_apply_plan_writes_bitexact_layout(self):
         paths = (mb._CcdPathInfo * 1)()
@@ -1624,12 +1788,13 @@ class TopologyPlanOnTest(unittest.TestCase):
         self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0x0003FFFF)
         self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0x00040005)
 
-    def test_apply_plan_falls_back_to_invalid(self):
+    def test_apply_plan_keeps_source_and_lets_target_be_invalid(self):
+        """真机矩阵：source 必须有效，target/desktop 可以 INVALID。"""
         paths = (mb._CcdPathInfo * 1)()
-        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": None,
+        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": 3,
                  "targetModeIdx": None, "desktopModeIdx": None}]
         mb._ccd_apply_plan_on(paths, plan)
-        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0xFFFFFFFF)
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0x0003FFFF)
         self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0xFFFFFFFF)
 
     def test_snapshot_helpers_are_memory_only(self):

@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · v2.01.1：接回 rc=87 的真机定论（推翻我自己上一轮的诊断）
+
+现场：点「点亮屏幕」弹出 `SetDisplayConfig 失败 rc=87`，events.log 里 15:50 / 15:59
+一共 4 次「拓扑接回：现算 mode 被拒，降级为由 Windows 自选模式」。
+
+**先说结论：上一轮我的两处判断都是错的。**
+
+1. **那句日志是假的。** 它写在第 1 档（`use_plan_modes=False`）的 `else` 分支里，
+   无条件输出——第 1 档成功时也会打出来。所以我看到的"现算 mode 总是被拒"
+   根本不是事实。
+2. **据此做的"修复"方向反了。** 我以为 87 来自"`QDC_ALL_PATHS` 的 233 条里
+   有 224 条未连接组合，全量提交过不了 full solution 校验"，于是把接回改成
+   `SDC_TOPOLOGY_SUPPLIED` 部分提交。实测**部分提交才是 87**，全量提交一直是好的。
+
+真机定论（`scripts/topology_repro87.py`，全程只用 `SDC_VALIDATE`，不改拓扑）：
+
+| # | 提交形态 | rc |
+|---|---|---|
+| C1 | 全量 233 条（含 224 条未连接组合），现状原样重交 | **0** |
+| C2 | `sourceInfo.modeInfoIdx = INVALID` | **87**（加 `PATH_PERSIST_IF_REQUIRED` / `FORCE_MODE_ENUMERATION` / `ALLOW_PATH_ORDER_CHANGES` 全部无效） |
+| C3 | `targetInfo.modeInfoIdx = INVALID`（source 有效） | **0** |
+
+即：**source 侧 mode 是硬要求，target/desktop 侧可以交 Windows 定。**
+老代码 `if None in (s, t, d)` 把**两个**都置 INVALID —— 这才是 rc=87 的唯一来源。
+
+**修复**
+
+- `_ccd_apply_plan_on()`：`sourceInfo.modeInfoIdx` 永不为 INVALID；只有
+  `targetModeIdx` / `desktopModeIdx` 缺失时才把 target 侧交 Windows。
+  source 缺失时**不改这条 path**（半改的数组提交上去就是 87）。
+- `topology_plan_on()`：source mode 查不到时进 `errs`，在**计划阶段**就拒绝，
+  错误文案写明"请重新插一次或重启，再接回"——不再硬提交换一个裸 rc=87。
+- `topology_on()` 两档：`现算三元组` → `source 现算 + target/desktop 交 Windows`。
+  删除 `SDC_TOPOLOGY_SUPPLIED` / `_CCD_PARTIAL_FLAGS` / `_ccd_plan_paths()`（已被证伪）。
+- 降级日志只在**真的**被拒之后才写，且带上真实 rc。
+- 新增 `scripts/topology_repro87.py`：上面三条结论的可复跑证据。
+- 测试 95 → 102（新增 `TopologySubmitShapeTest`，钉住"source 绝不 INVALID"、
+  "只有一种提交方式"、"降级必须真的被拒过"）。
+
+> ⚠️ 仍未验证：**真实断开之后** Windows 会不会把那块屏的 source mode 从 modes
+> 数组里丢掉。如果会，症状从"裸 rc=87"变成一句明确的
+> 「锚点 … 的 source mode 不在当前 modes 数组里」。需要真机点一次
+> 「熄灭屏幕」→「点亮屏幕」才能确认。
+
 ### 2026-11-27 · 设计纠偏 v2.01.0：程序不维护任何屏幕状态
 
 > 用户纠偏原文："拓扑就是可以被修改的，这个软件的职责只是读取当前状态和调整当前状态。
@@ -38,6 +82,7 @@
   现算出的三元组与 Windows 自己填的值**逐位一致**
   （path#0 `0x0001FFFF/0x00000002`、path#1 `0x0004FFFF/0x00030005`）。
 - 两级尝试：现算 mode 被拒时降级为 `INVALID` 交 `SDC_ALLOW_CHANGES` 由 Windows 挑。
+  （**v2.01.1 推翻**：这一档把 source 侧也置了 INVALID，必然 rc=87，真机矩阵见上。）
 - 快照只活在**内存**里，仅供本次操作失败回滚；`_ccd_save_snapshot` /
   `_ccd_load_snapshot` / `topology_snapshot_path` / `TOPO_SNAPSHOT_FILE` 全部删除。
 - `topology_enable_anchor()` 不再检查"快照里有没有它"，只问当前拓扑 connected+inactive。

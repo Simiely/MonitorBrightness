@@ -11,7 +11,7 @@
 """
 import os
 
-VERSION_DIR = "dist_v2010"          # ← 每次打包改这里（v2.01.0）
+VERSION_DIR = "dist_v2011"          # ← 每次打包改这里（v2.01.1）
 for k in ("TCL_LIBRARY", "TK_LIBRARY", "PYTHONPATH"):
     os.environ.pop(k, None)
 assert "TCL_LIBRARY" not in os.environ
