@@ -214,10 +214,15 @@ class App(_BrightnessActions, _ScreenPowerActions, _ScheduleActions,
 
 
     def _start(self, start_minimized):
-        """启动序列：枚举 → 任务状态 → 探测 → 托盘 → 延迟自检。"""
-        self.refresh_monitors(silent=True)
+        """启动序列：先让窗口画出来，再枚举/探测。
+
+        启动优化（不升版号）：`refresh_monitors` 会同步枚举 DDC + CCD，
+        原来在 mainloop 之前跑，窗口要等它做完才可见。
+        现在用 after(50) 把首屏探测挪到第一帧之后，窗口先出、列表晚一点填。
+        `refresh_task_status` 本来就走后台，保持在前面不占首屏。
+        """
+        self.root.after(50, self._start_probe)
         self.refresh_task_status()
-        self.probe_screens()
         if self.cfg.get("tray_enabled", True):
             self._create_tray()
         if start_minimized and self.tray is not None:
@@ -225,14 +230,6 @@ class App(_BrightnessActions, _ScreenPowerActions, _ScheduleActions,
 
         # 配置读坏的显式提示（不能静默吞掉：用户的设置还在坏文件里）
         self.root.after(150, self._warn_config_error)
-        # 首次启动：自动把检测到的显示器锚点写进配置（v2.01.17）。
-        # 原因：锚点只在用户手动勾选时才存，首次打开配置里 anchors 是空的，
-        # 定时/熄灭逻辑只能靠纯 index 兜底，换屏/重排后就会认错屏。
-        # 用 after_idle（Tk 官方推荐的"窗口显示后再初始化"做法，Bryan Oakley）：
-        # 等窗口可见、显示器列表建好再做，不阻塞首屏绘制。
-        # 只在"从未保存过锚点"时写一次，不覆盖用户后续的手动选择。
-        if not (self.cfg.get("monitor_anchors") or []):
-            self.root.after_idle(self._first_run_detect)
 
         # 启动后台自检：只校验任务定义与当前进程是否一致（不一致则原地重建）。
         # 不补执行、不改亮度、不熄屏；900ms 是给首屏探测让路，全程后台线程。
@@ -245,6 +242,17 @@ class App(_BrightnessActions, _ScreenPowerActions, _ScheduleActions,
             _write_event_log("检测到旧版配置（未自动迁移）：%s" % old_cfg)
             self.root.after(1400, lambda p=old_cfg: self.status_var.set(
                 "旧版配置在 %s；要沿用就手动复制 config.json 到程序目录" % p))
+
+    def _start_probe(self):
+        """首帧之后的首次枚举：先把窗口画出来，再填显示器列表。
+
+        首次启动还要补写锚点（v2.01.17）：只在"从未保存过锚点"时写一次，
+        不覆盖用户后续的手动选择；必须等 refresh_monitors 建好列表后再跑。
+        """
+        self.refresh_monitors(silent=True)
+        self.probe_screens()
+        if not (self.cfg.get("monitor_anchors") or []):
+            self.root.after_idle(self._first_run_detect)
 
     def _fit_window(self):
         """内容晚到（任务状态行/显示器行）后按请求尺寸重排窗口。
