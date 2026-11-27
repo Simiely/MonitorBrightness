@@ -135,6 +135,31 @@ path#1 `0x0004FFFF/0x00030005`）。
 跨机器待办按用户要求暂缓；E3 的实现以本机 C2–C5 实测数据为依据，
 其余显卡 / Python 版本 / Windows 版本的行为仍需回传 `topology_probe.py --json` 再确认。
 
+## 临时模块：诊断日志（v2.01.4 引入，问题收敛后删）
+
+用户要求"先加日志方便定位，软件稳定后再去掉"，所以这个模块的唯一额外要求是
+**好删**。它只有两个函数、埋点全是单行 `dlog(...)`。
+
+- 落盘：`%APPDATA%\MonitorBrightness\diag.log`，JSON Lines，单文件超 512KB
+  轮转一份 `.1`。
+- 开关：配置项 `diag_log`（默认开）。界面在 设置 → 关于；命令行 `--diag-log`
+  直接打印最近 200 行，`--diag` 里显示路径与开关状态。
+- tag 前缀：`app.*` / `screen.*` / `topo.*` / `ccd.*` / `sch.*`。
+  一次接回可以这样串起来看：
+  `findstr /c:"\"tag\": \"topo.on" diag.log`
+
+**删除清单（四步）**
+
+1. 删掉 `monitor_brightness.py` 里 `# ==== 诊断日志（临时模块` 到
+   `# 诊断日志结束` 之间整段；
+2. 删掉 `SETTINGS` 的 `diag_log` 项，以及 `load_config`、`apply_setting`
+   里各一行同步；
+3. 删掉设置页「关于」里的两个 row 与 `App.open_log_dir`；
+4. `grep -n "dlog(" monitor_brightness.py` 逐行删掉埋点，再删 `--diag-log`
+   分支和 `--diag` 里那两行输出。
+
+删完跑 `py -m unittest tests.test_core`：`DiagLogTest` 会红，把它一并删掉即可。
+
 ## 待办：跨机器验证（用户指定，稍后执行）
 
 当前所有实测只在**一台**机器（Win11 26100 / RTX 4070 SUPER + Intel 核显 /

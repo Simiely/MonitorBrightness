@@ -24,6 +24,27 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import monitor_brightness as mb
 
+_MODULE_TMP = None
+
+
+def setUpModule():
+    """整份测试都不许写用户的真实配置 / 日志目录。
+
+    有些用例类（TopologyPlanOnTest 等）直接继承 unittest.TestCase，不经过
+    TempConfigCase；它们一旦触发 dlog / _write_event_log，就会写到
+    %APPDATA%\\MonitorBrightness 去 —— 实测把单元测试的假数据写进了真实
+    diag.log。这里给整份测试兜一个临时目录。
+    """
+    global _MODULE_TMP
+    _MODULE_TMP = tempfile.mkdtemp(prefix="mb-test-module-")
+    mb.CONFIG_DIR = _MODULE_TMP
+    mb.CONFIG_FILE = os.path.join(_MODULE_TMP, "config.json")
+    mb.EVENTS_FILE = os.path.join(_MODULE_TMP, "events.log")
+
+
+def tearDownModule():
+    shutil.rmtree(_MODULE_TMP, ignore_errors=True)
+
 
 def pump_ui(root, rounds=2):
     """跑固定轮数的 Tk 事件循环，把 UI 回归用例从墙钟时间上摘下来。
@@ -1126,6 +1147,58 @@ def _row_button_texts(row):
             out.append(w._text)
         queue.extend(w.winfo_children())
     return out
+
+
+class DiagLogTest(TempConfigCase):
+    """诊断日志（临时模块 v2.01.4）：模块删掉时这组测试一起删。"""
+
+    def tearDown(self):
+        mb.diag_set_enabled(False)      # 默认关闭，别让其它用例往日志里写
+        super().tearDown()
+
+    def test_writes_one_json_line_with_tag_and_fields(self):
+        mb.diag_set_enabled(True)
+        mb.dlog("topo.on", anchors=["A2"], pc=233)
+        lines = mb.diag_dump()
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertEqual(rec["tag"], "topo.on")
+        self.assertEqual(rec["anchors"], ["A2"])
+        self.assertEqual(rec["pc"], 233)
+        for key in ("t", "pid", "th"):
+            self.assertIn(key, rec)
+
+    def test_disabled_writes_nothing_at_all(self):
+        mb.diag_set_enabled(False)
+        mb.dlog("topo.on", a=1)
+        self.assertEqual(mb.diag_dump(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "diag.log")))
+
+    def test_long_value_is_truncated(self):
+        mb.diag_set_enabled(True)
+        mb.dlog("x", big="a" * 2000)
+        rec = json.loads(mb.diag_dump()[0])
+        self.assertLessEqual(len(rec["big"]), 601)
+
+    def test_path_follows_config_dir(self):
+        """CONFIG_DIR 会被测试/便携模式改，路径必须现算，不能导入时定死。"""
+        self.assertEqual(mb._diag_file(), os.path.join(self.tmp, "diag.log"))
+
+    def test_load_config_syncs_the_switch(self):
+        cfg = mb.default_config()
+        cfg["diag_log"] = False
+        mb.save_config(cfg)
+        mb.load_config()
+        self.assertFalse(mb.diag_enabled())
+
+    def test_rotation_keeps_one_old_file(self):
+        mb.diag_set_enabled(True)
+        path = os.path.join(self.tmp, "diag.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x" * (mb._DIAG_LIMIT + 10))
+        mb.dlog("after.rotate")
+        self.assertTrue(os.path.exists(path + ".1"))
+        self.assertEqual(json.loads(mb.diag_dump()[0])["tag"], "after.rotate")
 
 
 class WalkthroughRound2Test(TempConfigCase):

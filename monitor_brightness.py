@@ -13,6 +13,7 @@
       MonitorBrightness.exe --list                        列出显示器
       MonitorBrightness.exe --probe                       实测每台显示器的亮灭
       MonitorBrightness.exe --diag                        只读诊断报告（排查点不亮）
+      MonitorBrightness.exe --diag-log                    打印最近的诊断日志（排障用）
       MonitorBrightness.exe --screen off|on|status        熄灭 / 点亮选中的显示器
       MonitorBrightness.exe --selftest                    自检（打印时间分档判定结果）
 
@@ -70,7 +71,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.3"     # 接回摆回原位；每行独立的熄灭/显示按钮
+APP_VERSION = "2.01.4"     # 加临时诊断日志模块（diag.log / --diag-log）
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
@@ -197,6 +198,8 @@ SETTINGS = (
     # 断开之后这个信息就再也读不到了（Windows 会把该屏的 mode 项摘掉），
     # 所以只能在断开前抓一次。
     {"key": "monitor_positions", "kind": "positions", "default": {}},
+    # 诊断日志开关（临时项，v2.01.4 引入；问题收敛后连同 dlog 一起删掉）。
+    {"key": "diag_log", "kind": "flag", "default": True},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 6
@@ -364,6 +367,99 @@ def read_recent_events(limit=3):
 _EVENT_LOCK = threading.Lock()
 
 
+# ============================================================================
+# 诊断日志（临时模块，v2.01.4 引入）
+# ----------------------------------------------------------------------------
+# 目的：趁问题还没收敛，把"当时到底读到了什么、算了什么、提交了什么、回来什么"
+# 原样落盘，省掉来回猜。**问题收敛后整块删掉**，删除清单只有四条：
+#   1) 删掉本节（DIAG_FILE ~ diag_dump，含 _DIAG_* 全局量）；
+#   2) 删掉 SETTINGS 里的 "diag_log" 一项（grep diag_log）；
+#   3) 删掉界面里两处（设置页的开关行、日志卡片的「打开目录」按钮）；
+#   4) `grep -n "dlog(" monitor_brightness.py` 把埋点行整行删掉。
+# 为了好删，这里只暴露两个函数、埋点一律写成单行 dlog(...)，不写多行调用。
+#
+# 格式是 JSON Lines：一行一个 JSON，字段固定 t/pid/th/lv/tag + 自定义键。
+# 排查时 `findstr /c:"\"tag\": \"topo.on\"" diag.log` 就能把一次接回的全过程串起来。
+# ============================================================================
+_DIAG_LOCK = threading.Lock()
+_DIAG_ON = True                 # 由配置项 diag_log 同步；关掉后 dlog 立即返回
+_DIAG_LIMIT = 512 * 1024        # 超过就轮转到 diag.log.1，只留一份
+
+
+def _diag_file():
+    """每次现算：测试会把 CONFIG_DIR 指到临时目录，不能在导入时就定死。"""
+    return os.path.join(CONFIG_DIR, "diag.log")
+
+
+def diag_set_enabled(value):
+    """配置变化时同步开关（load_config / apply_setting 各调一次就够了）。"""
+    global _DIAG_ON
+    _DIAG_ON = bool(value)
+
+
+def diag_enabled():
+    return _DIAG_ON
+
+
+def dlog(tag, **fields):
+    """写一条诊断日志。未启用时是纯函数调用，零 IO。
+
+    tag 用点号分段，便于按前缀筛：
+      app.*   界面动作（点了哪个按钮、哪个下标）
+      topo.*  拓扑读取 / 计划 / 提交 / 回读
+      ccd.*   和 SetDisplayConfig 打交道的细粒度动作
+      sch.*   定时档位判定
+    """
+    if not _DIAG_ON:
+        return
+    rec = {"t": datetime.now().strftime("%m-%d %H:%M:%S.%f")[:-3],
+           "pid": os.getpid(), "th": threading.current_thread().name,
+           "tag": tag}
+    for k, v in fields.items():
+        if isinstance(v, (int, float, bool)) or v is None:
+            rec[k] = v
+            continue
+        # 结构化值原样留（事后好筛），太大才退化成字符串
+        if isinstance(v, (list, tuple, dict)):
+            try:
+                as_json = list(v) if isinstance(v, tuple) else v
+                if len(json.dumps(as_json, ensure_ascii=False)) <= 600:
+                    rec[k] = as_json
+                    continue
+            except Exception:
+                pass
+        text = str(v)
+        rec[k] = text if len(text) <= 600 else text[:600] + "…"
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False)
+        path = _diag_file()
+        with _DIAG_LOCK:
+            try:
+                if os.path.getsize(path) > _DIAG_LIMIT:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def diag_dump(limit=400):
+    """给界面/CLI 用：返回最近 limit 行原文（不解析，原样给）。"""
+    try:
+        with open(_diag_file(), "r", encoding="utf-8", errors="replace") as f:
+            return [x.rstrip("\n") for x in f.readlines()[-limit:]]
+    except Exception:
+        return []
+
+
+# ============================================================================
+# 诊断日志结束（以上整块可删）
+# ============================================================================
+
+
 def _coerce_slots(value):
     """把各种写法规整成 [{time, level}]：按时间排序、时间去重、亮度 0-100、至少一档。"""
     out, seen = [], set()
@@ -467,6 +563,7 @@ def load_config():
             if key in raw:
                 cfg[key] = coerce_setting(key, raw[key])
         cfg["models"] = _load_model_cache(raw)
+        diag_set_enabled(cfg.get("diag_log", True))
         if _recovered_off_method:
             _ok, _err = save_config(cfg)
             if _ok:
@@ -1486,8 +1583,10 @@ def _ccd_apply(u32, paths, modes, pc, mc):
     u32.SetDisplayConfig.argtypes = [
         wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
     u32.SetDisplayConfig.restype = wintypes.LONG
-    return u32.SetDisplayConfig(pc, ctypes.byref(paths), mc, ctypes.byref(modes),
-                                _CCD_APPLY_FLAGS)
+    rc = u32.SetDisplayConfig(pc, ctypes.byref(paths), mc, ctypes.byref(modes),
+                              _CCD_APPLY_FLAGS)
+    dlog("ccd.apply", pc=pc, mc=mc, flags="0x%08X" % _CCD_APPLY_FLAGS, rc=rc)
+    return rc
 
 
 def _ccd_restore_from_bytes(u32, snap):
@@ -1865,6 +1964,8 @@ def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan, want=None)
         return modes, mc
     want = want or {}
     rects = _ccd_layout_rects(rows, paths, modes)
+    dlog("topo.on.synth.enter", need=[it["anchor"] for it in need],
+         want=want, layout=rects)
     for it in need:
         saved = want.get(it["anchor"])
         if saved and len(saved) == 4:
@@ -1884,6 +1985,8 @@ def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan, want=None)
             "拓扑接回：%s 的 source mode 已不在 modes 数组里"
             "（断开后被 Windows 摘掉），现造一条 %dx%d 放在 (%d,%d) 补在第 %d 位"
             % (it["anchor"], w, h, x, y, idx))
+        dlog("topo.on.synth.item", anchor=it["anchor"], size=[w, h], pos=[x, y],
+             modeIdx=idx, saved=bool(saved))
     return modes, mc
 
 
@@ -1916,6 +2019,10 @@ def _ccd_apply_plan_on(paths, plan):
         p.sourceInfo.statusFlags = 0
         p.targetInfo.statusFlags = 0
         done.append(item["anchor"])
+        dlog("ccd.plan.write", anchor=item.get("anchor"), path=item.get("pathIndex"),
+             srcId=item.get("srcId"), tgtId=item.get("tgtId"),
+             srcModeIdx="0x%08X" % int(p.sourceInfo.modeInfoIdx),
+             tgtModeIdx="0x%08X" % int(p.targetInfo.modeInfoIdx))
     return done
 
 
@@ -1935,6 +2042,9 @@ def topology_off(indices, cfg=None):
     if raw is None:
         return [], [(-1, "CCD 查询失败，未做任何改动")]
     paths, modes, pc, mc, raw_rows = raw
+    dlog("topo.off", indices=normalize_indices(indices), pc=pc, mc=mc,
+         active=[r["anchor"] for r in raw_rows if r.get("active")],
+         connected=[r["anchor"] for r in raw_rows if r.get("connected")])
     try:
         targets = enumerate_targets()
     except Exception:
@@ -1944,6 +2054,7 @@ def topology_off(indices, cfg=None):
     release_targets(targets)
     anchors, errs, noop = topology_plan_off(
         indices, _fold_raw_rows(raw_rows), primary, dev_to_index)
+    dlog("topo.off.plan", anchors=anchors, errs=errs, noop=noop, primary=primary)
     if errs:
         return [], [(-1, e) for e in errs]
     if noop:
@@ -1963,6 +2074,7 @@ def topology_off(indices, cfg=None):
             merged.update(pos)
             cfg["monitor_positions"] = _coerce_positions(merged)
             save_config(cfg)
+            dlog("topo.off.positions", captured=pos)
 
     for i in range(len(paths)):
         info = next((x for x in raw_rows if x["pathIndex"] == i), None)
@@ -1980,18 +2092,21 @@ def topology_off(indices, cfg=None):
 
     rc = _ccd_apply(u32, paths, modes, pc, mc)
     if rc != 0:
+        dlog("topo.off.fail", stage="apply", rc=rc)
         return [], [(-1, "SetDisplayConfig 失败 rc=%d（未改动拓扑）" % rc)]
     if not _ccd_wait_state(anchors, False):
         back = _ccd_restore_from_bytes(u32, snap)
         why = "回读未确认断开，已回滚"
         if back != 0:
             why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
+        dlog("topo.off.fail", stage="verify", rollback=back)
         return [], [(-1, why)]
     # 只报"真正被断开"的下标；主屏虽然在勾选里，但护栏跳过了它。
     done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
                  if r["anchor"] in anchors and r["connected"] and r["active"]}
     done = sorted({i for name, i in dev_to_index.items()
                    if _short_dev(name) in done_devs})
+    dlog("topo.off.done", anchors=anchors, indices=done)
     return done or list(normalize_indices(indices)), []
 
 
@@ -2116,6 +2231,8 @@ def topology_on(anchors, cfg=None):
     labels = {"full": "现算 modeInfoIdx",
               "windows-picks-target": "target/desktop 交 Windows 定"}
     last_err = "CCD 查询失败，未做任何改动"
+    dlog("topo.on", anchors=list(anchors or []),
+         saved_positions=(cfg or {}).get("monitor_positions"))
     for n, mode in enumerate(tries):
         raw = _ccd_query_raw(u32)
         if raw is None:
@@ -2123,6 +2240,8 @@ def topology_on(anchors, cfg=None):
         paths, modes, pc, mc, raw_rows = raw
         plan, errs, noop = topology_plan_on(anchors, raw_rows,
                                             _ccd_mode_entries(modes, mc))
+        dlog("topo.on.plan", tier=mode, pc=pc, mc=mc, plan=plan,
+             errs=errs, noop=noop)
         if errs:
             return [], [(-1, e) for e in errs], []
         if noop:                       # 已经全亮：不提交、不写日志
@@ -2141,9 +2260,12 @@ def topology_on(anchors, cfg=None):
         rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
         if rc == 0:
             if not _ccd_wait_state(restored, True):
+                dlog("topo.on.fail", tier=mode, stage="verify", restored=restored)
                 return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
+            dlog("topo.on.done", tier=mode, restored=restored, mc=cur_mc)
             return topology_indices_for_anchors(restored), [], restored
         last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
+        dlog("topo.on.fail", tier=mode, stage="apply", rc=rc, mc=cur_mc, pc=pc)
         if n + 1 < len(tries):
             _write_event_log("拓扑接回：%s 被拒 rc=%d，改用%s重试"
                              % (labels[mode], rc, labels[tries[n + 1]]))
@@ -2414,19 +2536,28 @@ def screen_off_cfg(cfg, indices):
     返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状，
     这样界面与 CLI 不用关心底层是哪种方式。
     """
+    dlog("screen.off.enter", method=cfg.get("screen_off_method"),
+         indices=normalize_indices(indices))
     if cfg.get("screen_off_method") == "ddc":
-        return screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
-    if cfg.get("screen_off_method") == "topology":
-        return topology_off(indices, cfg)
-    if not screen_off_system():
-        return [], [(-1, "系统级熄灭下发失败")]
-    return _system_ok_targets(indices), []
+        out = screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
+    elif cfg.get("screen_off_method") == "topology":
+        out = topology_off(indices, cfg)
+    elif not screen_off_system():
+        out = ([], [(-1, "系统级熄灭下发失败")])
+    else:
+        out = (_system_ok_targets(indices), [])
+    dlog("screen.off.exit", ok=out[0], errs=out[1])
+    return out
 
 
 def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
     """点亮显示器。ddc = 分级 DDC；topology = 现读现算接回后写亮度；其余系统级。"""
+    dlog("screen.on.enter", method=cfg.get("screen_off_method"),
+         indices=normalize_indices(indices), anchors=anchors)
     if cfg.get("screen_off_method") == "ddc":
-        return screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
+        out = screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
+        dlog("screen.on.exit", ok=out[0], errs=out[1])
+        return out
     if cfg.get("screen_off_method") == "topology":
         want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
         ok, errs, restored = topology_on(want, cfg)
@@ -2846,6 +2977,8 @@ def apply_schedule(cfg=None):
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
+    dlog("sch.decide", slot=slot, level=level, screen=screen, targets=targets,
+         method=cfg.get("screen_off_method"))
     # D3：拓扑模式的 off 跳过亮度（inactive 时 DDC 读不到/写不进）；
     # on 的亮度由 screen_on_cfg 在「按当前拓扑接回 → 回读」之后写。
     topo = cfg.get("screen_off_method") == "topology"
@@ -2861,6 +2994,7 @@ def apply_schedule(cfg=None):
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
+    dlog("sch.result", level=level, screen=screen, ok=ok, errs=errs)
     # v2.01.0：不再记账屏幕状态。程序只负责"到点把这几个动作做掉"，
     # 做完就结束；屏幕现在是什么状态，下次需要时现场读（screen_verdict）。
     return level, screen, ok, errs
@@ -3651,7 +3785,10 @@ def cli_diag():
          % (cfg.get("presets"), cfg.get("screen_off_method")))
     _out("配置里的显示器选择：monitors=%s · monitor_ids=%s · monitor_anchors=%s"
          % (cfg.get("monitors"), cfg.get("monitor_ids"), cfg.get("monitor_anchors")))
+    _out("接回位置记录：%s" % (cfg.get("monitor_positions") or "{}"))
     _out("锚点优先解析结果：%s" % (resolve_monitors(cfg) or "[]（= 全部）"))
+    _out("诊断日志：%s（%s，用 --diag-log 看内容）"
+         % (_diag_file(), "开启" if diag_enabled() else "已关闭"))
 
     targets = enumerate_targets()
     if not targets:
@@ -5191,6 +5328,15 @@ class SettingsSheet(Sheet):
         about = self.section("关于")
         self.row(about, "版本", "", right_text="v%s" % APP_VERSION)
         self.row(about, "配置文件", "", right_text="%APPDATA%\\MonitorBrightness")
+        # 诊断日志（临时模块 v2.01.4）：排障时留着，问题收敛后连同 dlog 一起删
+        self.row(about, "诊断日志", "排障用；问题解决后可关掉",
+                 builder=lambda p: Switch(
+                     p, bool(cfg.get("diag_log", True)),
+                     lambda v: app.apply_setting("diag_log", v)).pack())
+        self.row(about, "打开日志目录", "diag.log / events.log / error.log",
+                 builder=lambda p: Button(
+                     p, "打开", app.open_log_dir, kind="link",
+                     height=22, font_size=8).pack())
         self.show()
 
 
@@ -5374,6 +5520,14 @@ class App:
         except Exception as e:
             self.msg.showerror("打开说明失败", "%s: %s" % (type(e).__name__, e))
 
+    def open_log_dir(self):
+        """打开配置/日志目录（排障时直接看 diag.log）。"""
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            os.startfile(CONFIG_DIR)          # noqa: S606 — 只打开自家目录
+        except Exception as e:
+            self.status_var.set("打开日志目录失败：%s" % e)
+
     # ---------- 设置项写回 ----------
     def apply_setting(self, key, value):
         """设置弹层里每个开关/输入框的统一出口：落配置并立即生效。"""
@@ -5401,6 +5555,13 @@ class App:
             elif key == "wake_switch_input":
                 self.cfg[key] = bool(value)
                 save_config(self.cfg)
+            elif key == "diag_log":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                # 先写一条再改开关：否则"已关闭"这一条自己就记不下来了
+                dlog("app.setting", key=key, value=bool(value))
+                diag_set_enabled(self.cfg[key])
+                self.status_var.set("诊断日志已" + ("开启" if value else "关闭"))
             elif key == "presets":
                 self.cfg[key] = coerce_setting("presets", value)
                 save_config(self.cfg)
@@ -5791,6 +5952,7 @@ class App:
 
     def monitor_off(self, index):
         """行内「熄灭」：只熄灭这一块，不动别的。"""
+        dlog("app.action", what="monitor_off", index=index)
         why = self._row_action_blocker()
         if why:
             self.status_var.set(why)
@@ -5808,6 +5970,7 @@ class App:
 
     def monitor_on(self, index):
         """行内「显示」：只点亮这一块。"""
+        dlog("app.action", what="monitor_on", index=index)
         why = self._row_action_blocker()
         if why:
             self.status_var.set(why)
@@ -5860,6 +6023,7 @@ class App:
 
     def screen_off(self):
         targets = self.selected_indices()
+        dlog("app.action", what="screen_off", targets=targets)
         if not targets:
             self.status_var.set("请先勾选要操作的显示器")
             return
@@ -5900,7 +6064,8 @@ class App:
         self.probe_screens()
 
     def topology_enable(self, anchor):
-        """GUI「启用」按钮：后台接回指定锚点的屏（不碰 Tk）。"""
+        """GUI「显示」按钮（断开的屏那一行）：后台接回指定锚点的屏（不碰 Tk）。"""
+        dlog("app.action", what="topology_enable", anchor=anchor)
         if self._busy:
             self._queue_screen_action("on")
             return
@@ -5928,6 +6093,7 @@ class App:
 
     def screen_on(self):
         targets = self.selected_indices()
+        dlog("app.action", what="screen_on", targets=targets)
         if not targets:
             self.status_var.set("请先勾选要操作的显示器")
             return
@@ -6592,8 +6758,18 @@ def cli_screen(action):
 
 def main():
     args = sys.argv[1:]
+    dlog("app.start", ver=APP_VERSION, argv=args,
+         packaged=bool(getattr(sys, "frozen", False)),
+         py="%d.%d.%d" % sys.version_info[:3])
     if args:
         cmd = args[0]
+        if cmd == "--diag-log":
+            # 诊断日志（临时命令，v2.01.4）：直接打印最近若干行
+            lines = diag_dump(200)
+            _out("diag.log：%s（%d 行）" % (_diag_file(), len(lines)))
+            for line in lines:
+                _out(line)
+            return
         if cmd == "--set" and len(args) >= 3:
             cli_set(args[1], args[2])
             return

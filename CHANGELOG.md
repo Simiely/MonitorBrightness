@@ -5,6 +5,60 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · v2.01.4：加一个**临时**诊断日志模块（问题收敛后整体删掉）
+
+用户的诉求很直接："方便快速迭代定位问题，等软件没问题之后再把模块去掉。"
+所以这一版的重点不是日志功能多强，而是**好删**。
+
+**设计：只有两个函数，埋点全是单行**
+
+- `dlog(tag, **fields)` —— 唯一入口，JSON Lines 落 `%APPDATA%\MonitorBrightness\diag.log`。
+- `diag_dump(limit)` —— 给 CLI / 界面读最近若干行。
+- 埋点一律写成单行 `dlog("topo.on.plan", ...)`，不写多行调用，
+  将来 `grep -n "dlog(" monitor_brightness.py` 就能一次找全。
+- 开关是配置项 `diag_log`（默认开），关掉后 `dlog` 立即 return，零 IO。
+
+**删干净的四步**（写在代码里那段注释的开头）
+1. 删掉 `DIAG_FILE` 那一段（含 `_DIAG_LOCK/_DIAG_ON/_DIAG_LIMIT`、`_diag_file`、
+   `diag_set_enabled`、`diag_enabled`、`dlog`、`diag_dump`）；
+2. 删掉 `SETTINGS` 里的 `diag_log` 一项，以及 `load_config` / `apply_setting`
+   里那两行同步；
+3. 删掉设置页「关于」里的两个 row 和 `App.open_log_dir`；
+4. `grep -n "dlog(" monitor_brightness.py` 把埋点行整行删掉，外加 `--diag-log`
+   分支和 `--diag` 里那两行输出。
+
+**记什么（按前缀筛）**
+
+| tag | 内容 |
+|---|---|
+| `app.start` | 版本、argv、是否打包态 |
+| `app.action` | 点了哪个按钮、哪个下标 / 锚点 |
+| `screen.*.enter/exit` | 熄灭/点亮的入口出口，含方式与结果 |
+| `topo.off` / `topo.off.plan` / `topo.off.positions` / `topo.off.done` | 断开全过程 |
+| `topo.on` / `topo.on.plan` / `topo.on.synth.*` / `topo.on.done` | 接回全过程（含合成 source mode） |
+| `ccd.apply` | 每一次 `SetDisplayConfig` 的 pc/mc/flags/rc |
+| `ccd.plan.write` | 就地改写了哪条 path、三个 modeInfoIdx 是什么 |
+| `sch.decide` / `sch.result` | 定时档位判定的输入与结果 |
+
+一次接回的完整链路可以直接串起来看：
+
+```
+findstr /c:"\"tag\": \"topo.on" diag.log
+```
+
+**用起来**
+
+- 界面：设置 → 关于 → 「诊断日志」开关 + 「打开日志目录」按钮。
+- 命令行：`MonitorBrightness.exe --diag-log` 直接打印最近 200 行；
+  `--diag` 里也会显示日志路径和开关状态。
+
+**顺带修掉的测试污染**：有些用例类直接继承 `unittest.TestCase`（不经过
+`TempConfigCase`），跑测试会把假数据写进**真实的** `%APPDATA%` 日志目录 ——
+实测把单元测试里的 `anchor=A2` 写进了用户的 diag.log。加了 `setUpModule`，
+整份测试统一兜到临时目录。
+
+测试 120 → 126。
+
 ### 2026-11-27 · v2.01.3：接回摆回原位 + 每行独立的「熄灭 / 显示」
 
 **1) 接回后位置跳变（用户报的 bug）**
