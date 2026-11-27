@@ -8,6 +8,7 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import app.base as app_base_mod
 import app.brightness as app_bright_mod
 import app.common as app_common_mod
 import app.diag as app_diag_mod
@@ -55,7 +56,7 @@ _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod,
                   app_settings_mod, app_diag_mod, app_common_mod,
                   app_bright_mod, app_power_mod, app_schedule_mod,
-                  app_layout_mod)
+                  app_layout_mod, app_base_mod)
 
 
 _UNSET = object()
@@ -3677,6 +3678,34 @@ class TooltipTest(unittest.TestCase):
             sheet.destroy()
         finally:
             root.destroy()
+
+
+class MainDispatchTest(unittest.TestCase):
+    """R4-5：main() 拆成 _run_cli/_start_gui 后，CLI 分流不能变形。"""
+
+    def test_base_reexports(self):
+        self.assertIs(mb.App, app_base_mod.App)
+        self.assertIs(mb.main, app_base_mod.main)
+        self.assertIs(mb._route_wheel, app_base_mod._route_wheel)
+
+    def test_unknown_or_empty_falls_through(self):
+        self.assertFalse(app_base_mod._run_cli([]))
+        self.assertFalse(app_base_mod._run_cli(["--not-a-command"]))
+
+    def test_list_dispatches_and_returns_true(self):
+        with unittest.mock.patch.object(app_base_mod, "cli_list") as fn:
+            self.assertTrue(app_base_mod._run_cli(["--list"]))
+            fn.assert_called_once_with()
+
+    def test_screen_status_uses_live_verdict(self):
+        with unittest.mock.patch.object(
+                app_base_mod, "load_config", return_value={"x": 1}), \
+                unittest.mock.patch.object(
+                    app_base_mod, "screen_verdict",
+                    return_value={"text": "亮着", "detail": ""}) as verdict, \
+                unittest.mock.patch.object(app_base_mod, "_out"):
+            self.assertTrue(app_base_mod._run_cli(["--screen", "status"]))
+            verdict.assert_called_once_with({"x": 1})
 
 
 class CliSmokeTest(unittest.TestCase):
