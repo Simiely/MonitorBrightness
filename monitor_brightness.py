@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.1"     # 接回 rc=87 真机定论：source modeInfoIdx 绝不能是 INVALID
+APP_VERSION = "2.01.2"     # 接回时现造 source mode；修回滚快照的堆越界
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
@@ -1080,11 +1080,32 @@ class _CcdTargetName(ctypes.Structure):
                 ("monitorDevicePath", wintypes.WCHAR * 128)]
 
 
+class _Ccd2D(ctypes.Structure):
+    _fields_ = [("cx", wintypes.UINT), ("cy", wintypes.UINT)]
+
+
+class _CcdVideoSignalInfo(ctypes.Structure):
+    _fields_ = [("pixelRate", ctypes.c_uint64),
+                ("hSyncFreq", _CcdRational), ("vSyncFreq", _CcdRational),
+                ("activeSize", _Ccd2D), ("totalSize", _Ccd2D),
+                ("videoStandard", wintypes.UINT),
+                ("scanLineOrdering", wintypes.UINT)]
+
+
+class _CcdTargetPreferredMode(ctypes.Structure):
+    """DISPLAYCONFIG_TARGET_PREFERRED_MODE：这块屏的首选分辨率。"""
+
+    _fields_ = [("header", _CcdInfoHeader), ("width", wintypes.UINT),
+                ("height", wintypes.UINT), ("targetMode", _CcdVideoSignalInfo)]
+
+
 _QDC_ALL_PATHS = 0x1
 _QDC_VIRTUAL_MODE_AWARE = 0x10
 _CCD_PATH_ACTIVE = 0x1
 _CCD_GET_SOURCE_NAME = 1
 _CCD_GET_TARGET_NAME = 2
+_DC_GET_TARGET_PREFERRED_MODE = 3          # DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE
+_CCD_PIXELFORMAT_NONGDI = 4                # Windows 给 source mode 用的就是它，不是 32BPP
 _CCD_EDID_IDS_VALID = 0x4          # DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.edidIdsValid
 _CCD_TARGET_IN_USE = 0x1          # DISPLAYCONFIG_TARGET_IN_USE
 
@@ -1363,7 +1384,13 @@ def _ccd_query_raw(u32=None):
                 "connected": bool(tgt.targetAvailable),
                 # 接回时要现算 modeInfoIdx，必须知道这条 path 用哪个 source/target。
                 # srcId 是 adapter 内的独占资源：已被 ACTIVE 占用的 id 不能再置 ACTIVE。
+                # 判断"占没占用"必须带 adapter —— source id 只在 adapter 内唯一，
+                # 混着比会把另一块显卡上的空闲 source 误判成被占（VDD 就是例子）。
                 "srcId": int(p.sourceInfo.id), "tgtId": int(tgt.id),
+                "luidLow": int(p.sourceInfo.adapterId.LowPart) & 0xFFFFFFFF,
+                "luidHigh": int(p.sourceInfo.adapterId.HighPart) & 0xFFFFFFFF,
+                "tgtAdapterLow": int(tgt.adapterId.LowPart) & 0xFFFFFFFF,
+                "tgtAdapterHigh": int(tgt.adapterId.HighPart) & 0xFFFFFFFF,
                 "srcModeInfoIdx": int(p.sourceInfo.modeInfoIdx),
                 "tgtModeInfoIdx": int(tgt.modeInfoIdx),
                 "gdi": "", "friendly": "", "vdd": False}
@@ -1400,13 +1427,28 @@ def _ccd_query_raw(u32=None):
     return paths, modes, pc.value, mc.value, rows
 
 
+def _ccd_slice_bytes(arr, count):
+    """只取数组**前 count 个元素**的原始字节。
+
+    ⚠️ 不能用 `bytes(arr)`：`GetDisplayConfigBufferSizes` 给的是"够用的上限"
+    （本机 modes 要 699 条），而 `QueryDisplayConfig` 只填真正用到的那些
+    （本机 6 条）并把计数改回 6。整个数组一起存，长度就和 count 对不上，
+    回滚时 memmove 会越界写坏堆 —— 实测表现为最后在某个 print 里段错误。
+    """
+    if count <= 0:
+        return b""
+    elem = ctypes.sizeof(arr) // max(1, len(arr))
+    return ctypes.string_at(ctypes.addressof(arr), elem * int(count))
+
+
 def _ccd_make_snapshot(paths, modes, pc, mc, target_anchors):
     """把 CCD 原始字节打包成**内存内**回滚快照（用完即弃，绝不落盘）。"""
     return {
         "created": datetime.now().isoformat(timespec="seconds"),
         "note": "CCD 快照；pathsHex/modesHex 为原始 ctypes 字节，仅用于本次操作失败回滚",
         "pathCount": int(pc), "modeCount": int(mc),
-        "pathsHex": bytes(paths).hex(), "modesHex": bytes(modes).hex(),
+        "pathsHex": _ccd_slice_bytes(paths, pc).hex(),
+        "modesHex": _ccd_slice_bytes(modes, mc).hex(),
         "targetAnchors": list(target_anchors),
     }
 
@@ -1424,13 +1466,18 @@ def _ccd_restore_from_bytes(u32, snap):
     """回读失败后的唯一一次回滚：原样写回动作前的完整字节快照。
 
     从 hex 重新构造数组，绝不复用调用方已被改过的 paths/modes。
+    **长度对不上就一个字都不写**：宁可少一次回滚，也不要越界写坏堆。
     """
     paths = (_CcdPathInfo * int(snap["pathCount"]))()
     modes = (_CcdModeInfo * int(snap["modeCount"]))()
     pb = bytes.fromhex(snap["pathsHex"])
-    mb = bytes.fromhex(snap["modesHex"])
-    ctypes.memmove(ctypes.byref(paths), pb, len(pb))
-    ctypes.memmove(ctypes.byref(modes), mb, len(mb))
+    mb_ = bytes.fromhex(snap["modesHex"])
+    if len(pb) != ctypes.sizeof(paths) or len(mb_) != ctypes.sizeof(modes):
+        return -1                    # 快照与数组形状不符：拒绝提交
+    if len(pb):
+        ctypes.memmove(ctypes.byref(paths), pb, len(pb))
+    if len(mb_):
+        ctypes.memmove(ctypes.byref(modes), mb_, len(mb_))
     return _ccd_apply(u32, paths, modes, snap["pathCount"], snap["modeCount"])
 
 
@@ -1539,28 +1586,37 @@ _CCD_TYPE_DESKTOP = 3       # DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE
 
 
 def _ccd_mode_entries(modes, mc):
-    """把 modes 数组摘成 [(下标, infoType, id)]，供纯函数现算 modeInfoIdx。"""
+    """把 modes 数组摘成 [(下标, infoType, id, adapterLow)]，供纯函数现算 modeInfoIdx。"""
     out = []
     for i in range(max(0, min(int(mc or 0), len(modes)))):
         m = modes[i]
-        out.append((i, int(m.infoType), int(m.id)))
+        out.append((i, int(m.infoType), int(m.id),
+                    int(m.adapterId.LowPart) & 0xFFFFFFFF))
     return out
 
 
-def _ccd_pick_mode(entries, info_type, ident):
-    """按 (infoType, id) 找 mode 下标；找不到返回 None。
+def _ccd_pick_mode(entries, info_type, ident, luid_low=None):
+    """按 (infoType, adapter, id) 找 mode 下标；找不到返回 None。
 
-    None 表示"这块屏的 mode 已不在当前 modes 数组里"（例如刚拔插过）。
-    **source mode 找不到就接不回来**（见 topology_plan_on 的护栏），
-    target/desktop 找不到则可以交给 Windows 定。
+    **必须带 adapter**：source/target id 只在 adapter 内唯一，不同显卡上撞 id
+    很常见（本机 VDD 的 src=0 与物理屏的 src=0 就撞了）。不带 adapter 会挑中
+    另一块显卡的 mode 项，提交必然 rc=87 —— 这正是 v2.01.2 前"借用别的屏的
+    source mode → 87"的真身。
+
+    entries 里没有 adapter 字段时（老的三元组）不做 adapter 过滤，向后兼容。
     """
-    for i, t, ident_i in entries:
-        if t == info_type and ident_i == int(ident):
-            return i
+    for e in entries:
+        if len(e) < 3:
+            continue
+        if int(e[1]) != info_type or int(e[2]) != int(ident):
+            continue
+        if luid_low is not None and len(e) > 3 and int(e[3]) != int(luid_low):
+            continue
+        return int(e[0])
     return None
 
 
-def topology_plan_on(anchors, rows, mode_entries):
+def topology_plan_on(anchors, rows, mode_entries, allow_vdd=False):
     """纯函数：算出「把 anchors 里的屏加回**当前**拓扑」要动哪几条 path。
 
     全部输入都是本次现读的：rows=_ccd_query_raw 的逐 path 行，
@@ -1570,16 +1626,21 @@ def topology_plan_on(anchors, rows, mode_entries):
       - 只认 connected 的 path（拔了线的接不回来）；
       - VDD 永不作目标；
       - 已 ACTIVE 的锚点直接跳过（幂等：接两次和接一次结果一样）；
-      - source id 是 adapter 内独占资源，只挑没被其它 ACTIVE path 占用的；
-      - **source mode 必须在当前 modes 数组里**，缺了就报错不硬提交——
-        置 INVALID 必 rc=87（真机矩阵，scripts/topology_repro87.py 步骤 6）。
+      - source id 是 **adapter 内**独占资源，只挑没被同 adapter 的 ACTIVE path 占用的；
+      - source mode 缺失**不算错误**：真实断开后 Windows 一定会把它从 modes 数组
+        里摘掉，这时标记 `makeSourceMode`，由调用方现造一条补进去
+        （`_ccd_append_source_mode`；置 INVALID 必 rc=87）。
 
-    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx；
-    sourceModeIdx 保证非 None，target/desktop 可能为 None（交给 Windows 定）。
+    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx
+    以及 `makeSourceMode`（True 表示 sourceModeIdx 为 None，需要现造）。
+    target/desktop 可能为 None，表示交给 Windows 定。
+
+    `allow_vdd=True` 只给验证脚本用：VDD 是"连着但整块不在拓扑里"的现成样本，
+    拿它跑一次真接回就能验完整条链路，而不会碰到任何物理屏。产品路径永不传。
     """
     wanted = [str(a) for a in (anchors or []) if a]
     rows = list(rows or [])
-    used = {int(r["srcId"]) for r in rows
+    used = {(int(r.get("luidLow", 0)), int(r["srcId"])) for r in rows
             if r.get("active") and r.get("connected") and r.get("srcId") is not None}
     plan, errs = [], []
     for anchor in wanted:
@@ -1587,36 +1648,159 @@ def topology_plan_on(anchors, rows, mode_entries):
         if not mine:
             errs.append("锚点 %s 在拓扑里没有已连接的 path（可能已拔线）" % anchor)
             continue
-        if any(r.get("vdd") for r in mine):
+        if any(r.get("vdd") for r in mine) and not allow_vdd:
             errs.append("虚拟屏 %s 不作接回目标" % anchor)
             continue
         if any(r.get("active") for r in mine):
             continue                       # 已经亮着：no-op
-        free = [r for r in mine if int(r["srcId"]) not in used]
+        key = lambda r: (int(r.get("luidLow", 0)), int(r["srcId"]))
+        free = [r for r in mine if key(r) not in used]
         if not free:
             errs.append("锚点 %s 没有空闲 source（全被其它屏占用）" % anchor)
             continue
         # 确定性：source id 最小 → pathIndex 最小。不依赖"上次用的是哪条"。
         pick = min(free, key=lambda r: (int(r["srcId"]), int(r["pathIndex"])))
-        smode = _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE, pick["srcId"])
-        if smode is None:
-            # 硬拦：source mode 缺失时任何提交都是 rc=87（真机矩阵，见
-            # scripts/topology_repro87.py 步骤 6）。宁可在计划阶段说清楚，
-            # 也不要打一条假的"降级"再失败。
-            errs.append("锚点 %s 的 source mode 不在当前 modes 数组里"
-                        "（刚拔插过？请重新插一次或重启，再接回）" % anchor)
-            continue
+        smode = _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE, pick["srcId"],
+                               pick.get("luidLow"))
         plan.append({
             "pathIndex": int(pick["pathIndex"]), "anchor": anchor,
             "srcId": int(pick["srcId"]), "tgtId": int(pick["tgtId"]),
+            "luidLow": int(pick.get("luidLow", 0)),
+            "luidHigh": int(pick.get("luidHigh", 0)),
+            "tgtAdapterLow": int(pick.get("tgtAdapterLow", 0)),
+            "tgtAdapterHigh": int(pick.get("tgtAdapterHigh", 0)),
             "sourceModeIdx": smode,
+            # 真实断开后 source mode 必然不在 modes 数组里 → 由调用方现造一条
+            "makeSourceMode": smode is None,
             "targetModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_TARGET,
-                                            pick["tgtId"]),
+                                            pick["tgtId"], pick.get("tgtAdapterLow")),
             "desktopModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_DESKTOP,
-                                             pick["tgtId"]),
+                                             pick["tgtId"], pick.get("tgtAdapterLow")),
         })
-        used.add(int(pick["srcId"]))
+        used.add((int(pick.get("luidLow", 0)), int(pick["srcId"])))
     return plan, errs, (not plan and not errs)
+
+
+def _ccd_preferred_size(u32, adapter_low, adapter_high, target_id):
+    """问 Windows：这块屏的首选分辨率。查不到返回 None。"""
+    info = _CcdTargetPreferredMode()
+    info.header.type = _DC_GET_TARGET_PREFERRED_MODE
+    info.header.size = ctypes.sizeof(info)
+    info.header.adapterId.LowPart = int(adapter_low) & 0xFFFFFFFF
+    info.header.adapterId.HighPart = int(adapter_high)
+    info.header.id = int(target_id)
+    if u32.DisplayConfigGetDeviceInfo(ctypes.byref(info.header)) != 0:
+        return None
+    w, h = int(info.width), int(info.height)
+    return (w, h) if w and h else None
+
+
+def _ccd_live_size(rows, paths, modes):
+    """兜底尺寸：抄一块**正在用**的屏的 source mode。
+
+    同机同型号很常见；比硬编码 1920x1080 更可能被 Windows 接受。
+    一块都没有才退回 1920x1080。
+    """
+    for r in rows or []:
+        if not (r.get("active") and r.get("connected")):
+            continue
+        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
+        if idx == _CCD_MODE_IDX_INVALID:
+            continue
+        src = (idx >> 16) & 0xFFFF
+        if src >= len(modes):
+            continue
+        sm = modes[src].sourceMode
+        if sm.width and sm.height:
+            return int(sm.width), int(sm.height)
+    return 1920, 1080
+
+
+def _ccd_free_origin(rows, paths, modes):
+    """当前桌面最右边的 x —— 新接回的屏放这里。
+
+    **不是"顺手放右边"，是必需**：把新屏放在 (0,0) 和现有屏重叠，实测
+    `SetDisplayConfig` 直接 rc=87。所以位置必须自己算，而且必须不重叠。
+    """
+    right = 0
+    for r in rows or []:
+        if not (r.get("active") and r.get("connected")):
+            continue
+        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
+        if idx == _CCD_MODE_IDX_INVALID:
+            continue
+        src = (idx >> 16) & 0xFFFF
+        if src >= len(modes):
+            continue
+        sm = modes[src].sourceMode
+        right = max(right, int(sm.position.x) + int(sm.width))
+    return right
+
+
+def _ccd_append_source_mode(modes, mc, adapter_low, adapter_high, source_id,
+                            width, height, x, y):
+    """在 modes 数组末尾**追加**一条 SOURCE mode 项，返回 (新数组, 新下标)。
+
+    为什么必须自己造：一块屏被断开之后，Windows 就把它从 modes 数组里摘掉了，
+    接回时没有任何下标可引用（引用 INVALID 必 rc=87）。实测只有这条路能过：
+
+      | 做法                                   | rc |
+      |----------------------------------------|----|
+      | source = INVALID                        | 87 |
+      | 借用别的屏的 source mode 项             | 87 |
+      | 自己补一条（pf=NONGDI，位置不重叠）     | 0  |
+      | 自己补一条但 pf=32BPP                   | 87 |
+      | 自己补一条但位置 (0,0) 与主屏重叠       | 87 |
+
+    pixelFormat 必须是 `DISPLAYCONFIG_PIXELFORMAT_NONGDI(4)` —— Windows 自己给
+    source mode 填的就是 4，填 32BPP(3) 会被拒。证据：scripts/topology_mode_synthesis.py
+    """
+    out = (_CcdModeInfo * (mc + 1))()
+    ctypes.memmove(ctypes.byref(out), ctypes.byref(modes),
+                   ctypes.sizeof(_CcdModeInfo) * mc)
+    i = mc
+    out[i].infoType = _CCD_TYPE_SOURCE
+    out[i].id = int(source_id)
+    out[i].adapterId.LowPart = int(adapter_low) & 0xFFFFFFFF
+    out[i].adapterId.HighPart = int(adapter_high)
+    out[i].sourceMode.width = int(width)
+    out[i].sourceMode.height = int(height)
+    out[i].sourceMode.pixelFormat = _CCD_PIXELFORMAT_NONGDI
+    out[i].sourceMode.position.x = int(x)
+    out[i].sourceMode.position.y = int(y)
+    return out, i
+
+
+def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan):
+    """给 plan 里 source mode 已缺失的项**现造**一条补进 modes 数组。
+
+    真实断开后这是常态而非异常（Windows 会把断开屏的 SOURCE mode 从 modes
+    数组里摘掉），所以不能报错，只能自己补。返回 (新 modes 数组, 新计数)。
+
+    尺寸：该屏的首选分辨率，查不到就抄一块正在用的屏；
+    位置：桌面最右边，多块时依次往右排（重叠会被 Windows 拒，见
+    `_ccd_append_source_mode` 的实测矩阵）。
+    """
+    need = [it for it in plan if it.get("makeSourceMode")]
+    if not need:
+        return modes, mc
+    x = _ccd_free_origin(rows, paths, modes)
+    for it in need:
+        size = (_ccd_preferred_size(u32, it["tgtAdapterLow"],
+                                    it["tgtAdapterHigh"], it["tgtId"])
+                or _ccd_live_size(rows, paths, modes))
+        w, h = size
+        modes, idx = _ccd_append_source_mode(
+            modes, mc, it["luidLow"], it["luidHigh"], it["srcId"], w, h, x, 0)
+        mc += 1
+        x += w
+        it["sourceModeIdx"] = idx
+        it["makeSourceMode"] = False
+        _write_event_log(
+            "拓扑接回：%s 的 source mode 已不在 modes 数组里"
+            "（断开后被 Windows 摘掉），现造一条 %dx%d 补在第 %d 位"
+            % (it["anchor"], w, h, idx))
+    return modes, mc
 
 
 def _ccd_apply_plan_on(paths, plan):
@@ -1813,11 +1997,15 @@ def topology_on(anchors):
       scripts/topology_repro87.py 可复跑）：
       - **sourceInfo.modeInfoIdx 一旦置 INVALID 就必然 rc=87**，加多少
         ALLOW_CHANGES / PATH_PERSIST / FORCE_MODE_ENUMERATION 都救不回来。
-        所以"两个都交 Windows 挑"这条老路是死的，source mode 必须有有效值；
-        算不出 source mode 就由 topology_plan_on 在计划阶段直接报错。
+        所以"两个都交 Windows 挑"这条老路是死的，source mode 必须有有效值。
       - **全量提交（整份 QDC_ALL_PATHS 233 条）本身是合法的，rc=0**。
         曾经怀疑"224 条未连接组合导致 87"并改成 SDC_TOPOLOGY_SUPPLIED 部分
         提交——实测部分提交才是 87，那个方向是错的，已撤销。
+
+    而 source mode "算不出来"是**常态**，不是异常：一块屏被断开之后，Windows
+    就把它从 modes 数组里摘掉了，接回时没有任何下标可引用。这时现造一条补进
+    数组末尾（`_ccd_append_source_mode`），尺寸取该屏首选分辨率、位置取桌面
+    最右边。真机矩阵见 scripts/topology_mode_synthesis.py。
 
     返回 (成功下标列表, [(下标, 错误), ...], restored_anchors)。
     亮度不在这里写：断开源在接回后才重新出现在 EnumDisplayMonitors 里，
@@ -1844,8 +2032,12 @@ def topology_on(anchors):
         if mode != "full":
             for item in plan:
                 item["targetModeIdx"] = item["desktopModeIdx"] = None
+        # 真实断开后 Windows 会把这块屏的 SOURCE mode 从 modes 数组里摘掉，
+        # 空手引用必然 rc=87；这里现造一条补进数组末尾。
+        cur_modes, cur_mc = _ccd_fill_missing_source_modes(
+            u32, paths, modes, mc, raw_rows, plan)
         restored = _ccd_apply_plan_on(paths, plan)
-        rc = _ccd_apply(u32, paths, modes, pc, mc)
+        rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
         if rc == 0:
             if not _ccd_wait_state(restored, True):
                 return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []

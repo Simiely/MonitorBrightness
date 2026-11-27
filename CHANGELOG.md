@@ -5,6 +5,80 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · v2.01.2：接回时现造 source mode（真机闭环，不再需要人肉试）
+
+v2.01.1 上线后，真机点「点亮屏幕」弹的是：
+> 锚点 00010CBD:…/AE30/68C7/2 的 source mode 不在当前 modes 数组里
+
+这句提示本身是对的，也说明 v2.01.1 的判断没错——但**结论下错了**：
+我把"source mode 不存在"当成"接不回来"，其实它只是"要去造一条"。
+
+**关键工具：`SDC_VALIDATE` + VDD 样本**
+
+一台机器上总有"连着、但整块不在拓扑里"的屏（本机是 `VDD by MTT`），
+它的状态和"物理屏刚被断开"完全一样：path inactive、source mode 已从
+modes 数组里被摘掉。拿它当样本，用 `SDC_VALIDATE` 反复试提交，
+既不用真断物理屏，也不用请用户来点按钮。
+
+`scripts/topology_mode_synthesis.py` 的真机矩阵：
+
+| 做法 | rc |
+|---|---|
+| `sourceInfo.modeInfoIdx = INVALID` | 87 |
+| 借用另一块屏的 source mode 项 | 87 |
+| **自己往 modes 末尾补一条 SOURCE mode** | **0** |
+| 自己补一条，但 `pixelFormat=32BPP` | 87 |
+| 自己补一条，但位置 (0,0) 与主屏重叠 | 87 |
+
+于是结论是：**自己补，pixelFormat 用 NONGDI(4)，位置不能和现有屏重叠。**
+
+**顺手挖出一个会写坏堆的老 bug**
+
+为了端到端验证，我写了 `scripts/topology_live_synthesis_check.py`：
+拿 VDD 当样本真跑一次接回，`finally` 里无条件还原。第一次跑就段错误
+（exit 139），faulthandler 指到一行无辜的 `print` —— 是堆被踩了。
+
+根因在 `_ccd_make_snapshot`：
+- `GetDisplayConfigBufferSizes` 给的是**缓冲上限**（本机 modes 699 条）；
+- `QueryDisplayConfig` 只填真正用到的（本机 6 条）并把计数改回 6；
+- 快照却用 `bytes(modes)` 存了整个 **699** 条（44736 字节），`modeCount` 仍记 6；
+- 回滚时按 6 条建 384 字节的数组，再 `memmove` 44736 字节 → 越界写坏堆。
+
+这是 `topology_off` 回滚路径上的既有 bug，只在"回读失败要回滚"时才触发，
+所以一直没暴露。现在快照只取前 `count` 个元素，且长度不符时**拒绝提交**。
+
+**改动**
+
+- `_ccd_append_source_mode()`：在 modes 数组末尾补一条 SOURCE mode 项
+  （NONGDI + 指定位置），不动原数组。
+- `_ccd_fill_missing_source_modes()`：把 plan 里 source mode 已缺失的项补齐，
+  尺寸取 `GET_TARGET_PREFERRED_MODE`（真机确认 type=3 才对），
+  失败则抄一块正在用的屏，再不行才 1920x1080；
+  位置取桌面最右边，多块时依次往右排。
+- `_ccd_free_origin()` / `_ccd_live_size()` / `_ccd_preferred_size()`。
+- `topology_plan_on()` 不再因 source mode 缺失而报错，改为标记
+  `makeSourceMode`；并修了一个**跨 adapter 撞 id** 的真 bug：
+  `_ccd_pick_mode` 现在按 `(infoType, adapter, id)` 查，source 占用判断也按
+  adapter 分组。本机 VDD 的 src=0 与物理屏的 src=0 撞在一起，之前会挑到
+  另一块显卡的 mode 项（就是上表第二行那个 87）。
+- `_ccd_slice_bytes()` + 快照/回滚长度校验，修堆越界。
+- 新增 `scripts/topology_mode_synthesis.py`（矩阵证据，只读）与
+  `scripts/topology_live_synthesis_check.py`（真机端到端 + 自动还原）。
+
+**真机验证（我自己跑的，不需要用户操作）**
+
+```
+样本：1589A778:00000000/9436/1337/0（VDD）
+补齐后 modes：6 → 7 条  sourceModeIdx=[6]
+SetDisplayConfig rc=0（67ms）
+✅ 回读：已 ACTIVE
+还原原始拓扑：rc=0   → VDD 回到 inactive
+```
+
+> ⚠️ 位置语义：断开后 Windows 不记得这块屏原来摆在哪（我们也不记账），
+> 所以接回时统一放到**桌面最右边**。这和 Windows 设置里点"扩展这些显示器"
+> 的行为一致。如果原来副屏在左侧，接回后会跑到右侧，需要手动拖一次。
+
 ### 2026-11-27 · v2.01.1：接回 rc=87 的真机定论（推翻我自己上一轮的诊断）
 
 现场：点「点亮屏幕」弹出 `SetDisplayConfig 失败 rc=87`，events.log 里 15:50 / 15:59

@@ -8,6 +8,7 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import ctypes
 import glob
 import html
 import json
@@ -1594,13 +1595,15 @@ class TopologySubmitShapeTest(_TopoFixture):
         self.assertFalse(hasattr(mb, "_CCD_PARTIAL_FLAGS"))
         self.assertFalse(hasattr(mb, "_ccd_plan_paths"))
 
-    def test_plan_rejects_when_source_mode_missing(self):
-        """source mode 查不到就没法提交（置 INVALID 必 87），计划阶段直接报错。"""
+    def test_plan_marks_source_mode_for_synthesis_when_missing(self):
+        """真实断开后 source mode 必然不在 modes 数组里 —— 不是错误，是要现造。"""
         rows = self._off_raw()[4]
         plan, errs, noop = mb.topology_plan_on(["A2"], rows, [])
-        self.assertEqual(plan, [])
+        self.assertEqual(errs, [])
         self.assertFalse(noop)
-        self.assertIn("source mode", errs[0])
+        self.assertEqual(len(plan), 1)
+        self.assertIsNone(plan[0]["sourceModeIdx"])
+        self.assertTrue(plan[0]["makeSourceMode"])
 
     def test_plan_allows_missing_target_mode(self):
         """target/desktop mode 查不到不算错，交 Windows 定。"""
@@ -1629,6 +1632,99 @@ class TopologySubmitShapeTest(_TopoFixture):
         mb._ccd_apply_plan_on(paths, plan)
         self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0x0003FFFF)
         self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0xFFFFFFFF)
+
+
+class TopologySourceModeSynthesisTest(_TopoFixture):
+    """v2.01.2：真实断开后 Windows 会把该屏的 SOURCE mode 从 modes 数组里摘掉，
+    接回时没有任何下标可引用。只能**自己补一条**。
+
+    真机矩阵（scripts/topology_mode_synthesis.py，SDC_VALIDATE，只读）：
+      source=INVALID / 借用别的屏的 source mode / pf=32BPP / 位置与主屏重叠 → 87
+      自己补一条 + pf=NONGDI + 位置不与现有屏重叠                       → 0
+    """
+
+    def _active_layout(self):
+        """一块 2560x1440 活在 (0,0)，mo=des 数组里它能被引用。"""
+        paths = (mb._CcdPathInfo * 2)()
+        modes = (mb._CcdModeInfo * 4)()
+        paths[0].flags = mb._CCD_PATH_ACTIVE
+        paths[0].sourceInfo.modeInfoIdx = ((1 << 16) | 0xFFFF)
+        paths[0].targetInfo.targetAvailable = 1
+        modes[1].infoType = mb._CCD_TYPE_SOURCE
+        modes[1].id = 0
+        modes[1].sourceMode.width = 2560
+        modes[1].sourceMode.height = 1440
+        modes[1].sourceMode.position.x = 0
+        modes[1].sourceMode.position.y = 0
+        rows = [{"pathIndex": 0, "anchor": "A1", "active": True, "connected": True,
+                 "vdd": False, "srcId": 0, "tgtId": 100, "luidLow": 7},
+                {"pathIndex": 1, "anchor": "A2", "active": False, "connected": True,
+                 "vdd": False, "srcId": 1, "tgtId": 200, "luidLow": 7}]
+        return paths, modes, 2, 4, rows
+
+    def test_append_source_mode_uses_nongdi_and_does_not_touch_original(self):
+        modes = self._modes()
+        before = bytes(modes).hex()
+        grown, idx = mb._ccd_append_source_mode(modes, 6, 0x00010CBD, 0, 2,
+                                                2560, 1440, 2560, 0)
+        self.assertEqual(idx, 6)
+        self.assertEqual(len(grown), 7)
+        self.assertEqual(int(grown[idx].infoType), mb._CCD_TYPE_SOURCE)
+        self.assertEqual(int(grown[idx].id), 2)
+        self.assertEqual(int(grown[idx].adapterId.LowPart), 0x00010CBD)
+        self.assertEqual(int(grown[idx].sourceMode.width), 2560)
+        self.assertEqual(int(grown[idx].sourceMode.height), 1440)
+        # Windows 自己给 source mode 填的就是 NONGDI；填 32BPP 会被拒
+        self.assertEqual(int(grown[idx].sourceMode.pixelFormat),
+                         mb._CCD_PIXELFORMAT_NONGDI)
+        self.assertEqual(int(grown[idx].sourceMode.position.x), 2560)
+        self.assertEqual(bytes(modes).hex(), before)     # 原数组没被带脏
+
+    def test_free_origin_is_right_edge_of_current_desktop(self):
+        paths, modes, _pc, _mc, rows = self._active_layout()
+        self.assertEqual(mb._ccd_free_origin(rows, paths, modes), 2560)
+
+    def test_live_size_copies_an_active_screen(self):
+        paths, modes, _pc, _mc, rows = self._active_layout()
+        self.assertEqual(mb._ccd_live_size(rows, paths, modes), (2560, 1440))
+
+    def test_live_size_falls_back_when_nothing_active(self):
+        paths, modes, _pc, _mc, rows = self._active_layout()
+        rows[0]["active"] = False
+        self.assertEqual(mb._ccd_live_size(rows, paths, modes), (1920, 1080))
+
+    def test_on_synthesizes_source_mode_and_grows_mode_array(self):
+        """端到端：plan 缺 source mode → 造一条 → 提交时 mc 多 1、下标指向新项。"""
+        seen = {}
+        cfg = self._cfg(screen_off_method="topology")
+
+        def fake_apply(u32, paths, modes, pc, mc):
+            seen["mc"] = mc
+            seen["modes"] = modes
+            seen["srcIdx"] = int(paths[1].sourceInfo.modeInfoIdx)
+            return 0
+
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a, **k: self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
+                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                                           return_value=(2560, 1440)), \
+                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "_write_event_log"):
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(errs, [])
+        self.assertEqual(seen["mc"], 7)                       # 原 6 条 + 补 1 条
+        self.assertEqual(seen["srcIdx"], (6 << 16) | 0xFFFF)  # 指向新补的 modes[6]
+        self.assertEqual(int(seen["modes"][6].sourceMode.width), 2560)
+        self.assertEqual(int(seen["modes"][6].sourceMode.pixelFormat),
+                         mb._CCD_PIXELFORMAT_NONGDI)
 
     def test_on_falls_back_to_windows_target_choice(self):
         """降级链只有两档：现算三元组 → source 现算 + target/desktop 交 Windows。"""
@@ -1687,6 +1783,48 @@ class TopologySubmitShapeTest(_TopoFixture):
                                            side_effect=logs.append):
             mb.screen_on_cfg(cfg, [1])
         self.assertEqual(logs, [])
+
+
+class TopologySnapshotShapeTest(_TopoFixture):
+    """快照只许存"用到的那些元素"。存多了回滚时会越界写坏堆（实测段错误）。
+
+    `GetDisplayConfigBufferSizes` 给的是**上限**（本机 modes 699 条），
+    `QueryDisplayConfig` 只填真正用到的（本机 6 条）并把计数改回 6。
+    以前用 `bytes(modes)` 存了整个 699 条，回滚按 6 条建数组再 memmove
+    44736 字节 → 堆越界 → 最后在某个 print 里崩成 access violation。
+    """
+
+    def test_snapshot_only_captures_used_elements(self):
+        paths = (mb._CcdPathInfo * 10)()          # 分配 10 条
+        modes = (mb._CcdModeInfo * 40)()          # 分配 40 条
+        snap = mb._ccd_make_snapshot(paths, modes, 3, 2, [])
+        self.assertEqual(len(bytes.fromhex(snap["pathsHex"])),
+                         3 * ctypes.sizeof(mb._CcdPathInfo))
+        self.assertEqual(len(bytes.fromhex(snap["modesHex"])),
+                         2 * ctypes.sizeof(mb._CcdModeInfo))
+        self.assertEqual((snap["pathCount"], snap["modeCount"]), (3, 2))
+
+    def test_restore_refuses_mismatched_snapshot(self):
+        """长度对不上就一个字都不写：宁可少一次回滚，也不要写坏堆。"""
+
+        class _U:
+            def SetDisplayConfig(self, *a):
+                raise AssertionError("形状不符时不该提交")
+
+        snap = {"pathCount": 2, "modeCount": 2,
+                "pathsHex": "00" * 10, "modesHex": "00" * 10}
+        self.assertEqual(mb._ccd_restore_from_bytes(_U(), snap), -1)
+
+    def test_snapshot_roundtrip_keeps_bytes(self):
+        paths = (mb._CcdPathInfo * 4)()
+        modes = (mb._CcdModeInfo * 3)()
+        paths[0].sourceInfo.id = 7
+        modes[0].id = 11
+        snap = mb._ccd_make_snapshot(paths, modes, 4, 3, [])
+        self.assertEqual(bytes.fromhex(snap["pathsHex"])[:16],
+                         bytes(mb._ccd_slice_bytes(paths, 1))[:16])
+        self.assertEqual(len(bytes.fromhex(snap["modesHex"])),
+                         3 * ctypes.sizeof(mb._CcdModeInfo))
 
 
 class TopologyScheduleTest(_TopoFixture):
@@ -1773,11 +1911,14 @@ class TopologyPlanOnTest(unittest.TestCase):
         self.assertIn("没有空闲 source", errs[0])
 
     def test_plan_returns_none_mode_when_mode_gone(self):
-        """source mode 缺失 → 计划阶段报错（置 INVALID 必 rc=87，不能硬提交）。"""
+        """source mode 缺失 → 标记 makeSourceMode，由接回时现造一条补上。"""
         plan, errs, _ = mb.topology_plan_on(["A2"], self.ROWS, [])
-        self.assertEqual(plan, [])
-        self.assertEqual(len(errs), 1)
-        self.assertIn("source mode", errs[0])
+        self.assertEqual(errs, [])
+        self.assertEqual(len(plan), 1)
+        self.assertIsNone(plan[0]["sourceModeIdx"])
+        self.assertTrue(plan[0]["makeSourceMode"])
+        self.assertIsNone(plan[0]["targetModeIdx"])
+        self.assertIsNone(plan[0]["desktopModeIdx"])
 
     def test_apply_plan_writes_bitexact_layout(self):
         paths = (mb._CcdPathInfo * 1)()
