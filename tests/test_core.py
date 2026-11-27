@@ -1469,6 +1469,71 @@ class RestoreSelectionTest(unittest.TestCase):
         self.assertEqual(mb.App._restore_selection(self._app(2), [5]), [0, 1])
 
 
+class RememberLayoutTest(TempConfigCase):
+    """「记住当前显示器布局」—— 位置记录的唯一主动更新入口。
+
+    背景（17:36 的日志）：交接主屏会把接班屏挪到桌面原点，之后每次断开都
+    把"那一刻的位置"记进去，两块屏的记录全被写成 (0,0)，原布局丢失。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = mb.default_config()
+        self.cfg["monitor_positions"] = {}
+        self.saved = []
+        self._old_save = mb.save_config
+
+        def _fake_save(c):
+            self.saved.append(dict(c))
+            return True, ""
+
+        mb.save_config = _fake_save
+
+    def tearDown(self):
+        mb.save_config = self._old_save
+        super().tearDown()
+
+    def _topo(self):
+        """两块屏的最小拓扑：A1 在 (0,0)，A2 在 (-2560,0)。"""
+        rows = [
+            {"pathIndex": 0, "index": 0, "anchor": "A1", "active": True,
+             "connected": True, "gdi": "\\\\.\\DISPLAY1", "friendly": "P1",
+             "vdd": False, "srcId": 0, "tgtId": 100},
+            {"pathIndex": 1, "index": 1, "anchor": "A2", "active": True,
+             "connected": True, "gdi": "\\\\.\\DISPLAY2", "friendly": "P2",
+             "vdd": False, "srcId": 1, "tgtId": 200},
+        ]
+        paths = (mb._CcdPathInfo * 2)()
+        modes = (mb._CcdModeInfo * 4)()
+        paths[0].sourceInfo.modeInfoIdx = (0 << 16) | 0xFFFF
+        modes[0].sourceMode.width = 2560
+        modes[0].sourceMode.height = 1440
+        paths[1].sourceInfo.modeInfoIdx = (3 << 16) | 0xFFFF
+        modes[3].sourceMode.width = 2560
+        modes[3].sourceMode.height = 1440
+        modes[3].sourceMode.position.x = -2560
+        return paths, modes, 2, 4, rows
+
+    def test_records_current_layout(self):
+        paths, modes, pc, mc, rows = self._topo()
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           return_value=(paths, modes, pc, mc, rows)):
+            layout, err = mb.remember_layout_snapshot(self.cfg)
+        self.assertEqual(err, None)
+        self.assertEqual(layout["A1"], [0, 0, 2560, 1440])
+        self.assertEqual(layout["A2"], [-2560, 0, 2560, 1440])
+        self.assertEqual(self.saved, [self.cfg])
+
+    def test_reports_when_nothing_active(self):
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           side_effect=lambda *a: (None, None, 0, 0, [])):
+            layout, err = mb.remember_layout_snapshot(self.cfg)
+        self.assertIsNone(layout)
+        self.assertIn("没有活动", err)
+
+
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 

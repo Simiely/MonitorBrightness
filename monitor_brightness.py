@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.10"    # 启动默认全选显示器；修回副屏在左的布局
+APP_VERSION = "2.01.11"    # 位置记录不再被交接污染；加「记住布局」；虚拟屏不给按钮
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -2382,10 +2382,16 @@ def topology_off(indices, cfg=None, heir=None):
             pos = {a: [v[0] + shift[0], v[1] + shift[1], v[2], v[3]]
                    for a, v in pos.items()}
             merged = dict(cfg.get("monitor_positions") or {})
-            merged.update(pos)
+            # **已有记录不覆盖**（v2.01.11）。交接主屏会把接班屏挪到桌面原点，
+            # 于是"断开那一刻的位置"已经不是用户摆的位置了；照它记下来，
+            # 下次接回就会把副屏丢到右边去（实测：两块屏的记录都被写成 (0,0)）。
+            # 用户真想更新布局，用设置里的「记住当前显示器布局」。
+            for a, v in pos.items():
+                merged.setdefault(a, v)
             cfg["monitor_positions"] = _coerce_positions(merged)
             save_config(cfg)
-            dlog("topo.off.positions", captured=pos)
+            dlog("topo.off.positions", captured=pos,
+                 kept=list(cfg["monitor_positions"]))
 
     cur_modes, cur_mc = modes, mc
 
@@ -3305,6 +3311,30 @@ def topology_heir_candidates(off_anchors=(), rows=None):
                     "gdi": r.get("gdi") or ""})
     out.sort(key=lambda c: (c["vdd"], not c["active"]))
     return out
+
+
+def remember_layout_snapshot(cfg):
+    """把"当前拓扑"记成用户的显示器布局（v2.01.11）。
+
+    位置记录**不会自动覆盖**：交接主屏会把接班屏挪到桌面原点，那一刻的
+    "真实位置"不是用户摆的。这条是唯一的主动更新入口，放主线程同步做
+    （一次 CCD 查询 ~50ms，不值得异步）。
+    返回 (布局, None) 或 (None, 错误文案)。
+    """
+    u32 = _ccd_api()
+    raw = _ccd_query_raw(u32) if u32 is not None else None
+    if raw is None:
+        return None, "读不到当前显示器拓扑"
+    paths, modes, pc, mc, rows = raw
+    layout = _ccd_layout_by_anchor(rows, paths, modes)
+    if not layout:
+        return None, "当前没有活动的显示器"
+    cfg["monitor_positions"] = {a: list(r) for a, r in layout.items()}
+    ok, err = save_config(cfg)
+    if not ok:
+        return None, err or "配置保存失败"
+    dlog("app.remember_layout", layout=cfg["monitor_positions"])
+    return cfg["monitor_positions"], None
 
 
 def resolve_monitors(cfg):
@@ -5250,9 +5280,14 @@ class MonitorPanel:
         以前是两个都摆上（一个常灰），实测用户看到的是"这按钮怎么是灰的、
         是不是坏了"。按钮本来就该表达"现在能做的那一件事"。
         系统级熄灭是整组广播，没有"只动一块"，那种模式一个都不放。
+        虚拟显示器也不放：它归串流软件管，本程序断/接它没有意义
+        （实测：VDD 当主屏时它也会出现在列表里，给个「熄灭」点了只会
+        提示"拿不到锚点"，纯属骗人）。
         """
         method = self.app.cfg.get("screen_off_method")
         if method not in ("ddc", "topology"):
+            return None
+        if getattr(self.app, "is_vdd", lambda i: False)(index):
             return None
         box = tk.Frame(row, bg=UI["card"])
         box.pack(side="right", padx=(6, 10))
@@ -5790,11 +5825,18 @@ class SettingsSheet(Sheet):
         self.row(off, "点亮时允许切信号源", "最后一招；DP+HDMI 双线时可能切到空口",
                  builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
                                           lambda v: app.apply_setting("wake_switch_input", v)).pack())
-        # 交接主屏会让所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
+        # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
         self.row(off, "改显示器时窗口跟着屏走",
                  "拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",
                  builder=lambda p: Switch(p, bool(cfg.get("window_follow", True)),
                                           lambda v: app.apply_setting("window_follow", v)).pack())
+        # 位置记录不会自动覆盖（交接会把屏挪来挪去，那一刻的位置不是用户摆的），
+        # 所以给一个主动更新的入口 —— 这是"记住布局"的唯一途径
+        self.row(off, "记住当前显示器布局",
+                 "断开/接回都按这份位置摆放；自己挪过屏之后点一次",
+                 builder=lambda p: Button(
+                     p, "记住", app.remember_layout, kind="link",
+                     height=22, font_size=8).pack())
 
         pre = self.section("亮度预设")
         pbg = pre.cget("bg")
@@ -6019,6 +6061,16 @@ class App:
         except Exception as e:
             self.status_var.set("打开日志目录失败：%s" % e)
 
+    def remember_layout(self):
+        """把现在的显示器摆法记成"用户的布局"，断开/接回都按这份来。"""
+        layout, err = remember_layout_snapshot(self.cfg)
+        if err:
+            self.status_var.set("记不住布局：%s" % err)
+            self.msg.showerror("记住布局失败", err)
+            return
+        dlog("app.action", what="remember_layout", count=len(layout))
+        self.status_var.set("已记住 %d 块屏的位置" % len(layout))
+
     def export_diag(self):
         """导出诊断包，并直接在资源管理器里选中它。"""
         path, err = diag_export()
@@ -6173,14 +6225,27 @@ class App:
             release_targets(targets)
         self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
         # 拓扑模式额外列出「断开但设备还在」的屏；ddc/system 一律清空。
+        # 顺手记下虚拟显示器的设备名：它们不能有逐台按钮（见 _row_action_button）。
         if self.cfg.get("screen_off_method") == "topology":
             try:
-                self.topo_inactive = topology_inactive_rows()
+                rows = ccd_probe_topology()
+                self._vdd_devs = {_short_dev(r.get("gdi"))
+                                  for r in rows if r.get("vdd")}
+                self.topo_inactive = topology_inactive_rows(rows)
             except Exception:
+                self._vdd_devs = set()
                 self.topo_inactive = []
         else:
+            self._vdd_devs = set()
             self.topo_inactive = []
         self.mon_panel.rebuild(self._restore_selection(prev))
+
+    def is_vdd(self, index):
+        """这一行是不是虚拟显示器 —— 归串流软件管，不给逐台按钮。"""
+        if index >= len(self.monitors):
+            return False
+        dev = _short_dev(self.monitors[index].get("dev"))
+        return bool(getattr(self, "_vdd_devs", ()) and dev in self._vdd_devs)
         if not self.monitors:
             self.status_var.set(
                 "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
