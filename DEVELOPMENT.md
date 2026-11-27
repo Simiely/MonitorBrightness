@@ -140,10 +140,12 @@ path#1 `0x0004FFFF/0x00030005`）。
 用户要求"先加日志方便定位，软件稳定后再去掉"，所以这个模块的唯一额外要求是
 **好删**。它只有两个函数、埋点全是单行 `dlog(...)`。
 
-- 落盘：`%APPDATA%\MonitorBrightness\diag.log`，JSON Lines，单文件超 512KB
-  轮转一份 `.1`。
+- 落盘：**程序同目录** `diag.log`（不可写才回退 `%APPDATA%`），JSON Lines，
+  单文件超 512KB 轮转一份 `.1`。见 `_pick_log_dir()`。
 - 开关：配置项 `diag_log`（默认开）。界面在 设置 → 关于；命令行 `--diag-log`
   直接打印最近 200 行，`--diag` 里显示路径与开关状态。
+- 导出：设置 → 关于 →「导出诊断包」，或 `--diag-export`，生成 zip
+  （日志 + config.json + 环境.txt），放在程序目录。
 - tag 前缀：`app.*` / `screen.*` / `topo.*` / `ccd.*` / `sch.*`。
   一次接回可以这样串起来看：
   `findstr /c:"\"tag\": \"topo.on" diag.log`

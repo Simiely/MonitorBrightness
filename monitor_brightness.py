@@ -14,6 +14,7 @@
       MonitorBrightness.exe --probe                       实测每台显示器的亮灭
       MonitorBrightness.exe --diag                        只读诊断报告（排查点不亮）
       MonitorBrightness.exe --diag-log                    打印最近的诊断日志（排障用）
+      MonitorBrightness.exe --diag-export                 导出诊断包 zip（日志+配置）
       MonitorBrightness.exe --screen off|on|status        熄灭 / 点亮选中的显示器
       MonitorBrightness.exe --selftest                    自检（打印时间分档判定结果）
 
@@ -34,6 +35,7 @@ import json
 import html
 import queue
 import shutil
+import zipfile
 import hashlib
 import tempfile
 import threading
@@ -71,13 +73,75 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.4"     # 加临时诊断日志模块（diag.log / --diag-log）
+APP_VERSION = "2.01.5"     # 日志改到程序目录；加「导出诊断包」
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
+def _app_dir():
+    """程序所在目录：打包态 = exe 所在目录；源码运行 = 脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _dir_writable(path):
+    """真的试着写一下再删。
+
+    `os.access(W_OK)` 在 Windows 上对 Program Files 之类的目录会返回 True，
+    实际写的时候才报错，所以必须真写。
+    """
+    probe = os.path.join(path, ".mb-write-probe")
+    try:
+        os.makedirs(path, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        try:
+            os.remove(probe)
+        except Exception:
+            pass
+        return False
+
+
+def _pick_log_dir():
+    """日志放**程序同目录**（便携、出问题整个目录发给开发者就行）。
+
+    只有程序目录不可写才回退到 APPDATA —— 装在 Program Files、只读介质、
+    网络盘上时会走到这条回退路径。
+    配置本身仍留在 APPDATA：换版本目录时设置不会丢。
+    """
+    app_dir = _app_dir()
+    return app_dir if _dir_writable(app_dir) else CONFIG_DIR
+
+
+APP_DIR = _app_dir()
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
 # ⚠️ 本程序启动时不会主动熄屏：启动自检只校验计划任务定义，绝不补执行任何档位。
-EVENTS_FILE = os.path.join(CONFIG_DIR, "events.log")
-ERROR_FILE = os.path.join(CONFIG_DIR, "error.log")
+LOG_DIR = _pick_log_dir()
+EVENTS_FILE = os.path.join(LOG_DIR, "events.log")
+ERROR_FILE = os.path.join(LOG_DIR, "error.log")
+
+
+def _migrate_old_logs():
+    """老版本把日志写在 APPDATA，换到程序目录后把现有的几份搬一次过来。
+
+    v2.01.5 之前日志在 `%APPDATA%\\MonitorBrightness`；现在优先放程序目录，
+    这样出问题时整个目录打包发出去就行。搬一次、不覆盖已有的。
+    **只在 main() 里调用**：单元测试不该有这个副作用。
+    """
+    if os.path.abspath(LOG_DIR) == os.path.abspath(CONFIG_DIR):
+        return
+    for name in ("events.log", "events.log.1", "error.log", "diag.log"):
+        src = os.path.join(CONFIG_DIR, name)
+        dst = os.path.join(LOG_DIR, name)
+        try:
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
 
 # v1.9.4：删除启动补执行与 12 小时补检阈值。启动自检只比对任务定义
 # （路径/参数/触发点/StartWhenAvailable），绝不按「今天错过了哪一档」执行业务动作，
@@ -340,7 +404,7 @@ def _write_event_log(text):
     """
     line = "%s %s" % (datetime.now().strftime("%m-%d %H:%M"), text)
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
         with _EVENT_LOCK:
             try:
                 if os.path.getsize(EVENTS_FILE) > 256 * 1024:
@@ -387,8 +451,8 @@ _DIAG_LIMIT = 512 * 1024        # 超过就轮转到 diag.log.1，只留一份
 
 
 def _diag_file():
-    """每次现算：测试会把 CONFIG_DIR 指到临时目录，不能在导入时就定死。"""
-    return os.path.join(CONFIG_DIR, "diag.log")
+    """每次现算：测试会把 LOG_DIR 指到临时目录，不能在导入时就定死。"""
+    return os.path.join(LOG_DIR, "diag.log")
 
 
 def diag_set_enabled(value):
@@ -431,7 +495,7 @@ def dlog(tag, **fields):
         text = str(v)
         rec[k] = text if len(text) <= 600 else text[:600] + "…"
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
         line = json.dumps(rec, ensure_ascii=False)
         path = _diag_file()
         with _DIAG_LOCK:
@@ -453,6 +517,47 @@ def diag_dump(limit=400):
             return [x.rstrip("\n") for x in f.readlines()[-limit:]]
     except Exception:
         return []
+
+
+def diag_export(dest_dir=None):
+    """把日志 + 配置打成一个 zip，出问题直接把这个文件发出去。
+
+    只装排障需要的东西：三份日志（含轮转的 .1）、config.json、一份环境摘要。
+    返回 (zip 路径, 错误)。日志目录优先用程序同目录 —— 所以 zip 也放那里，
+    和 exe 并排，用户一找就能看到。
+    """
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = dest_dir or LOG_DIR
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "MonitorBrightness_诊断包_%s.zip" % stamp)
+        cfg = load_config()
+        summary = [
+            "版本：v%s" % APP_VERSION,
+            "打包态：%s" % bool(getattr(sys, "frozen", False)),
+            "Python：%s" % sys.version.split()[0],
+            "程序目录：%s" % APP_DIR,
+            "日志目录：%s" % LOG_DIR,
+            "配置目录：%s" % CONFIG_DIR,
+            "熄灭方式：%s" % cfg.get("screen_off_method"),
+            "锚点：%s" % (cfg.get("monitor_anchors") or []),
+            "位置记录：%s" % (cfg.get("monitor_positions") or {}),
+            "诊断日志：%s" % ("开启" if diag_enabled() else "关闭"),
+            "导出时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in ("diag.log", "diag.log.1", "events.log",
+                         "events.log.1", "error.log"):
+                src = os.path.join(LOG_DIR, name)
+                if os.path.exists(src):
+                    z.write(src, name)
+            if os.path.exists(CONFIG_FILE):
+                z.write(CONFIG_FILE, "config.json")
+            z.writestr("环境.txt", "\n".join(summary) + "\n")
+        dlog("app.export", path=path)
+        return path, ""
+    except Exception as e:
+        return "", "%s: %s" % (type(e).__name__, e)
 
 
 # ============================================================================
@@ -3787,6 +3892,7 @@ def cli_diag():
          % (cfg.get("monitors"), cfg.get("monitor_ids"), cfg.get("monitor_anchors")))
     _out("接回位置记录：%s" % (cfg.get("monitor_positions") or "{}"))
     _out("锚点优先解析结果：%s" % (resolve_monitors(cfg) or "[]（= 全部）"))
+    _out("日志目录：%s（%s）" % (LOG_DIR, "程序同目录" if LOG_DIR == APP_DIR else "回退到 APPDATA"))
     _out("诊断日志：%s（%s，用 --diag-log 看内容）"
          % (_diag_file(), "开启" if diag_enabled() else "已关闭"))
 
@@ -4773,7 +4879,12 @@ class MonitorPanel:
                 if info:
                     sub = "%d × %d · %s · %s" % (
                         info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
-                Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
+                    if (self.app.cfg.get("screen_off_method") == "topology"
+                            and info[3]):
+                        # 按钮还在但置灰，必须说清为什么，否则用户以为程序坏了
+                        sub += " · 拓扑模式不可断开"
+                Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"],
+                      justify="left", wraplength=320).pack(anchor="w")
                 self.mon_rows[i] = row
             # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置 →
             # 屏幕，那里连虚拟显示器都会画出来）。物理屏给「显示」按钮；
@@ -4803,26 +4914,28 @@ class MonitorPanel:
     def _row_buttons(self, row, index):
         """给一行活动显示器装「熄灭 / 显示」。返回容器或 None。
 
-        系统级熄灭是**整组广播**，没有"只关一块"这回事 —— 那种模式下
-        一个按钮都不放，免得点了没反应还以为是程序坏了。
+        **两种按钮始终都在**，不可用时置灰并说明原因 —— 实测：把主屏的
+        「熄灭」直接藏掉，用户看到的是"这一行没正常显示"，而不是"这里不可用"。
+
+        系统级熄灭是**整组广播**，没有"只关一块"这回事，那种模式下一个按钮
+        都不放（整行都没有，一眼就能看出不是漏画）。
         """
         method = self.app.cfg.get("screen_off_method")
         if method not in ("ddc", "topology"):
             return None
         box = tk.Frame(row, bg=UI["card"])
         box.pack(side="right", padx=(6, 10))
-        # 拓扑模式断不开主屏（Windows 不让移除主屏），那一行就不给「熄灭」
         primary = bool(self.app.mon_info[index][3]) if index < len(self.app.mon_info) else False
-        off_btn = None
-        if not (method == "topology" and primary):
-            off_btn = Button(box, "熄灭", lambda i=index: self.app.monitor_off(i),
-                             kind="link", height=18, pad_bg=UI["card"], font_size=8)
+        off_btn = Button(box, "熄灭", lambda i=index: self.app.monitor_off(i),
+                         kind="link", height=18, pad_bg=UI["card"], font_size=8)
         on_btn = Button(box, "显示", lambda i=index: self.app.monitor_on(i),
                         kind="link", height=18, pad_bg=UI["card"], font_size=8)
         # 先 pack 的在最右边：于是视觉上是「熄灭」「显示」，控件顺序也是这个序
         on_btn.pack(side="right")
-        if off_btn is not None:
-            off_btn.pack(side="right", padx=(0, 4))
+        off_btn.pack(side="right", padx=(0, 4))
+        if method == "topology" and primary:
+            # Windows 不允许把主屏从拓扑里移除（实测 rc=87），置灰而不是藏起来
+            off_btn.set_enabled(False)
         return box
 
     def set_row_text(self, i, text):
@@ -5337,6 +5450,10 @@ class SettingsSheet(Sheet):
                  builder=lambda p: Button(
                      p, "打开", app.open_log_dir, kind="link",
                      height=22, font_size=8).pack())
+        self.row(about, "导出诊断包", "日志 + 配置打成一个 zip，直接发出去",
+                 builder=lambda p: Button(
+                     p, "导出", app.export_diag, kind="link",
+                     height=22, font_size=8).pack())
         self.show()
 
 
@@ -5521,12 +5638,25 @@ class App:
             self.msg.showerror("打开说明失败", "%s: %s" % (type(e).__name__, e))
 
     def open_log_dir(self):
-        """打开配置/日志目录（排障时直接看 diag.log）。"""
+        """打开日志目录（和程序同目录；不可写时才在 APPDATA）。"""
         try:
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            os.startfile(CONFIG_DIR)          # noqa: S606 — 只打开自家目录
+            os.makedirs(LOG_DIR, exist_ok=True)
+            os.startfile(LOG_DIR)             # noqa: S606 — 只打开自家目录
         except Exception as e:
             self.status_var.set("打开日志目录失败：%s" % e)
+
+    def export_diag(self):
+        """导出诊断包，并直接在资源管理器里选中它。"""
+        path, err = diag_export()
+        if err:
+            self.status_var.set("导出失败：%s" % err)
+            self.msg.showerror("导出诊断包失败", err)
+            return
+        self.status_var.set("诊断包已导出：%s" % path)
+        try:
+            subprocess.Popen(["explorer", "/select,%s" % path])
+        except Exception:
+            pass
 
     # ---------- 设置项写回 ----------
     def apply_setting(self, key, value):
@@ -6758,6 +6888,7 @@ def cli_screen(action):
 
 def main():
     args = sys.argv[1:]
+    _migrate_old_logs()
     dlog("app.start", ver=APP_VERSION, argv=args,
          packaged=bool(getattr(sys, "frozen", False)),
          py="%d.%d.%d" % sys.version_info[:3])
@@ -6769,6 +6900,11 @@ def main():
             _out("diag.log：%s（%d 行）" % (_diag_file(), len(lines)))
             for line in lines:
                 _out(line)
+            return
+        if cmd == "--diag-export":
+            # 导出诊断包（临时命令）：日志 + 配置打成一个 zip
+            path, err = diag_export()
+            _out(err or ("已导出：%s" % path))
             return
         if cmd == "--set" and len(args) >= 3:
             cli_set(args[1], args[2])

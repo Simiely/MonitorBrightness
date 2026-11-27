@@ -39,6 +39,7 @@ def setUpModule():
     _MODULE_TMP = tempfile.mkdtemp(prefix="mb-test-module-")
     mb.CONFIG_DIR = _MODULE_TMP
     mb.CONFIG_FILE = os.path.join(_MODULE_TMP, "config.json")
+    mb.LOG_DIR = _MODULE_TMP
     mb.EVENTS_FILE = os.path.join(_MODULE_TMP, "events.log")
 
 
@@ -64,14 +65,17 @@ class TempConfigCase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mb-test-")
-        self._old = (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE, mb.CONFIG_LOAD_ERROR)
+        self._old = (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
+                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR)
         mb.CONFIG_DIR = self.tmp
         mb.CONFIG_FILE = os.path.join(self.tmp, "config.json")
+        mb.LOG_DIR = self.tmp
         mb.EVENTS_FILE = os.path.join(self.tmp, "events.log")
         mb.CONFIG_LOAD_ERROR = ""
 
     def tearDown(self):
-        mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE, mb.CONFIG_LOAD_ERROR = self._old
+        (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
+         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR) = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -1102,8 +1106,11 @@ class TopologyGuiTest(TempConfigCase):
         finally:
             root.destroy()
 
-    def test_primary_row_has_no_off_button_in_topology_mode(self):
-        """拓扑模式断不开主屏（Windows 不让移除），那一行就不给「熄灭」。"""
+    def test_primary_off_button_disabled_not_hidden_in_topology_mode(self):
+        """拓扑模式断不开主屏，但按钮要**在**（置灰+说明），不能凭空消失。
+
+        实测：藏掉之后用户看到的是"这一行没正常显示"，而不是"这里不可用"。
+        """
         try:
             import tkinter as tk
             root = tk.Tk()
@@ -1127,10 +1134,21 @@ class TopologyGuiTest(TempConfigCase):
             panel = mb.MonitorPanel(fake)
             fake.mon_panel = panel
             panel.rebuild([])
-            rows = [_row_button_texts(row)
-                    for row in panel.inner.winfo_children()]
-            self.assertNotIn("熄灭", rows[0])        # 主屏
-            self.assertIn("熄灭", rows[1])           # 副屏
+            rows = list(panel.inner.winfo_children())
+            self.assertEqual(_row_button_texts(rows[0]), ["熄灭", "显示"])
+            self.assertEqual(_row_button_texts(rows[1]), ["熄灭", "显示"])
+
+            def off_enabled(row):
+                queue = list(row.winfo_children())
+                while queue:
+                    w = queue.pop(0)
+                    if getattr(w, "_text", None) == "熄灭":
+                        return bool(getattr(w, "_enabled", True))
+                    queue.extend(w.winfo_children())
+                return None
+
+            self.assertFalse(off_enabled(rows[0]))    # 主屏：置灰
+            self.assertTrue(off_enabled(rows[1]))     # 副屏：可点
         finally:
             root.destroy()
 
@@ -1199,6 +1217,49 @@ class DiagLogTest(TempConfigCase):
         mb.dlog("after.rotate")
         self.assertTrue(os.path.exists(path + ".1"))
         self.assertEqual(json.loads(mb.diag_dump()[0])["tag"], "after.rotate")
+
+
+class DiagExportTest(TempConfigCase):
+    """日志跟程序同目录 + 一键导出诊断包（v2.01.5）。"""
+
+    def tearDown(self):
+        mb.diag_set_enabled(False)
+        super().tearDown()
+
+    def test_log_dir_is_app_dir_when_writable(self):
+        self.assertEqual(mb._pick_log_dir(), mb.APP_DIR)
+
+    def test_log_dir_falls_back_to_config_dir_when_readonly(self):
+        old = mb._dir_writable
+        mb._dir_writable = lambda p: False
+        try:
+            self.assertEqual(mb._pick_log_dir(), mb.CONFIG_DIR)
+        finally:
+            mb._dir_writable = old
+
+    def test_export_zip_contains_logs_and_env(self):
+        import zipfile
+        mb.diag_set_enabled(True)
+        mb.dlog("demo", a=1)
+        mb._write_event_log("事件一行")
+        path, err = mb.diag_export()
+        self.assertEqual(err, "")
+        self.assertTrue(path.endswith(".zip"))
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+        self.assertIn("diag.log", names)
+        self.assertIn("events.log", names)
+        self.assertIn("环境.txt", names)
+
+    def test_export_reports_error_instead_of_raising(self):
+        old = mb.zipfile.ZipFile
+        mb.zipfile.ZipFile = lambda *a, **k: (_ for _ in ()).throw(OSError("磁盘满"))
+        try:
+            path, err = mb.diag_export()
+        finally:
+            mb.zipfile.ZipFile = old
+        self.assertEqual(path, "")
+        self.assertIn("磁盘满", err)
 
 
 class WalkthroughRound2Test(TempConfigCase):
