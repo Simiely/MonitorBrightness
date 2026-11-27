@@ -25,6 +25,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.config as cfg_mod
 import core.logging as log_mod
+import domain.slots as slots_mod
 import hw.ccd as hw_ccd
 import hw.ccd_structs as hw_structs
 import hw.ddc as hw_ddc
@@ -38,7 +39,7 @@ import service as svc_mod
 # R2：同一个函数可能同时绑在主文件与多个 hw/service 模块里。测试 patch 必须
 # 覆盖**调用方所在的那个绑定**，否则 mock 根本不会被调用到。这里用同一个
 # mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
-_PATCH_MODULES = (mb, cfg_mod, log_mod, hw_ddc, hw_structs, hw_ccd,
+_PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod)
 
 

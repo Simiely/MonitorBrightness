@@ -4,12 +4,10 @@
 放在 hw/ 之上、App 之下：hw.power 与 hw.topology 因此互不反向依赖，
 环②（topology_enable_anchor ↔ screen_on_cfg）在此消失。
 """
-from datetime import datetime
-
 from core.config import load_config, normalize_indices
 from core.logging import dlog
 from domain.decisions import _short_dev
-from domain.timeutil import clamp_level, parse_hhmm
+from domain.slots import _minutes, _slot_minutes, active_slot
 from hw.ccd import ccd_probe_topology
 from hw.ddc import enumerate_targets, probe_states, release_targets, set_brightness_many
 from hw.power import (
@@ -123,45 +121,6 @@ def screen_wake_entry(cfg, indices):
     if not opts["allow_switch"]:
         return screen_on_cfg(cfg, indices, wake_opts=opts)
     return screen_wake_flip(indices, opts["allow_switch"], opts["expect_off"])
-
-def _minutes(now=None):
-    now = now or datetime.now()
-    return now.hour * 60 + now.minute
-
-def _slot_minutes(cfg):
-    """cfg["slots"] -> [(当日分钟, 亮度)]，按时间排序。"""
-    out = []
-    for x in cfg.get("slots", []):
-        out.append((parse_hhmm(x.get("time"), (0, 0)), clamp_level(x.get("level", 50))))
-    return sorted(out)
-
-def active_slot(slots, now_min):
-    """N 档调度核心：取 time <= now 的最后一档；一个都没有 -> 最后一档（跨午夜回绕）。
-
-    slots 为 [(当日分钟, 亮度)]，返回 (当日分钟, 亮度)。
-    """
-    best = None
-    for m, lv in sorted(slots):
-        if m <= now_min:
-            best = (m, lv)
-    if best is None:
-        best = sorted(slots)[-1]
-    return best
-
-def active_slot_dict(slots, now_min):
-    """同 active_slot 的选择规则，但作用于原始档位 dict（含 screen 动作）。
-
-    取 time <= now_min 的最后一档；一个都没有 -> 时间最大的最后一档（跨午夜回绕）。
-    """
-    best = None
-    best_m = None
-    for s in slots:
-        m = parse_hhmm(s.get("time"), (0, 0))
-        if m <= now_min and (best is None or m >= best_m):
-            best, best_m = s, m
-    if best is None:
-        best = max(slots, key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
-    return best
 
 def current_level(cfg=None, now=None):
     """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""

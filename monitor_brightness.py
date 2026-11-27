@@ -150,8 +150,11 @@ from hw.power import (                                # noqa: E402
     WAKE_STAGE_LABEL, FAST_FLIP_WINDOW_S, _FAST_FLIP_AT, _FAST_FLIP_LOCK, _WAKE_INFO, _WAKE_INFO_LOCK,
 )
 from service import (                                # noqa: E402
-    screen_off_cfg, screen_on_row, screen_on_cfg, screen_wake_entry, topology_enable_anchor, current_level,
-    wake_options, selection_anchors, _minutes, _slot_minutes, active_slot, active_slot_dict,
+    screen_off_cfg, screen_on_row, screen_on_cfg, screen_wake_entry, topology_enable_anchor,
+    current_level, wake_options, selection_anchors,
+)
+from domain.slots import (                           # noqa: E402
+    _minutes, _slot_minutes, active_slot, active_slot_dict,
 )
 from hw.winfollow import (                                # noqa: E402
     _WinRect, _user32, _window_rect, iter_app_windows, win_snapshot, win_follow,
