@@ -11,6 +11,8 @@
 import app.brightness as app_bright_mod
 import app.common as app_common_mod
 import app.diag as app_diag_mod
+import app.layout as app_layout_mod
+import app.schedule as app_schedule_mod
 import app.screen_power as app_power_mod
 import app.settings as app_settings_mod
 import cli as cli_mod
@@ -52,7 +54,8 @@ _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
                   schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod,
                   app_settings_mod, app_diag_mod, app_common_mod,
-                  app_bright_mod, app_power_mod)
+                  app_bright_mod, app_power_mod, app_schedule_mod,
+                  app_layout_mod)
 
 
 _UNSET = object()
@@ -1761,6 +1764,17 @@ class UiSmokeTest(unittest.TestCase):
         self.assertTrue(issubclass(mb.App, app_bright_mod._BrightnessActions))
         self.assertTrue(issubclass(mb.App, app_power_mod._ScreenPowerActions))
 
+    def test_schedule_layout_split(self):
+        """R4-4：调度/布局类与布局辅助函数再导出仍在，_finish_apply 已归位。"""
+        self.assertIs(mb._ScheduleActions, app_schedule_mod._ScheduleActions)
+        self.assertIs(mb._LayoutActions, app_layout_mod._LayoutActions)
+        for name in ("topology_heir_candidates", "remember_layout_snapshot",
+                     "save_default_layout", "load_default_layout",
+                     "restore_default_layout", "DEFAULT_LAYOUT_FILE"):
+            self.assertIs(getattr(mb, name), getattr(app_layout_mod, name))
+        self.assertTrue(hasattr(app_schedule_mod._ScheduleActions, "_finish_apply"))
+        self.assertFalse(hasattr(app_power_mod._ScreenPowerActions, "_finish_apply"))
+
     def test_widgets_construct(self):
         """每个自绘控件都要能建出来且能正常销毁。"""
         import tkinter as tk
@@ -2110,16 +2124,15 @@ class RememberLayoutTest(TempConfigCase):
         self.cfg = mb.default_config()
         self.cfg["monitor_positions"] = {}
         self.saved = []
-        self._old_save = mb.save_config
 
         def _fake_save(c):
             self.saved.append(dict(c))
             return True, ""
 
-        mb.save_config = _fake_save
+        self._saves = set_any("save_config", _fake_save)
 
     def tearDown(self):
-        mb.save_config = self._old_save
+        restore_any(self._saves)
         super().tearDown()
 
     def _topo(self):
@@ -3414,10 +3427,12 @@ class DefaultLayoutTest(TempConfigCase):
         super().setUp()
         self.layout_file = os.path.join(self.tmp, "default_layout.json")
         self._old_file = mb.DEFAULT_LAYOUT_FILE
-        mb.DEFAULT_LAYOUT_FILE = self.layout_file
+        # R4-4：布局函数已搬 app/layout.py，路径常量必须两处同时改，
+        # 否则函数仍读 app.layout 里 import 时的真实 CONFIG_DIR。
+        mb.DEFAULT_LAYOUT_FILE = app_layout_mod.DEFAULT_LAYOUT_FILE = self.layout_file
 
     def tearDown(self):
-        mb.DEFAULT_LAYOUT_FILE = self._old_file
+        mb.DEFAULT_LAYOUT_FILE = app_layout_mod.DEFAULT_LAYOUT_FILE = self._old_file
         super().tearDown()
 
     def _snap(self):

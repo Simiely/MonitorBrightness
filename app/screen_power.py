@@ -185,15 +185,3 @@ class _ScreenPowerActions:
     def _auto_relight_minutes(self):
         """转发到模块级纯函数（v2.03.0 P2）。"""
         return auto_relight_minutes(self.cfg)
-
-    def _finish_apply(self, result, part, before_xml):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 走查 P-04：与其余入口统一回滚策略
-            self._rollback_schedule(False, "重建任务计划失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("任务计划已重建")
-        self._announce_rebuilt(part, out, before_xml, "任务计划已重建")
