@@ -151,10 +151,11 @@ SCREEN_ACTIONS = (("", "不变"), ("off", "熄灭"), ("on", "点亮"))
 SCREEN_VALUE_BY_LABEL = {label: value for value, label in SCREEN_ACTIONS}
 SCREEN_LABEL_BY_VALUE = {value: label for value, label in SCREEN_ACTIONS}
 
-# 熄灭方式：system = 系统级整组熄灭（默认，一定唤得回来）
-#           ddc    = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，仅作高级选项）
-OFF_METHODS = ("system", "ddc")
-OFF_METHOD_LABEL = {"system": "系统级", "ddc": "单屏待机"}
+# 熄灭方式：system   = 系统级整组熄灭（一定唤得回来）
+#           ddc      = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，仅作高级选项）
+#           topology = CCD 断开副屏（串流隐藏物理屏用；默认不是它）
+OFF_METHODS = ("system", "ddc", "topology")
+OFF_METHOD_LABEL = {"system": "系统级", "ddc": "单屏待机", "topology": "拓扑断开"}
 SETTINGS = (
     {"key": "monitors", "kind": "indices", "default": []},
     # 设备名锚点（如 ['DISPLAY1','DISPLAY2']），与 monitors 同序对应。
@@ -175,11 +176,12 @@ SETTINGS = (
     # 熄灭那一刻的系统 tick（毫秒）。用来判断"熄灭之后有没有过键鼠输入"——有输入
     # 就说明系统已经把屏幕唤醒了（见 _screen_woke_by_input）。重启后 tick 失效，忽略。
     {"key": "screen_off_tick", "kind": "int", "default": 0},
-    # 熄灭方式：system = Windows 系统级整组熄灭（一定唤得回来）
-    #           ddc    = 逐台 DDC 0xD6=2 待机（默认；v1.8.5 已验证的熄灭路径）
+    # 熄灭方式：system   = Windows 系统级整组熄灭（一定唤得回来）
+    #           ddc      = 逐台 DDC 0xD6=2 待机（默认；v1.8.5 已验证的熄灭路径）
+    #           topology = CCD 断开副屏（E3/E4 新增选项，默认不变）
     # v1.9.3 恢复 v1.8.5 的默认值：v1.9.0 曾未经要求把默认改成 system。
     {"key": "screen_off_method", "kind": "choice",
-     "values": ("system", "ddc"), "default": "ddc"},
+     "values": OFF_METHODS, "default": "ddc"},
     # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
     {"key": "wake_switch_input", "kind": "flag", "default": True},
     # v1.9.7 快速点亮：0x60 切源翻转（读当前源 → 写中间源 → 立即写回），单台 ~180ms。
@@ -1340,6 +1342,330 @@ def screen_verdict(cfg, probes=None):
     return {"state": state, "text": text, "detail": detail, "woke_by_input": woke}
 
 
+# ---- 拓扑动作层（E3）-----------------------------------------------------
+# 只服务于 screen_off_method == "topology"；默认 ddc / system 的路径完全不经过这里。
+# 事实依据见 docs/拓扑探针.md C2–C5：
+#   - 副屏断开 rc=0 / 805ms，接回 986ms（含进程启动）；
+#   - 主屏断开 rc=87，Windows 不允许直接移除主屏；
+#   - inactive 时 DDC 读不到，所以「点亮」必须先恢复拓扑、再写亮度；
+#   - 回读失败时原始字节快照可原样恢复（C5 强制失败实验验证过）。
+# 快照落在 %APPDATA%\MonitorBrightness\topology-snapshot.json（仓库外，不入库）。
+_SDC_USE_SUPPLIED = 0x00000020
+_SDC_APPLY = 0x00000080
+_SDC_SAVE_TO_DATABASE = 0x00000200
+_SDC_ALLOW_CHANGES = 0x00000400
+_SDC_VIRTUAL_MODE_AWARE = 0x00008000
+_CCD_APPLY_FLAGS = (_SDC_USE_SUPPLIED | _SDC_APPLY | _SDC_SAVE_TO_DATABASE |
+                    _SDC_ALLOW_CHANGES | _SDC_VIRTUAL_MODE_AWARE)
+_CCD_MODE_IDX_INVALID = 0xFFFFFFFF
+TOPO_SNAPSHOT_FILE = "topology-snapshot.json"
+TOPO_VERIFY_TIMEOUT = 2.0          # D3：接回回读有界轮询 ≤2s
+
+
+def topology_snapshot_path():
+    """拓扑快照路径（与原始终把原始字节放仓库外保持一致）。"""
+    return os.path.join(CONFIG_DIR, TOPO_SNAPSHOT_FILE)
+
+
+def _ccd_api():
+    """拿一份声明好函数签名的 user32；非 Windows 返回 None。"""
+    if os.name != "nt":
+        return None
+    u32 = ctypes.windll.user32
+    u32.GetDisplayConfigBufferSizes.argtypes = [
+        wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)]
+    u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
+    u32.QueryDisplayConfig.argtypes = [
+        wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.c_void_p,
+        ctypes.POINTER(wintypes.UINT), ctypes.c_void_p, ctypes.c_void_p]
+    u32.QueryDisplayConfig.restype = wintypes.LONG
+    u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
+    u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
+    return u32
+
+
+def _ccd_query_raw(u32=None):
+    """返回 (paths, modes, pc, mc, rows)；失败返回 None。
+
+    rows 每条 path 一项（不折叠）：anchor / active / connected / gdi /
+    friendly / vdd / pathIndex。paths + modes 是原始字节快照的来源。
+    """
+    u32 = u32 if u32 is not None else _ccd_api()
+    if u32 is None:
+        return None
+    flags = _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE
+    for _ in range(4):
+        pc, mc = wintypes.UINT(), wintypes.UINT()
+        if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
+                                           ctypes.byref(mc)) != 0:
+            return None
+        paths = (_CcdPathInfo * pc.value)()
+        modes = (_CcdModeInfo * mc.value)()
+        rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
+                                    ctypes.byref(mc), ctypes.byref(modes), None)
+        if rc == 0:
+            break
+        if rc != 122:                  # ERROR_INSUFFICIENT_BUFFER 才重试
+            return None
+    else:
+        return None
+
+    rows = []
+    for i, p in enumerate(list(paths)):
+        tgt = p.targetInfo
+        item = {"pathIndex": i, "anchor": "",
+                "active": bool(p.flags & _CCD_PATH_ACTIVE),
+                "connected": bool(tgt.targetAvailable),
+                "gdi": "", "friendly": "", "vdd": False}
+        if not tgt.targetAvailable:
+            rows.append(item)
+            continue
+        tname = _CcdTargetName()
+        tname.header.type = _CCD_GET_TARGET_NAME
+        tname.header.size = ctypes.sizeof(tname)
+        tname.header.adapterId = tgt.adapterId
+        tname.header.id = tgt.id
+        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
+            rows.append(item)
+            continue
+        luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
+                              p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
+        if tname.flags & _CCD_EDID_IDS_VALID:
+            item["anchor"] = "%s/%04X/%04X/%d" % (
+                luid, tname.edidManufactureId, tname.edidProductCodeId,
+                tname.connectorInstance)
+        else:
+            item["anchor"] = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
+        item["friendly"] = tname.monitorFriendlyDeviceName
+        item["vdd"] = any(k in (tname.monitorFriendlyDeviceName or "").lower()
+                          for k in ("vdd", "virtual", "iddcx"))
+        sname = _CcdSourceName()
+        sname.header.type = _CCD_GET_SOURCE_NAME
+        sname.header.size = ctypes.sizeof(sname)
+        sname.header.adapterId = p.sourceInfo.adapterId
+        sname.header.id = p.sourceInfo.id
+        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header)) == 0:
+            item["gdi"] = sname.viewGdiDeviceName
+        rows.append(item)
+    return paths, modes, pc.value, mc.value, rows
+
+
+def _ccd_make_snapshot(paths, modes, pc, mc, target_anchors):
+    """把 CCD 原始字节打包成可原样恢复的快照（不落仓库）。"""
+    return {
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "note": "CCD 快照；pathsHex/modesHex 为原始 ctypes 字节，可原样恢复",
+        "pathCount": int(pc), "modeCount": int(mc),
+        "pathsHex": bytes(paths).hex(), "modesHex": bytes(modes).hex(),
+        "targetAnchors": list(target_anchors),
+    }
+
+
+def _ccd_save_snapshot(snap):
+    path = topology_snapshot_path()
+    _atomic_write_text(path, json.dumps(snap, ensure_ascii=False))
+    return path
+
+
+def _ccd_load_snapshot(path=None):
+    path = path or topology_snapshot_path()
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _ccd_apply(u32, paths, modes, pc, mc):
+    """提交拓扑变更（带 SAVE_TO_DATABASE），原样返回 Windows 错误码。"""
+    u32.SetDisplayConfig.argtypes = [
+        wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+    u32.SetDisplayConfig.restype = wintypes.LONG
+    return u32.SetDisplayConfig(pc, ctypes.byref(paths), mc, ctypes.byref(modes),
+                                _CCD_APPLY_FLAGS)
+
+
+def _ccd_restore_from_bytes(u32, snap):
+    """回读失败后的唯一一次回滚：原样写回动作前的完整字节快照。
+
+    从 hex 重新构造数组，绝不复用调用方已被改过的 paths/modes。
+    """
+    paths = (_CcdPathInfo * int(snap["pathCount"]))()
+    modes = (_CcdModeInfo * int(snap["modeCount"]))()
+    pb = bytes.fromhex(snap["pathsHex"])
+    mb = bytes.fromhex(snap["modesHex"])
+    ctypes.memmove(ctypes.byref(paths), pb, len(pb))
+    ctypes.memmove(ctypes.byref(modes), mb, len(mb))
+    return _ccd_apply(u32, paths, modes, snap["pathCount"], snap["modeCount"])
+
+
+def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=None):
+    """有界轮询回读；目标全部达到 expect_active 才算成功。"""
+    probe = probe or ccd_probe_topology
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    wanted = set(anchors or [])
+    while True:
+        try:
+            rows = [r for r in probe()
+                    if r.get("anchor") in wanted and not r.get("vdd")]
+        except Exception:
+            rows = []
+        if wanted and rows and all(bool(r.get("active")) == bool(expect_active)
+                                   for r in rows):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def topology_plan_off(indices, rows, primary_gdis=None, dev_to_index=None):
+    """纯函数：从勾选下标 + 拓扑行算出要断开的锚点。
+
+    dev_to_index 由 enumerate_targets() 提供（GDI 名 → 界面下标），和 E2 的
+    selection_anchors 用的是同一套映射；没传时按 rows 自带的 index 匹配，便于单测。
+    护栏（D4）：VDD 永不作目标；主屏永不作目标；活动物理屏 ≤1 拒绝；
+    一次只断一块。返回 (anchors, errs, noop)。
+    """
+    primary = {_short_dev(g) for g in (primary_gdis or [])}
+    idx = set(normalize_indices(indices))
+    wanted_names = None
+    if dev_to_index is not None:
+        wanted_names = {_short_dev(name) for name, i in dev_to_index.items()
+                        if i in idx} if idx else None
+    active_physical = 0
+    selected = []
+    for r in rows:
+        if r.get("vdd") or not r.get("anchor"):
+            continue
+        if r.get("active") and r.get("connected", True):
+            active_physical += 1
+        if wanted_names is not None:
+            # 也只认 ACTIVE 的 source：aliases 里两块屏会互相混进 DISPLAYn，
+            # 拿它做选择匹配会把「只勾主屏」误判成「勾了副屏」。
+            if _short_dev(r.get("gdi")) not in wanted_names:
+                continue
+        elif idx and r.get("index") not in idx:
+            continue
+        # 主屏判定只看 ACTIVE 的那条 source（折叠后的 gdi）。
+        # 不能拿 aliases 比：同一块屏的多个 source 里会混进主屏的 DISPLAYn。
+        if _short_dev(r.get("gdi")) in primary:
+            continue                      # 主屏：实测 rc=87，永不尝试
+        selected.append(r)
+    anchors = []
+    for r in selected:
+        if r.get("active") and r.get("anchor") not in anchors:
+            anchors.append(r["anchor"])
+    if active_physical <= 1 and anchors:
+        return [], ["只剩 1 块活动物理屏，拒绝断开（会黑屏）"], False
+    if not anchors:
+        if selected and all(not r.get("active") for r in selected):
+            return [], [], True           # 目标已经 inactive：no-op
+        return [], ["没有可断开的副屏（主屏不可断、VDD 不作目标）"], False
+    if len(anchors) > 1:
+        return [], ["拓扑模式一次只能断开一块副屏（当前选中 %d 块），请只勾选一块"
+                    % len(anchors)], False
+    return anchors, [], False
+
+
+def _fold_raw_rows(raw_rows):
+    """把逐 path 的原始行按锚点折叠（同一块屏的多个 source 算一块）。"""
+    rows = []
+    for r in raw_rows:
+        hit = next((x for x in rows if x["anchor"] == r["anchor"]), None)
+        if hit is None:
+            rows.append(dict(r, aliases=[r["gdi"]] if r["gdi"] else []))
+        else:
+            if r["gdi"] and r["gdi"] not in hit["aliases"]:
+                hit["aliases"].append(r["gdi"])
+            if r["active"] and not hit["active"]:
+                hit["active"] = True
+    return rows
+
+
+def topology_off(indices):
+    """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
+
+    返回 (成功下标列表, [(下标, 错误), ...])，与 screen_off_many 同形状。
+    """
+    u32 = _ccd_api()
+    if u32 is None:
+        return [], [(-1, "拓扑模式仅支持 Windows")]
+    raw = _ccd_query_raw(u32)
+    if raw is None:
+        return [], [(-1, "CCD 查询失败，未做任何改动")]
+    paths, modes, pc, mc, raw_rows = raw
+    try:
+        targets = enumerate_targets()
+    except Exception:
+        targets = []
+    primary = [t.get("dev") for t in targets if t.get("primary")]
+    dev_to_index = {t.get("dev"): t.get("index") for t in targets}
+    release_targets(targets)
+    anchors, errs, noop = topology_plan_off(
+        indices, _fold_raw_rows(raw_rows), primary, dev_to_index)
+    if errs:
+        return [], [(-1, e) for e in errs]
+    if noop:
+        return list(normalize_indices(indices)), []
+
+    # D6：动作前先存完整原始字节快照；快照没落盘就绝不碰拓扑。
+    snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
+    try:
+        _ccd_save_snapshot(snap)
+    except Exception as e:
+        return [], [(-1, "拓扑快照写入失败，未做任何改动：%s" % e)]
+
+    for i in range(len(paths)):
+        info = next((x for x in raw_rows if x["pathIndex"] == i), None)
+        # 与 topology_switch.py 的 C2/C4 实测口径一致：只清 ACTIVE 的那条 path，
+        # 同一块屏的其它 source 原样保留，快照负责兜底恢复。
+        if (not info or info["anchor"] not in anchors
+                or not info["connected"] or not info["active"]):
+            continue
+        p = paths[i]
+        p.flags &= ~_CCD_PATH_ACTIVE
+        p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        p.sourceInfo.statusFlags = 0
+        p.targetInfo.statusFlags = 0
+
+    rc = _ccd_apply(u32, paths, modes, pc, mc)
+    if rc != 0:
+        return [], [(-1, "SetDisplayConfig 失败 rc=%d（未改动拓扑）" % rc)]
+    if not _ccd_wait_state(anchors, False):
+        back = _ccd_restore_from_bytes(u32, snap)
+        why = "回读未确认断开，已回滚"
+        if back != 0:
+            why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
+        return [], [(-1, why)]
+    # 只报"真正被断开"的下标；主屏虽然在勾选里，但护栏跳过了它。
+    done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
+                 if r["anchor"] in anchors and r["connected"] and r["active"]}
+    done = sorted({i for name, i in dev_to_index.items()
+                   if _short_dev(name) in done_devs})
+    return done or list(normalize_indices(indices)), []
+
+
+def topology_on(indices):
+    """拓扑接回：恢复动作前快照 → 有界轮询回读 → 写亮度（D3/D6）。
+
+    返回 (成功下标列表, [(下标, 错误), ...])。
+    """
+    u32 = _ccd_api()
+    if u32 is None:
+        return [], [(-1, "拓扑模式仅支持 Windows")]
+    try:
+        snap = _ccd_load_snapshot()
+    except FileNotFoundError:
+        return [], [(-1, "没有拓扑快照，未执行恢复")]
+    except Exception as e:
+        return [], [(-1, "拓扑快照读取失败：%s" % e)]
+    rc = _ccd_restore_from_bytes(u32, snap)
+    if rc != 0:
+        return [], [(-1, "拓扑恢复失败 rc=%d" % rc)]
+    anchors = snap.get("targetAnchors") or []
+    if not _ccd_wait_state(anchors, True):
+        return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")]
+    return list(normalize_indices(indices)), []
+
+
 # ---- 熄屏 / 点亮 ----------------------------------------------------------
 # ⚠️ 硬件红线，两条，都有本机实测事故背书：
 # 1) **绝不用 `0xD6=4/5`（软关/硬关）** —— 面板进固件级熄灭，DDC 点亮 / 驱动重启 /
@@ -1599,22 +1925,30 @@ def _system_ok_targets(indices):
 
 
 def screen_off_cfg(cfg, indices):
-    """熄灭显示器。system（默认）= 整组系统级；ddc = 逐台 0xD6=2（可能唤不回）。
+    """熄灭显示器。ddc = 逐台 0xD6=2；topology = CCD 断开副屏；其余系统级。
 
     返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状，
     这样界面与 CLI 不用关心底层是哪种方式。
     """
     if cfg.get("screen_off_method") == "ddc":
         return screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
+    if cfg.get("screen_off_method") == "topology":
+        return topology_off(indices)
     if not screen_off_system():
         return [], [(-1, "系统级熄灭下发失败")]
     return _system_ok_targets(indices), []
 
 
 def screen_on_cfg(cfg, indices):
-    """点亮显示器。system（默认）= 系统级点亮；ddc = 分级 DDC 唤醒。"""
+    """点亮显示器。ddc = 分级 DDC；topology = 恢复快照后写亮度；其余系统级。"""
     if cfg.get("screen_off_method") == "ddc":
         return screen_wake_many(indices, **wake_options(cfg))
+    if cfg.get("screen_off_method") == "topology":
+        ok, errs = topology_on(indices)
+        if not ok:
+            return ok, errs
+        bok, berrs = set_brightness_many(indices, current_level(cfg))
+        return ok + bok, errs + berrs
     if not screen_on_system():
         return [], [(-1, "系统级点亮下发失败")]
     return _system_ok_targets(indices), []
@@ -2005,7 +2339,13 @@ def apply_schedule(cfg=None):
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
-    ok, errs = set_brightness_many(targets, level)
+    # D3：拓扑模式的 off 跳过亮度（inactive 时 DDC 读不到/写不进）；
+    # on 的亮度由 screen_on_cfg 在「恢复快照 → 回读」之后写。
+    topo = cfg.get("screen_off_method") == "topology"
+    if topo and screen in ("off", "on"):
+        ok, errs = [], []
+    else:
+        ok, errs = set_brightness_many(targets, level)
     if screen == "off":
         sok, serrs = screen_off_cfg(cfg, targets)
     elif screen == "on":
@@ -4222,7 +4562,8 @@ class SettingsSheet(Sheet):
                          command=lambda i: app.apply_off_method(OFF_METHODS[i]))
         mode.pack(fill="x", pady=(6, 0))
         Label(wrap, "系统级：整组熄灭、一定唤得回，但键鼠会点亮。\n"
-                    "单屏待机：键鼠不点亮（远程防窥用），个别面板唤不回。",
+                    "单屏待机：键鼠不点亮（远程防窥用），个别面板唤不回。\n"
+                    "拓扑断开：把选中的副屏从桌面移除（串流用），主屏不动。",
               size=8, color=UI["text3"], bg=pbg, justify="left").pack(anchor="w", pady=(6, 0))
         tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
 
@@ -4281,10 +4622,14 @@ class HelpSheet(Sheet):
             "DDC 回读只作参考 —— 面板待机时仍会回报“已开机”，不可信。",
             "物理电源键、Windows 自动熄屏不在追踪范围内。",
         ])
-        block("两种熄灭方式", [
-            "系统级（默认）：整组一起灭，一定唤得回；任何键鼠输入都会点亮。",
-            "DDC 单屏待机：键鼠不会点亮，适合远程操作时防窥；唤醒靠四级兜底，"
+        block("三种熄灭方式", [
+            "系统级：整组一起灭，一定唤得回；任何键鼠输入都会点亮。",
+            "DDC 单屏待机（默认）：键鼠不会点亮，适合远程防窥；唤醒靠四级兜底，"
             "个别面板仍可能唤不回。",
+            "拓扑断开：把选中的副屏从 Windows 桌面移除，串流时只留虚拟显示器；"
+            "主屏不会被断（Windows 实测 rc=87），VDD 永不作目标。",
+            "拓扑断开的「点亮」= 恢复动作前快照 → 回读 ACTIVE → 写亮度；"
+            "窗口位置不保证完全还原，首次使用请做一次串流回归。",
         ])
         block("唤醒阶梯", [
             "0xD6=1 电源模式 → 写回亮度 → 输出重驱动（SC_MONITORPOWER 2→-1）"
@@ -4491,10 +4836,20 @@ class App:
                     "点亮时会依次尝试：电源模式 → 写亮度 → 输出重驱动 → 切信号源。"):
                 return
             self.cfg["ddc_allow_undeclared"] = True
+        if value == "topology" and not self.msg.askyesno(
+                "拓扑断开：先确认",
+                "这条路会把「选中的副屏」从 Windows 桌面拓扑里移除，供串流隐藏物理屏用：\n"
+                "• 主屏不会被断（Windows 实测 rc=87），虚拟屏 VDD 永不作目标；\n"
+                "• 每次只断一块；恢复时先回读 ACTIVE 再写亮度（≤2 秒）；\n"
+                "• 窗口位置不保证完全还原，首次使用请做一次串流回归。\n\n"
+                "默认仍是「单屏待机」，选它才会切到本方式。"):
+            return
         self.cfg["screen_off_method"] = value
         save_config(self.cfg)
         if value == "ddc":
             self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
+        elif value == "topology":
+            self.status_var.set("熄灭方式：拓扑断开（副屏移除，主屏不动）")
         else:
             self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
         # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次

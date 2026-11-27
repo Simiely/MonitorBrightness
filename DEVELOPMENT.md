@@ -91,12 +91,20 @@ E1 只读层接入（`screen_verdict` / `--diag`）→ E2 身份层替换 `DISPL
 E3 动作层（快照 / 回读 / 回滚 / 护栏）→ E4 配置与 GUI → E5 串流回归（用户执行）。
 每步独立可停；单测全部 monkeypatch，不碰真机屏幕。
 
-**进度**：E1、E2 已完成（2026-11-27）。
+**进度**：E1、E2、E3、E4 已完成（2026-11-27）；E5 待用户执行。
 - E1：主脚本内新增 CCD 只读层，`--diag` 可看到每块屏的 ACTIVE / 锚点 / 同源别名；
   默认熄灭方式的行为由 4 个单测守住。
 - E2：`monitor_anchors` 优先解析，旧的 `monitor_ids` / `monitors` 依次兜底；
   真机闭环验证过"勾选 → 锚点 → 解析回同一组下标"。旧配置不写盘、继续可用。
-- E3（动作层）未开始；跨机器待办仍未做，进 E3 前必须有结论。
+- E3：`topology_off()` / `topology_on()` 进主程序；快照 → 提交 → 回读 → 一次回滚，
+  护栏按 D4（VDD / 主屏 / ≤1 活动物理屏 / 一次一块）；`screen_off_cfg()` /
+  `screen_on_cfg()` 只在 `topology` 模式下分派到新层，`ddc` / `system` 零改动。
+- E4：`OFF_METHODS` 增加 `topology`；设置页、说明页、档位亮度顺序按 D3 同步；
+  默认值仍是 `ddc`。
+- E5：Moonlight 连接—断开 ×3 由用户执行（见下）。
+
+跨机器待办按用户要求暂缓；E3 的实现以本机 C2–C5 实测数据为依据，
+其余显卡 / Python 版本 / Windows 版本的行为仍需回传 `topology_probe.py --json` 再确认。
 
 ## 待办：跨机器验证（用户指定，稍后执行）
 

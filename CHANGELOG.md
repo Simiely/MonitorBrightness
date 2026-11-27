@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · E3 动作层 + E4 配置与 GUI（拓扑显示方案）
+
+- **E3 动作层**：主程序新增 CCD 写路径，但只在 `screen_off_method=topology` 下进入；
+  默认 `ddc` / `system` 的熄灭与唤醒路径**一行未动**。
+  - 断开：快照原始 `PATH_INFO` / `MODE_INFO` 字节 → 清 ACTIVE path（与 C2/C4 同口径）
+    → `SetDisplayConfig`（`SAVE_TO_DATABASE`）→ 有界回读；失败自动回滚**一次**，
+    错误码原样上报。快照落在 `%APPDATA%\MonitorBrightness\topology-snapshot.json`，不入仓。
+  - 接回：恢复快照 → 回读 `ACTIVE`（≤2s 轮询）→ 写亮度；顺序按 D3，inactive 时不再写 DDC。
+  - 护栏（D4）：VDD 永不作目标；主屏直接拒绝（实测 rc=87）；活动物理屏 ≤1 拒绝；
+    一次只断一块；按 ACTIVE source 判定选中项，避免同源别名把主屏勾到副屏上。
+  - 新单测 10 项（护栏 / 快照时序 / 回滚一次 / 快照失败不提交 / 档位亮度顺序），
+    全部 monkeypatch，**不碰真机屏幕**；回归 **54 tests OK**。
+- **E4 配置与 GUI**：`OFF_METHODS` 增加 `topology`（标签「拓扑断开」），
+  设置页分段控件与说明文案同步；`SETTINGS.choice` 的值从 `OFF_METHODS` 派生，
+  默认值仍 `ddc`。档位层在 topology 模式下 `off` 跳过亮度、`on` 把亮度交给
+  `screen_on_cfg` 在回读成功后写。旧配置不写盘、继续可用。
+- 跨机器验证按用户要求**暂缓**（E3 前置项未做完即进入实现）；E5 串流回归仍需用户执行。
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、54 tests OK。
+
 ### 2026-11-27 · 按单项目规范 2.1.5 整理文档维护
 
 - **文档拆分（阈值触发，先复制后删）**

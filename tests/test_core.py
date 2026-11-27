@@ -899,5 +899,183 @@ class MonitorIdentityTest(unittest.TestCase):
             self.assertEqual(mb.selection_anchors([]), [])
 
 
+class TopologyActionTest(TempConfigCase):
+    """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
+
+    ROWS_RAW = [
+        {"pathIndex": 0, "index": 0, "anchor": "A1", "active": True, "connected": True,
+         "gdi": "\\\\.\\DISPLAY1", "friendly": "P1", "vdd": False},
+        {"pathIndex": 1, "index": 1, "anchor": "A2", "active": True, "connected": True,
+         "gdi": "\\\\.\\DISPLAY2", "friendly": "P2", "vdd": False},
+        {"pathIndex": 2, "index": 2, "anchor": "V1", "active": False, "connected": True,
+         "gdi": "\\\\.\\DISPLAY92", "friendly": "VDD by MTT", "vdd": True},
+    ]
+    TARGETS = [{"index": 0, "dev": "DISPLAY1", "primary": True},
+               {"index": 1, "dev": "DISPLAY2", "primary": False}]
+
+    def _cfg(self, **kw):
+        cfg = mb.default_config()
+        cfg.update(kw)
+        return cfg
+
+    def _raw(self):
+        paths = (mb._CcdPathInfo * 3)()
+        modes = (mb._CcdModeInfo * 3)()
+        paths[0].flags = mb._CCD_PATH_ACTIVE
+        paths[1].flags = mb._CCD_PATH_ACTIVE
+        for p in paths:
+            p.targetInfo.targetAvailable = 1
+        return (paths, modes, 3, 3, [dict(r) for r in self.ROWS_RAW]), paths
+
+    def _base_patches(self, fake_query, apply_rc=0, verify=True):
+        return (
+            unittest.mock.patch.object(mb, "_ccd_api", return_value=object()),
+            unittest.mock.patch.object(mb, "_ccd_query_raw", side_effect=fake_query),
+            unittest.mock.patch.object(mb, "_ccd_apply", return_value=apply_rc),
+            unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=verify),
+            unittest.mock.patch.object(mb, "enumerate_targets",
+                                       return_value=list(self.TARGETS)),
+            unittest.mock.patch.object(mb, "release_targets"),
+        )
+
+    def test_config_option_added_without_changing_default(self):
+        self.assertIn("topology", mb.OFF_METHODS)
+        self.assertEqual(mb.coerce_setting("screen_off_method", "topology"), "topology")
+        self.assertEqual(mb.default_config()["screen_off_method"], "ddc")
+
+    def test_plan_refuses_primary_vdd_and_single_active(self):
+        rows = [dict(r) for r in self.ROWS_RAW]
+        anchors, errs, noop = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
+        self.assertEqual(anchors, ["A2"])
+        self.assertFalse(errs)
+        self.assertFalse(noop)
+        anchors, errs, _ = mb.topology_plan_off([2], rows, ["DISPLAY1"])
+        self.assertEqual(anchors, [])
+        self.assertTrue(any("没有可断开的副屏" in e for e in errs))
+        rows[0]["active"] = False
+        anchors, errs, _ = mb.topology_plan_off([0, 1], rows, ["DISPLAY1"])
+        self.assertEqual(anchors, [])
+        self.assertTrue(any("只剩 1 块" in e for e in errs))
+
+    def test_plan_noop_when_target_already_inactive(self):
+        rows = [dict(r) for r in self.ROWS_RAW]
+        rows[1]["active"] = False
+        anchors, errs, noop = mb.topology_plan_off([1], rows, ["DISPLAY1"])
+        self.assertEqual(anchors, [])
+        self.assertFalse(errs)
+        self.assertTrue(noop)
+
+    def test_off_saves_pre_action_snapshot_then_applies(self):
+        seen = {}
+
+        def fake_query(u32=None):
+            raw, paths = self._raw()
+            seen["original"] = bytes(paths).hex()
+            return raw
+
+        def fake_save(snap):
+            seen["snap"] = snap
+            return "fake.json"
+
+        patches = self._base_patches(fake_query)
+        with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
+                unittest.mock.patch.object(mb, "_ccd_save_snapshot", side_effect=fake_save):
+            ok, errs = mb.topology_off([0, 1])
+        self.assertEqual(ok, [1])   # 主屏虽被勾选，护栏跳过，不算成功
+        self.assertEqual(errs, [])
+        self.assertEqual(apply.call_count, 1)
+        self.assertEqual(seen["snap"]["targetAnchors"], ["A2"])
+        # 快照必须来自动作之前：ACTIVE 位还在，且路径未被置 INVALID
+        self.assertEqual(seen["snap"]["pathsHex"], seen["original"])
+
+    def test_off_rolls_back_once_when_verify_fails(self):
+        def fake_query(u32=None):
+            return self._raw()[0]
+
+        rollback = []
+        patches = self._base_patches(fake_query, verify=False)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+                unittest.mock.patch.object(mb, "_ccd_save_snapshot", return_value="x"), \
+                unittest.mock.patch.object(
+                    mb, "_ccd_restore_from_bytes",
+                    side_effect=lambda u32, snap: rollback.append(snap) or 0):
+            ok, errs = mb.topology_off([1])
+        self.assertEqual(ok, [])
+        self.assertEqual(len(rollback), 1)
+        self.assertIn("已回滚", errs[0][1])
+
+    def test_off_does_not_apply_when_snapshot_write_fails(self):
+        def fake_query(u32=None):
+            return self._raw()[0]
+
+        patches = self._base_patches(fake_query)
+        with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
+                unittest.mock.patch.object(mb, "_ccd_save_snapshot", side_effect=OSError("disk")):
+            ok, errs = mb.topology_off([1])
+        self.assertEqual(ok, [])
+        self.assertEqual(apply.call_count, 0)
+        self.assertIn("快照写入失败", errs[0][1])
+
+    def test_on_restores_verifies_then_writes_brightness(self):
+        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
+                "targetAnchors": ["A2"]}
+        calls = []
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
+                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes",
+                                           side_effect=lambda *a: calls.append("restore") or 0), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state",
+                                           side_effect=lambda *a, **k: calls.append("verify") or True), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many",
+                                           side_effect=lambda idx, lv: (
+                                               calls.append(("brightness", idx, lv)), ([1], []))[1]):
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(errs, [])
+        self.assertEqual(ok, [1, 1])
+        self.assertEqual(calls[:2], ["restore", "verify"])
+        self.assertEqual(calls[2], ("brightness", [1], 80))
+
+    def test_on_does_not_write_brightness_when_restore_fails(self):
+        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
+                "targetAnchors": ["A2"]}
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
+                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes", return_value=87), \
+                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(ok, [])
+        self.assertIn("rc=87", errs[0][1])
+        bright.assert_not_called()
+
+    def test_schedule_off_skips_brightness_in_topology_mode(self):
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "active_slot_dict",
+                                        return_value={"level": 0, "screen": "off"}), \
+                unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
+                unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
+                unittest.mock.patch.object(mb, "screen_off_cfg", return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "mark_screen_state"):
+            level, screen, ok, errs = mb.apply_schedule(cfg)
+        self.assertEqual((level, screen, ok, errs), (0, "off", [1], []))
+        bright.assert_not_called()
+
+    def test_schedule_on_defers_brightness_to_screen_on_cfg(self):
+        """D3：档位层不能在恢复拓扑之前写亮度；写亮度归 screen_on_cfg。"""
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "active_slot_dict",
+                                        return_value={"level": 75, "screen": "on"}), \
+                unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
+                unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
+                unittest.mock.patch.object(mb, "screen_wake_entry",
+                                           return_value=([1], [])), \
+                unittest.mock.patch.object(mb, "mark_screen_state"):
+            level, screen, ok, errs = mb.apply_schedule(cfg)
+        self.assertEqual((level, screen, ok, errs), (75, "on", [1], []))
+        bright.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
