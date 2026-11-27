@@ -33,6 +33,10 @@
   （2 物理 + 1 VDD）；`DISPLAYn` **不唯一**（同一块屏对应 4 个 source）；
   稳定锚点（显卡 LUID + EDID mfr/prod + `connectorInstance`）唯一区分两块同型号屏；
   VDD 可单独识别；只有 ACTIVE 的屏能读到 DDC
+- **C2/C3/C4 真机实测**（scripts/topology_switch.py，两屏交替、任一时刻最多灭一块）：
+  副屏断开 rc=0 / 全程 805ms、接回 986ms 且 DDC 恢复；**主屏断开 rc=87，Windows 不允许**
+  （已加护栏）；计划任务（Interactive principal）内 CCD 查询 `rc=0`，可用。
+  结论：有界轮询取 2 秒足够；主屏不能直接作为断开目标
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
