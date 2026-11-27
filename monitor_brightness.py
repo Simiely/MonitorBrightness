@@ -70,7 +70,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.00.1"     # 拓扑显示方案正式版（v2 首个版本；E1–E4 全部落地）
+APP_VERSION = "2.01.0"     # 设计纠偏：不再维护屏幕状态账；拓扑接回改为现读现算
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
@@ -170,12 +170,10 @@ SETTINGS = (
     {"key": "screen_hotkeys", "kind": "flag", "default": False},          # 熄屏/点亮热键（需常驻）
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
     {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
-    {"key": "screen_state", "kind": "screenstate", "default": "on"},      # 屏幕状态记账（软件最后一次操作）
-    # 记账时间点（"MM-DD HH:MM"）：结论行要能说清"什么时候熄的/亮的"
-    {"key": "screen_state_at", "kind": "stamp", "default": ""},
-    # 熄灭那一刻的系统 tick（毫秒）。用来判断"熄灭之后有没有过键鼠输入"——有输入
-    # 就说明系统已经把屏幕唤醒了（见 _screen_woke_by_input）。重启后 tick 失效，忽略。
-    {"key": "screen_off_tick", "kind": "int", "default": 0},
+    # ⚠️ v2.01.0 删除了 screen_state / screen_state_at / screen_off_tick：
+    # 程序不再维护"屏幕现在亮还是灭"的状态账。拓扑/系统才是唯一事实源，
+    # 每次需要结论时现场读（见 screen_verdict）。旧配置里残留的同名字段
+    # 会被 load_config 丢弃，不影响任何行为。
     # 熄灭方式：system   = Windows 系统级整组熄灭（一定唤得回来）
     #           ddc      = 逐台 DDC 0xD6=2 待机（默认；v1.8.5 已验证的熄灭路径）
     #           topology = CCD 断开副屏（E3/E4 新增选项，默认不变）
@@ -220,18 +218,11 @@ def coerce_setting(key, value):
         return _coerce_ids(value)
     if kind == "choice":
         return value if value in spec.get("values", ()) else spec["default"]
-    if kind == "stamp":
-        # 只接受我们自己写的 "MM-DD HH:MM" 形状；其他一律当没有
-        text = str(value or "").strip()
-        return text if _valid_stamp(text) else ""
     if kind == "int":
         try:
             return max(0, int(value))
         except Exception:
             return spec["default"]
-    if kind == "screenstate":
-        # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
-        return value if value in ("on", "off") else spec["default"]
     if kind == "anchors":
         if not isinstance(value, (list, tuple)):
             return []
@@ -309,15 +300,6 @@ def shift_time(text, delta_min):
     h, mi = int(base[:2]), int(base[3:])
     total = (h * 60 + mi + delta_min) % (24 * 60)
     return "%02d:%02d" % (total // 60, total % 60)
-
-
-def _valid_stamp(text):
-    """记账时间点形状：'MM-DD HH:MM'（自己写的，只认这一种）。"""
-    return bool(re.match(r"^\d{2}-\d{2} \d{2}:\d{2}$", text or ""))
-
-
-def stamp_now():
-    return datetime.now().strftime("%m-%d %H:%M")
 
 
 def _write_event_log(text):
@@ -486,38 +468,19 @@ def _atomic_write_text(path, text):
         raise
 
 
-def _merge_runtime_state(payload):
-    """走查 E1-02：保存前合并磁盘上**更新**的屏幕状态三字段。
-
-    GUI 的 self.cfg 只在启动时 load_config 一次；定时任务（CLI 进程）在 GUI
-    运行期间可能写过 screen_state。整文件覆盖会把 CLI 刚写的状态打回旧值。
-    screen_state_at 是 "MM-DD HH:MM"，字典序即时间序——谁新用谁。
-    刚 mark_screen_state() 的调用方时间戳最新，自然用内存值，不受影响。
-    """
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            disk = json.load(f)
-        if not isinstance(disk, dict):
-            return
-        disk_at = str(disk.get("screen_state_at") or "")
-        mem_at = str(payload.get("screen_state_at") or "")
-        if disk_at and disk_at > mem_at:
-            for key in ("screen_state", "screen_state_at", "screen_off_tick"):
-                if key in disk:
-                    payload[key] = disk[key]
-    except Exception:
-        pass                      # 读不到磁盘配置时保持内存值，不阻断保存
-
-
 def save_config(cfg):
-    """保存配置：原子写 + 屏幕状态字段按磁盘最新值合并（防跨进程回退）。"""
+    """保存配置：原子写。
+
+    v2.01.0：不再做"屏幕状态按磁盘时间戳合并"——程序已经不记屏幕状态账
+    （见 screen_verdict 的说明），没有需要跨进程协调的运行态字段，
+    自然也没有"内存旧值覆盖磁盘新值"的问题。
+    """
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
         if _CAPS_CACHE:
             payload["caps"] = dict(_CAPS_CACHE)
         payload["version"] = CONFIG_VERSION
-        _merge_runtime_state(payload)
         _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
     except Exception as e:
@@ -1052,48 +1015,6 @@ def _human_gap(seconds):
     return "%d 小时前" % int(seconds // 3600)
 
 
-def _tick_ms():
-    """系统启动以来的毫秒数（GetTickCount）。取不到返回 0。"""
-    try:
-        return int(ctypes.windll.kernel32.GetTickCount())
-    except Exception:
-        return 0
-
-
-def mark_screen_state(cfg, state):
-    """屏幕状态记账：状态 + 时间点 + （熄灭时）tick。
-
-    tick 是"熄灭之后有没有输入过"的判据来源，见 _screen_woke_by_input。
-    """
-    cfg["screen_state"] = state
-    cfg["screen_state_at"] = stamp_now()
-    cfg["screen_off_tick"] = _tick_ms() if state == "off" else 0
-
-
-def _screen_woke_by_input(cfg):
-    """系统级熄灭之后，只要出现过键鼠输入，屏幕就已经被 Windows 唤醒了。
-
-    判据：`熄灭至今的时长` 明显大于 `当前 idle`，说明期间 idle 被重置过 = 有过输入。
-    （熄灭那一刻的 idle 约等于 0——点按钮本身就是输入，所以留 0.8 秒余量。）
-    只对 system 方式成立：DDC 待机不会因为输入而醒来。
-    """
-    if cfg.get("screen_off_method") == "ddc" or cfg.get("screen_state") != "off":
-        return False
-    off_tick = cfg.get("screen_off_tick") or 0
-    if not off_tick:
-        return False
-    try:
-        now = ctypes.windll.kernel32.GetTickCount()
-    except Exception:
-        return False
-    if off_tick > now:                 # 中间重启过，tick 失效
-        return False
-    idle = _idle_seconds()
-    if idle is None:
-        return False
-    return idle * 1000 + 800 < (now - off_tick)
-
-
 # ---- CCD 只读拓扑（拓扑模式的状态层；只查不写）-------------------------
 # 依据：Windows CCD API（QueryDisplayConfig / DisplayConfigGetDeviceInfo）。
 # 只用于"现在这块屏在不在桌面拓扑里"的判断；真正的断开/接回在阶段 E3 才接入。
@@ -1302,17 +1223,23 @@ def topology_state_for(cfg, rows=None):
 
 
 def screen_verdict(cfg, probes=None):
-    """给出"屏幕现在是亮还是灭"的**一句话结论** + 一行依据。
+    """给出"屏幕现在是亮还是灭"的结论 + 一行依据——**只依据当场读到的信号**。
 
-    判据优先级（越靠前越硬）：
-      1) `_screen_woke_by_input()`：熄灭后出现过输入 → 屏幕已被系统唤醒（结论：亮）；
-      2) 软件记账：我们熄灭后再没有输入 → 仍然是灭的；
-      3) DDC 回读：只作为一行证据展示 —— `0xD6` 会撒谎（实测待机时仍报 1），
-         之前把它直接当结论，才会出现"明明黑着却显示亮"。
+    ⚠️ v2.01.0 设计纠偏：程序**不维护任何屏幕状态账**。
+    拓扑和系统才是唯一事实源，每次要结论就现场读，读不到就说"不知道"：
+
+      topology  → CCD 的 ACTIVE flag 是系统事实，直接当结论（on/off/unknown）。
+      system /  → Windows 没有公开可靠的"显示器电源"读取接口，
+      ddc          实测 `0xD6` 在面板已黑时仍报 1（会撒谎）。
+                   所以：
+                     · 读到 0xD6=2/3/4/5 → 可信地说明它待机了 → off
+                       （0xD6 只会假阴性，不会假阳性）
+                     · 其余情况 → unknown，把读到的寄存器、上次输入距今时间
+                       摊开给用户自己判断
+                   给个假结论比说"不知道"更糟：v1.5.0 就是
+                   "程序说亮着、屏幕其实黑着"。
+
     返回 {"state": "on"/"off"/"unknown", "text": "...", "detail": "..."}。
-
-    拓扑模式（screen_off_method == "topology"）下优先级反转：
-      拓扑 ACTIVE 是系统事实，直接当结论；记账与 DDC 都不参与。
     """
     if cfg.get("screen_off_method") == "topology":
         try:
@@ -1325,41 +1252,35 @@ def screen_verdict(cfg, probes=None):
             tail = "物理电源键、Windows 自动熄屏不在拓扑追踪范围内"
         elif state == "off":
             text = "屏幕：已断开（拓扑）"
-            tail = "接回时先恢复拓扑再写亮度"
+            tail = "接回时按当前拓扑现算，再写亮度"
         else:
             text = "屏幕：状态未知（拓扑）"
             tail = topo["detail"]
         return {"state": state, "text": text,
-                "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else ""),
-                "woke_by_input": False}
-
-    at = (cfg.get("screen_state_at") or "").strip()
-    woke = _screen_woke_by_input(cfg)
-    state = "on" if woke else cfg.get("screen_state", "on")
-    idle = _idle_seconds()
-
-    if state == "off":
-        text = "屏幕：熄灭中" + ("（%s 熄灭）" % at if at else "")
-        tail = "点「点亮显示器」或动一下鼠标/键盘即可恢复"
-    elif woke:
-        text = "屏幕：亮着" + ("（%s 熄灭后被键鼠输入唤醒）" % at if at else
-                              "（熄灭后收到键鼠输入，已自动唤醒）")
-        tail = "系统级熄灭由 Windows 恢复，输入即亮"
-    elif state == "on":
-        text = "屏幕：亮着" + ("（%s 点亮）" % at if at else "")
-        tail = "物理电源键、Windows 自动熄屏不在追踪范围内"
-    else:
-        text, tail = "屏幕：状态未知", ""
+                "evidence": topo["detail"],
+                "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else "")}
 
     if probes is None:
         try:
             probes = probe_states()
         except Exception:
             probes = []
-    bits = ["记账为主"]
+    idle = _idle_seconds()
+    offs = [p for p in (probes or []) if p.get("state") == "off"]
+
+    if offs:
+        state = "off"
+        text = "屏幕：已熄灭（DDC 报待机）"
+        tail = "点「点亮屏幕」恢复；键鼠输入未必唤得回来"
+    else:
+        state = "unknown"
+        text = "屏幕：状态未知"
+        tail = "Windows 没有可靠的显示器电源读取接口，亮灭请以眼睛为准"
+
+    bits = []
     if probes:
-        # 结论行要人话；原始寄存器值留给 --probe / --diag
-        bits.append("DDC 回读 %s（会撒谎，仅参考）"
+        # 原始寄存器值留给 --probe / --diag，结论行只给人话
+        bits.append("DDC 回读 %s"
                     % "、".join("%d=%s" % (p["index"],
                                           {"on": "开", "off": "灭"}.get(p["state"], "未知"))
                                 for p in probes))
@@ -1367,8 +1288,9 @@ def screen_verdict(cfg, probes=None):
         bits.append("DDC 无回读")
     if idle is not None:
         bits.append("上次输入 %s" % ("刚发生" if idle < 2 else _human_gap(idle)))
-    detail = "依据：" + " · ".join(bits) + ("｜" + tail if tail else "")
-    return {"state": state, "text": text, "detail": detail, "woke_by_input": woke}
+    evidence = " · ".join(bits)
+    return {"state": state, "text": text, "evidence": evidence,
+            "detail": "依据：" + evidence + ("｜" + tail if tail else "")}
 
 
 # ---- 拓扑动作层（E3）-----------------------------------------------------
@@ -1387,13 +1309,7 @@ _SDC_VIRTUAL_MODE_AWARE = 0x00008000
 _CCD_APPLY_FLAGS = (_SDC_USE_SUPPLIED | _SDC_APPLY | _SDC_SAVE_TO_DATABASE |
                     _SDC_ALLOW_CHANGES | _SDC_VIRTUAL_MODE_AWARE)
 _CCD_MODE_IDX_INVALID = 0xFFFFFFFF
-TOPO_SNAPSHOT_FILE = "topology-snapshot.json"
 TOPO_VERIFY_TIMEOUT = 2.0          # D3：接回回读有界轮询 ≤2s
-
-
-def topology_snapshot_path():
-    """拓扑快照路径（与原始终把原始字节放仓库外保持一致）。"""
-    return os.path.join(CONFIG_DIR, TOPO_SNAPSHOT_FILE)
 
 
 def _ccd_api():
@@ -1445,6 +1361,11 @@ def _ccd_query_raw(u32=None):
         item = {"pathIndex": i, "anchor": "",
                 "active": bool(p.flags & _CCD_PATH_ACTIVE),
                 "connected": bool(tgt.targetAvailable),
+                # 接回时要现算 modeInfoIdx，必须知道这条 path 用哪个 source/target。
+                # srcId 是 adapter 内的独占资源：已被 ACTIVE 占用的 id 不能再置 ACTIVE。
+                "srcId": int(p.sourceInfo.id), "tgtId": int(tgt.id),
+                "srcModeInfoIdx": int(p.sourceInfo.modeInfoIdx),
+                "tgtModeInfoIdx": int(tgt.modeInfoIdx),
                 "gdi": "", "friendly": "", "vdd": False}
         if not tgt.targetAvailable:
             rows.append(item)
@@ -1480,26 +1401,14 @@ def _ccd_query_raw(u32=None):
 
 
 def _ccd_make_snapshot(paths, modes, pc, mc, target_anchors):
-    """把 CCD 原始字节打包成可原样恢复的快照（不落仓库）。"""
+    """把 CCD 原始字节打包成**内存内**回滚快照（用完即弃，绝不落盘）。"""
     return {
         "created": datetime.now().isoformat(timespec="seconds"),
-        "note": "CCD 快照；pathsHex/modesHex 为原始 ctypes 字节，可原样恢复",
+        "note": "CCD 快照；pathsHex/modesHex 为原始 ctypes 字节，仅用于本次操作失败回滚",
         "pathCount": int(pc), "modeCount": int(mc),
         "pathsHex": bytes(paths).hex(), "modesHex": bytes(modes).hex(),
         "targetAnchors": list(target_anchors),
     }
-
-
-def _ccd_save_snapshot(snap):
-    path = topology_snapshot_path()
-    _atomic_write_text(path, json.dumps(snap, ensure_ascii=False))
-    return path
-
-
-def _ccd_load_snapshot(path=None):
-    path = path or topology_snapshot_path()
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _ccd_apply(u32, paths, modes, pc, mc):
@@ -1526,7 +1435,11 @@ def _ccd_restore_from_bytes(u32, snap):
 
 
 def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=None):
-    """有界轮询回读；目标全部达到 expect_active 才算成功。"""
+    """有界轮询回读；**目标每一个**都达到 expect_active 才算成功。
+
+    v2.01.0 修：原来只要"存在的那些都符合"就返回 True，多屏接回时
+    少接回来一块也会报成功。现在要求 wanted 全部出现在回读结果里且状态一致。
+    """
     probe = probe or ccd_probe_topology
     deadline = time.monotonic() + max(0.0, float(timeout))
     wanted = set(anchors or [])
@@ -1536,8 +1449,9 @@ def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=N
                     if r.get("anchor") in wanted and not r.get("vdd")]
         except Exception:
             rows = []
-        if wanted and rows and all(bool(r.get("active")) == bool(expect_active)
-                                   for r in rows):
+        got = {r.get("anchor") for r in rows}
+        if wanted and wanted <= got and all(
+                bool(r.get("active")) == bool(expect_active) for r in rows):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1608,6 +1522,114 @@ def _fold_raw_rows(raw_rows):
     return rows
 
 
+# ---- 声明式接回（v2.01.0）------------------------------------------------
+# ⚠️ 设计纠偏：接回**不再恢复"断开前的历史快照"**。
+# 快照是"过去某一刻的整份拓扑字节"，一旦期间用户在 Windows 设置里改过排布、
+# 分辨率、主屏，恢复旧快照会把这些改动全部覆盖掉——这正是"程序自己维护状态"
+# 的典型错误。程序的职责只是「读当前拓扑 + 把要用的屏加回当前拓扑」。
+#
+# 现算依据（2026-11-27 真机实测，scripts/topo-declarative-probe.py --verify）：
+#   DISPLAYCONFIG_PATH_SOURCE_INFO.modeInfoIdx = (sourceModeIdx << 16) | 0xFFFF
+#   DISPLAYCONFIG_PATH_TARGET_INFO.modeInfoIdx = (targetModeIdx << 16) | desktopModeIdx
+#   按 (infoType, id) 在**当前** modes 数组里查，得到的三元组与 Windows 自己填的
+#   值逐位一致（path#0 0x0001FFFF/0x00000002、path#1 0x0004FFFF/0x00030005）。
+_CCD_TYPE_SOURCE = 1        # DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+_CCD_TYPE_TARGET = 2        # DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
+_CCD_TYPE_DESKTOP = 3       # DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE
+
+
+def _ccd_mode_entries(modes, mc):
+    """把 modes 数组摘成 [(下标, infoType, id)]，供纯函数现算 modeInfoIdx。"""
+    out = []
+    for i in range(max(0, min(int(mc or 0), len(modes)))):
+        m = modes[i]
+        out.append((i, int(m.infoType), int(m.id)))
+    return out
+
+
+def _ccd_pick_mode(entries, info_type, ident):
+    """按 (infoType, id) 找 mode 下标；找不到返回 None。
+
+    None 表示"这块屏的 mode 已不在当前 modes 数组里"（例如刚拔插过），
+    此时接回退化为 modeInfoIdx=INVALID，由 SDC_ALLOW_CHANGES 让 Windows 自己挑。
+    """
+    for i, t, ident_i in entries:
+        if t == info_type and ident_i == int(ident):
+            return i
+    return None
+
+
+def topology_plan_on(anchors, rows, mode_entries):
+    """纯函数：算出「把 anchors 里的屏加回**当前**拓扑」要动哪几条 path。
+
+    全部输入都是本次现读的：rows=_ccd_query_raw 的逐 path 行，
+    mode_entries=当前 modes 数组摘要。不读快照、不记历史。
+
+    护栏：
+      - 只认 connected 的 path（拔了线的接不回来）；
+      - VDD 永不作目标；
+      - 已 ACTIVE 的锚点直接跳过（幂等：接两次和接一次结果一样）；
+      - source id 是 adapter 内独占资源，只挑没被其它 ACTIVE path 占用的。
+
+    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx。
+    """
+    wanted = [str(a) for a in (anchors or []) if a]
+    rows = list(rows or [])
+    used = {int(r["srcId"]) for r in rows
+            if r.get("active") and r.get("connected") and r.get("srcId") is not None}
+    plan, errs = [], []
+    for anchor in wanted:
+        mine = [r for r in rows if r.get("anchor") == anchor and r.get("connected")]
+        if not mine:
+            errs.append("锚点 %s 在拓扑里没有已连接的 path（可能已拔线）" % anchor)
+            continue
+        if any(r.get("vdd") for r in mine):
+            errs.append("虚拟屏 %s 不作接回目标" % anchor)
+            continue
+        if any(r.get("active") for r in mine):
+            continue                       # 已经亮着：no-op
+        free = [r for r in mine if int(r["srcId"]) not in used]
+        if not free:
+            errs.append("锚点 %s 没有空闲 source（全被其它屏占用）" % anchor)
+            continue
+        # 确定性：source id 最小 → pathIndex 最小。不依赖"上次用的是哪条"。
+        pick = min(free, key=lambda r: (int(r["srcId"]), int(r["pathIndex"])))
+        plan.append({
+            "pathIndex": int(pick["pathIndex"]), "anchor": anchor,
+            "srcId": int(pick["srcId"]), "tgtId": int(pick["tgtId"]),
+            "sourceModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE,
+                                            pick["srcId"]),
+            "targetModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_TARGET,
+                                            pick["tgtId"]),
+            "desktopModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_DESKTOP,
+                                             pick["tgtId"]),
+        })
+        used.add(int(pick["srcId"]))
+    return plan, errs, (not plan and not errs)
+
+
+def _ccd_apply_plan_on(paths, plan):
+    """把接回计划就地写进 paths 数组。返回真正改动的锚点列表。"""
+    done = []
+    for item in plan:
+        p = paths[item["pathIndex"]]
+        p.flags |= _CCD_PATH_ACTIVE
+        s = item.get("sourceModeIdx")
+        t = item.get("targetModeIdx")
+        d = item.get("desktopModeIdx")
+        if None in (s, t, d):
+            # 模式查不到：置 INVALID，交给 SDC_ALLOW_CHANGES 由 Windows 挑
+            p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+            p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        else:
+            p.sourceInfo.modeInfoIdx = ((s << 16) | 0xFFFF) & 0xFFFFFFFF
+            p.targetInfo.modeInfoIdx = ((t << 16) | d) & 0xFFFFFFFF
+        p.sourceInfo.statusFlags = 0
+        p.targetInfo.statusFlags = 0
+        done.append(item["anchor"])
+    return done
+
+
 def topology_off(indices):
     """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
 
@@ -1634,12 +1656,10 @@ def topology_off(indices):
     if noop:
         return list(normalize_indices(indices)), []
 
-    # D6：动作前先存完整原始字节快照；快照没落盘就绝不碰拓扑。
+    # D6：动作前拍一份**本进程内**的原始字节快照，只用于"这次操作失败就原样撤回"。
+    # v2.01.0 起不再落盘：快照一旦落盘就会被当成"状态"，接回时恢复旧快照
+    # 会把用户其后在 Windows 设置里做的改动一起覆盖掉（设计纠偏，见 topology_plan_on）。
     snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
-    try:
-        _ccd_save_snapshot(snap)
-    except Exception as e:
-        return [], [(-1, "拓扑快照写入失败，未做任何改动：%s" % e)]
 
     for i in range(len(paths)):
         info = next((x for x in raw_rows if x["pathIndex"] == i), None)
@@ -1690,16 +1710,16 @@ def topology_inactive_rows(rows=None):
 
 
 def topology_enable_anchor(cfg, anchor):
-    """GUI「启用」按钮：确认快照确实覆盖这块屏，再走完整接回 + 写亮度。"""
-    try:
-        snap = _ccd_load_snapshot()
-    except FileNotFoundError:
-        return [], [(-1, "没有拓扑快照，请用「点亮屏幕」接回")]
-    except Exception as e:
-        return [], [(-1, "拓扑快照读取失败：%s" % e)]
-    if anchor not in (snap.get("targetAnchors") or []):
-        return [], [(-1, "快照里没有这块屏，不能单独启用")]
-    return screen_on_cfg(cfg, [])
+    """GUI「启用」按钮：把这一块屏加回**当前**拓扑（不再查历史快照）。
+
+    v2.01.0 起不再要求"断开时留下的快照里得有它"——那等于要求程序维护状态账。
+    现在只问当前拓扑：这块屏 connected 且 inactive 吗？是就直接接回。
+    校验由 topology_plan_on 现读现判，这里不做重复预检。
+    """
+    anchor = str(anchor or "")
+    if not anchor:
+        return [], [(-1, "缺少显示器锚点")]
+    return screen_on_cfg(cfg, [], anchors=[anchor])
 
 
 def topology_indices_for_anchors(anchors):
@@ -1725,29 +1745,71 @@ def topology_indices_for_anchors(anchors):
     return sorted(out)
 
 
-def topology_on(indices):
-    """拓扑接回：恢复动作前快照 → 有界轮询回读（D3/D6）。
+def topology_wanted_anchors(cfg, rows=None):
+    """拓扑模式「点亮」要接回哪些屏——**每次现算**，不读任何记账。
+
+    优先用用户勾选时存下的锚点（monitor_anchors）；没存过就表示"全部接回"，
+    取当前拓扑里所有 connected + inactive 的物理屏（VDD 除外）。
+    """
+    saved = [str(a) for a in (cfg.get("monitor_anchors") or []) if a]
+    if saved:
+        return saved
+    rows = rows if rows is not None else _ccd_query_raw_rows()
+    return sorted({r["anchor"] for r in rows
+                   if r.get("connected") and not r.get("active")
+                   and not r.get("vdd") and r.get("anchor")})
+
+
+def _ccd_query_raw_rows():
+    """只读：当前拓扑的逐 path 行（失败返回空列表）。"""
+    raw = _ccd_query_raw()
+    return list(raw[4]) if raw else []
+
+
+def topology_on(anchors):
+    """拓扑接回：把 anchors 里的屏加回**当前**拓扑（声明式，无历史快照）。
+
+    步骤：现读拓扑 → 现算要动哪几条 path / 哪个 mode → 提交 → 有界回读。
+    同一块屏接两次与接一次结果相同（已 ACTIVE 的锚点直接跳过）。
+
+    两级尝试（每级都重新现读，绝不复用被改过的数组）：
+      1) 用现算的 modeInfoIdx 提交（真机实测与 Windows 自己填的值逐位一致）；
+      2) 被拒时降级为 modeInfoIdx=INVALID，交给 SDC_ALLOW_CHANGES 让 Windows 挑。
+    第 2 级比第 1 级"少指定信息"，不会更差；两级都失败就报错，拓扑保持原样。
 
     返回 (成功下标列表, [(下标, 错误), ...], restored_anchors)。
-    亮度不在这里写：断开源在恢复后才重新出现在 EnumDisplayMonitors 里，
-    必须由 screen_on_cfg 用恢复后的下标写，否则刚接回的屏拿不到亮度。
+    亮度不在这里写：断开源在接回后才重新出现在 EnumDisplayMonitors 里，
+    必须由 screen_on_cfg 用接回后的下标写，否则刚接回的屏拿不到亮度。
     """
     u32 = _ccd_api()
     if u32 is None:
         return [], [(-1, "拓扑模式仅支持 Windows")], []
-    try:
-        snap = _ccd_load_snapshot()
-    except FileNotFoundError:
-        return [], [(-1, "没有拓扑快照，未执行恢复")], []
-    except Exception as e:
-        return [], [(-1, "拓扑快照读取失败：%s" % e)], []
-    rc = _ccd_restore_from_bytes(u32, snap)
-    if rc != 0:
-        return [], [(-1, "拓扑恢复失败 rc=%d" % rc)], []
-    anchors = snap.get("targetAnchors") or []
-    if not _ccd_wait_state(anchors, True):
-        return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
-    return list(normalize_indices(indices)), [], anchors
+    last_err = "CCD 查询失败，未做任何改动"
+    for relax in (False, True):
+        raw = _ccd_query_raw(u32)
+        if raw is None:
+            return [], [(-1, last_err)], []
+        paths, modes, pc, mc, raw_rows = raw
+        plan, errs, noop = topology_plan_on(anchors, raw_rows,
+                                            _ccd_mode_entries(modes, mc))
+        if errs:
+            return [], [(-1, e) for e in errs], []
+        if noop:
+            return [], [], []
+        if relax:
+            for item in plan:
+                item["sourceModeIdx"] = item["targetModeIdx"] = \
+                    item["desktopModeIdx"] = None
+            _write_event_log("拓扑接回：现算 mode 被拒，降级为由 Windows 自选模式")
+        restored = _ccd_apply_plan_on(paths, plan)
+        rc = _ccd_apply(u32, paths, modes, pc, mc)
+        if rc != 0:
+            last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
+            continue
+        if not _ccd_wait_state(restored, True):
+            return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
+        return topology_indices_for_anchors(restored), [], restored
+    return [], [(-1, last_err)], []
 
 
 # ---- 熄屏 / 点亮 ----------------------------------------------------------
@@ -2023,18 +2085,21 @@ def screen_off_cfg(cfg, indices):
     return _system_ok_targets(indices), []
 
 
-def screen_on_cfg(cfg, indices):
-    """点亮显示器。ddc = 分级 DDC；topology = 恢复快照后写亮度；其余系统级。"""
+def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
+    """点亮显示器。ddc = 分级 DDC；topology = 现读现算接回后写亮度；其余系统级。"""
     if cfg.get("screen_off_method") == "ddc":
-        return screen_wake_many(indices, **wake_options(cfg))
+        return screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
     if cfg.get("screen_off_method") == "topology":
-        ok, errs, anchors = topology_on(indices)
+        want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
+        ok, errs, restored = topology_on(want)
         if errs:
             return ok, errs
-        # 断开的屏在恢复后才回到 EnumDisplayMonitors；用「恢复后」的下标写亮度，
+        # 断开的屏在接回后才回到 EnumDisplayMonitors；用「接回后」的下标写亮度，
         # 否则副屏接回来了却拿不到亮度（D3）。
         write_to = sorted(set(normalize_indices(indices))
-                          | set(topology_indices_for_anchors(anchors)))
+                          | set(topology_indices_for_anchors(restored)))
+        if not write_to:
+            return ok, errs
         bok, berrs = set_brightness_many(write_to, current_level(cfg))
         return ok + bok, errs + berrs
     if not screen_on_system():
@@ -2235,17 +2300,18 @@ def screen_wake_entry(cfg, indices):
       - 开关 wake_fast_flip 打开（旧配置缺键 -> 默认 1）；
       - 熄灭方式为 ddc（system 模式的 SC_MONITORPOWER -1 是即时广播，不需要翻转）；
       - 允许切信号源（用户关掉「切信号源」时不得偷偷切换）。
-    屏亮着（记账为 on）且 8 秒内没有快速点亮记录时，路由器内部按旧行为发
-    `_wake_one(..., expect_off=False)`，不会翻转造成可见黑屏。
+    `expect_off` 由 wake_options 当场探测得出（v2.01.0 起不读记账）：
+    探不到"确实待机"就按保守路径走，不翻转、不切源。
+
+    ⚠️ 这里只算一次 wake_options：它内部要读 DDC，算两次会让点亮慢一倍。
     """
     reset_wake_info()
-    if not bool(cfg.get("wake_fast_flip", True)):
-        return screen_on_cfg(cfg, indices)
-    if cfg.get("screen_off_method") != "ddc":
+    if (not bool(cfg.get("wake_fast_flip", True))
+            or cfg.get("screen_off_method") != "ddc"):
         return screen_on_cfg(cfg, indices)
     opts = wake_options(cfg)
     if not opts["allow_switch"]:
-        return screen_on_cfg(cfg, indices)
+        return screen_on_cfg(cfg, indices, wake_opts=opts)
     return screen_wake_flip(indices, opts["allow_switch"], opts["expect_off"])
 
 
@@ -2405,10 +2471,25 @@ def selection_payload(indices, targets=None):
             release_targets(targets)
 
 
-def wake_options(cfg):
-    """唤醒策略的两个开关，CLI 与界面共用。"""
+def wake_options(cfg, probes=None):
+    """唤醒策略的两个开关，CLI 与界面共用。
+
+    `expect_off` 的意思是"这次点亮之前，屏幕可能真的是灭的"——它决定要不要
+    动用「切信号源」「快速翻转」这两招（会给本来就亮着的屏白闪两秒）。
+
+    v2.01.0：改成**当场探测**，不再读软件记账。判据只认可信方向：
+      读到任一屏 0xD6=2/3/4/5  → 确实待机过 → True
+      其余情况（含读不到）    → False，走保守路径
+    依据：`0xD6` 只会假阴性（待机时仍报 1），不会假阳性，所以"报了待机"
+    就是真的待机；"报了开"什么都不能证明。
+    """
+    if probes is None:
+        try:
+            probes = probe_states()
+        except Exception:
+            probes = []
     return {"allow_switch": bool(cfg.get("wake_switch_input", True)),
-            "expect_off": cfg.get("screen_state") != "on"}
+            "expect_off": any(p.get("state") == "off" for p in (probes or []))}
 
 
 def apply_schedule(cfg=None):
@@ -2416,19 +2497,19 @@ def apply_schedule(cfg=None):
 
     返回 (level, screen, ok, errs)；screen 为该档屏幕动作（""/off/on）。
     屏幕动作失败的错误以序号 -1 记入 errs（界面按原文显示）。
-    内部加载配置时，屏幕动作执行后会把屏幕状态记账落盘（供状态显示 / --screen status）。
 
     v1.9.4：恢复 v1.8.5 的语义（不再写 last_fired、不再从 GUI 启动自检调用）。
+    v2.01.0：不再把"屏幕现在是什么状态"记进配置——定时任务只负责"到点把
+    这几个动作做掉"，是纯粹的一次性执行，不维护状态。
     本函数只由计划任务（--apply-schedule）与用户显式操作触发。
     """
-    internal = cfg is None
     cfg = cfg or load_config()
     slot = active_slot_dict(cfg.get("slots", []), _minutes())
     level = slot.get("level", 50)
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
     # D3：拓扑模式的 off 跳过亮度（inactive 时 DDC 读不到/写不进）；
-    # on 的亮度由 screen_on_cfg 在「恢复快照 → 回读」之后写。
+    # on 的亮度由 screen_on_cfg 在「按当前拓扑接回 → 回读」之后写。
     topo = cfg.get("screen_off_method") == "topology"
     if topo and screen in ("off", "on"):
         ok, errs = [], []
@@ -2442,13 +2523,8 @@ def apply_schedule(cfg=None):
         sok, serrs = [], []
     ok = ok + sok
     errs = errs + [(-1, "屏幕 %d: %s" % (i, e)) for i, e in serrs]
-    # 走查 E1-01：屏幕状态只能由**屏幕动作自己**的成功决定。
-    # 原来用合并后的 ok（亮度成功也算），会出现"亮度写成功但熄屏失败 →
-    # 状态记成 off、任务报成功、屏幕实际亮着"的三重不一致。
-    if screen in ("off", "on") and sok:
-        mark_screen_state(cfg, screen)
-        if internal:
-            save_config(cfg)
+    # v2.01.0：不再记账屏幕状态。程序只负责"到点把这几个动作做掉"，
+    # 做完就结束；屏幕现在是什么状态，下次需要时现场读（screen_verdict）。
     return level, screen, ok, errs
 
 
@@ -2688,12 +2764,24 @@ def task_match_reason(cfg, xml_text=None):
 
 
 def ensure_task_registration(cfg, force=False):
-    """定时启用时校验任务；不一致则静默重建。返回 (是否可用, 说明)。
+    """让"计划任务"与"用户当前配置"保持一致。返回 (是否可用, 说明)。
 
-    在后台线程调用，不阻塞窗口显示。重建结果写 events.log，界面读它展示。
+    ⚠️ v2.01.0 修走查 E2-04：原来 `enabled=False` 时直接 return，
+    连 force=True（`--force`）也被吞掉——用户显式要求"不管怎样对齐一次"，
+    程序却因为记住的开关而什么都不做。现在 force 的语义是"对齐"，两个方向都做：
+      enabled=True  → 任务不一致（或 force）就重建
+      enabled=False → force 时**反向对齐**：把残留任务清掉
+    在后台线程调用，不阻塞窗口显示；结果写 events.log。
     """
     if not cfg.get("enabled"):
-        return True, "定时未启用，跳过任务校验"
+        if not force:
+            return True, "定时未启用，跳过任务校验"
+        ok, out = unregister_tasks()
+        event = ("定时未启用：残余计划任务已清理" if ok
+                 else "定时未启用，但残余任务清理失败：%s"
+                      % ((out or "").strip().splitlines() or ["未知原因"])[-1])
+        _write_event_log(event)
+        return ok, event
     reason = task_match_reason(cfg)
     if not reason and not force:
         return True, ""
@@ -3197,13 +3285,17 @@ def cli_probe():
     except Exception as e:
         _err(e)
         sys.exit(1)
-    _out(screen_verdict(cfg, states)["text"])
+    v = screen_verdict(cfg, states)
+    _out(v["text"])
     for s in states:
         _out("  显示器 %d（%s）：回读 %s — %s"
              % (s["index"], s["dev"],
                 {"on": "亮", "off": "灭"}.get(s["state"], "未知"), s["why"]))
     if states:
-        _out("  说明：0xD6 回读不可信（待机时仍报 1），结论以上面那行为准（软件记账）")
+        _out("  说明：0xD6 只会假阴性（待机时仍报 1），所以「报灭」可信、"
+             "「报亮」不能证明面板亮着；程序不再记账，读不到就说不知道")
+    if v.get("detail"):
+        _out("  " + v["detail"])
     sys.exit(0)
 
 
@@ -3217,8 +3309,8 @@ def cli_diag():
     _out("Python %s · 打包态=%s · 配置=%s"
          % (sys.version.split()[0], bool(getattr(sys, "frozen", False)), CONFIG_FILE))
     cfg = load_config()
-    _out("配置：presets=%s · 熄灭方式=%s · 记录屏幕状态=%s"
-         % (cfg.get("presets"), cfg.get("screen_off_method"), cfg.get("screen_state")))
+    _out("配置：presets=%s · 熄灭方式=%s（屏幕亮灭每次现读，不记账）"
+         % (cfg.get("presets"), cfg.get("screen_off_method")))
     _out("配置里的显示器选择：monitors=%s · monitor_ids=%s · monitor_anchors=%s"
          % (cfg.get("monitors"), cfg.get("monitor_ids"), cfg.get("monitor_anchors")))
     _out("锚点优先解析结果：%s" % (resolve_monitors(cfg) or "[]（= 全部）"))
@@ -4114,7 +4206,9 @@ class StatusCard(Card):
             self.dot.itemconfigure(self._dot_item,
                                    image=self._dot_on if on else self._dot_off)
             self.title_lbl.config(text="屏幕亮着" if on else "屏幕已熄灭")
-            self.meta_lbl.config(text=self.app.screen_time_text())
+            # v2.01.0：不再显示"几点熄灭/点亮"——那需要维护状态账，
+            # 而程序只读当前状态、不记历史。时间信息在提示行里按需给。
+            self.meta_lbl.config(text="")
         self.set_hint_default(verdict.get("hint", ""))
         # 主按钮 = 当前可执行的那个动作，另一个置灰；状态未知时两个都可用
         if self._unknown:
@@ -4800,7 +4894,9 @@ class App:
         self._relight_pending = False
         self._relight_timer = None       # 走查 E1-05：自动复亮 timer 句柄（可取消）
         self._hotkey_tid = None
-        self._last_verdict = {"state": self.cfg.get("screen_state", "on"), "detail": ""}
+        # 启动时**不猜**屏幕状态：unknown 直到第一次「检测」拿到真实读数。
+        # v2.01.0：以前这里从配置里读 screen_state，等于把上次的记账当成当前事实。
+        self._last_verdict = {"state": "unknown", "detail": ""}
         self.status_var = tk.StringVar(value="就绪")
         self.msg = DarkBox(self.root)
         # windowed 打包后 stderr 为 None，Tk 回调异常会彻底静默；
@@ -4974,6 +5070,11 @@ class App:
                 "默认仍是「单屏待机」，选它才会切到本方式。"):
             return
         self.cfg["screen_off_method"] = value
+        # v2.01.0：`ddc_allow_undeclared` 是"这一次明知有风险"的授权，不是永久状态。
+        # 离开 ddc 就收回——否则用户在旧屏上点过一次「同意」，换屏后盲写
+        # 未声明的待机值这件事会被悄悄继承下来（走查 E2-05 的单向阀门）。
+        if value != "ddc":
+            self.cfg["ddc_allow_undeclared"] = False
         save_config(self.cfg)
         if value == "ddc":
             self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
@@ -5220,16 +5321,6 @@ class App:
         self.read_current()
 
     # ---------- 亮灭检测 ----------
-    def screen_time_text(self):
-        if self.cfg.get("screen_off_method") == "ddc":
-            return ""
-        at = (self.cfg.get("screen_state_at") or "").strip()
-        m = re.match(r"^\d{2}-\d{2} (\d{2}:\d{2})$", at)
-        short = m.group(1) if m else at
-        if self.cfg.get("screen_state") == "off":
-            return ("%s 熄灭" % short) if short else ""
-        return ("%s 点亮" % short) if short else ""
-
     def probe_screens(self):
         """「检测」：一次后台任务里同时读亮灭结论与当前亮度。"""
         if not self.monitors or self._probing:
@@ -5260,12 +5351,8 @@ class App:
                 self._update_hint_brightness(bright)
             return
         v = screen_verdict(self.cfg, states)
-        if v.get("woke_by_input"):
-            # 走查 P-03：这里以前只改内存不落盘，GUI 说"亮着"但磁盘仍"off"，
-            # 下次 CLI 进程读到相反结论。save_config 只写小 JSON、不碰硬件，
-            # 放在 Tk 线程做是安全的（DDC 读才必须在后台线程）。
-            mark_screen_state(self.cfg, "on")
-            save_config(self.cfg)
+        # v2.01.0：这里以前会在"被键鼠唤醒"时把状态回写落盘。程序不再记账，
+        # 结论就是当次探测的结果，不需要也不应该往配置里写运行态。
         if v["state"] != "off":
             vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
             if vals and len(set(vals)) == 1:
@@ -5277,6 +5364,10 @@ class App:
                 hint = "%d 台显示器 · 亮度可调" % len(states)
         else:
             hint = "键鼠输入不会点亮它；点「点亮屏幕」恢复"
+        # 状态未知时，把"为什么不知道"直接摆在提示行——否则用户点一次「检测」
+        # 只看到一片空白，不知道程序到底读了什么。
+        if v["state"] == "unknown" and v.get("evidence"):
+            hint = hint + " · " + v["evidence"]
         self.status_card.render(self._status_payload(v["state"], hint))
         self._last_verdict = v
         self._fit_window()
@@ -5294,8 +5385,13 @@ class App:
         self.status_card.set_hint_default("%s · %d 台显示器" % (b, len(self.monitors)))
 
     def _status_payload(self, state, hint):
-        """DDC 模式下回读不可信：不显示亮灭结论（用户明确要求）。"""
-        if self.cfg.get("screen_off_method") == "ddc":
+        """动作刚结束时的即时显示。
+
+        v2.01.0：只有拓扑模式"动作完成 = 拓扑回读确认"才算知道结果；
+        ddc / system 读不到可信的亮灭，一律先显示未知，随后的「检测」
+        会用真实读数覆盖。宁可短暂不显示，也不给假结论。
+        """
+        if self.cfg.get("screen_off_method") != "topology":
             return {"state": "unknown", "hint": hint}
         return {"state": state, "hint": hint}
 
@@ -5354,7 +5450,6 @@ class App:
     def _finish_screen_off(self, result):
         ok, errs = _as_ok_errs(result)
         if ok:
-            mark_screen_state(self.cfg, "off")
             self._remember_selection()
             save_config(self.cfg)
             self.status_var.set("已熄灭显示器")
@@ -5393,7 +5488,6 @@ class App:
     def _finish_topology_enable(self, result):
         ok, errs = _as_ok_errs(result)
         if ok:
-            mark_screen_state(self.cfg, "on")
             save_config(self.cfg)
             self.status_var.set("显示器已启用")
             self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
@@ -5434,7 +5528,6 @@ class App:
         info = take_wake_info()
         self._cancel_relight_timer()
         if ok:
-            mark_screen_state(self.cfg, "on")
             self._remember_selection()
             save_config(self.cfg)
             self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
@@ -5539,7 +5632,10 @@ class App:
                                           "亮" if x.get("screen") == "on" else "")
                            for x in slots)
         nxt = _next_run_text([parse_hhmm(x.get("time")) for x in slots])
-        st = "熄灭中" if self.cfg.get("screen_state") == "off" else "点亮中"
+        # v2.01.0：用**上次实际探测**的结果，不再读配置里的记账；
+        # 没探测过就老实说"未检测"，不猜。
+        st = {"on": "亮着", "off": "已熄灭"}.get(
+            (self._last_verdict or {}).get("state"), "未检测")
         return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (APP_TITLE, brief, nxt, st))[:120]
 
     def _tray_update_tooltip(self):
@@ -6044,7 +6140,11 @@ def parse_screen_action(text):
 
 
 def cli_screen(action):
-    """熄灭/点亮选中的显示器（配置里的选择；空 = 全部），并记账屏幕状态。"""
+    """熄灭/点亮选中的显示器（配置里的选择；空 = 全部）。
+
+    v2.01.0：不再把动作结果记账落盘——动作做完就是做完了，
+    屏幕现在什么状态要靠 screen_verdict 现场读。
+    """
     cfg = load_config()
     targets = resolve_monitors(cfg)
     if action == "off":
@@ -6055,9 +6155,6 @@ def cli_screen(action):
         _out("已点亮显示器" if ok else "点亮失败")
         for line in take_wake_info():
             _out(line)
-    if ok:
-        mark_screen_state(cfg, action)
-        save_config(cfg)
     for i, e in errs:
         _out("显示器 %d：%s" % (i, e))
     if errs and not ok:
@@ -6077,8 +6174,11 @@ def main():
         if cmd == "--screen" and len(args) >= 2:
             arg = args[1].strip().lower()
             if arg == "status":
-                # 与界面同一套结论（记账为主，附一行依据）
-                _out(screen_verdict(load_config())["text"])
+                # 与界面同一套结论：当场读、不读任何记账（v2.01.0）
+                v = screen_verdict(load_config())
+                _out(v["text"])
+                if v.get("detail"):
+                    _out("  " + v["detail"])
                 return
             action = parse_screen_action(args[1])
             if action is None:

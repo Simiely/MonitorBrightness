@@ -104,6 +104,34 @@ E3 动作层（快照 / 回读 / 回滚 / 护栏）→ E4 配置与 GUI → E5 �
   （灰显 + 「启用」按钮，VDD 永不显示），断开/接回后自动重刷。
 - E5：Moonlight 连接—断开 ×3 由用户执行（见下）。
 
+### v2.01.0 设计纠偏：接回不再用历史快照
+
+E3 当初把"接回"实现成"恢复断开前的整份 CCD 字节快照"。用户指出这仍然是
+"程序替用户维护状态"：断开期间用户在 Windows 设置里改过的排布 / 分辨率 / 主屏，
+接回时会被旧快照覆盖。
+
+改为**声明式接回**（E3 的重做，`topology_plan_on` + `_ccd_apply_plan_on`）：
+
+1. 现读当前拓扑（`QDC_ALL_PATHS`）；
+2. 对每个目标锚点，挑一条 `connected && !active` 的 path，
+   **source id 必须未被其它 ACTIVE path 占用**（source 是 adapter 内独占资源）；
+3. 从**当前** modes 数组按 `(infoType, id)` 现算三个下标，
+   按 `(srcMode<<16)|0xFFFF` / `(tgtMode<<16)|desktopMode` 写进 path；
+4. 提交 → 有界回读（要求每个目标锚点都 ACTIVE）；
+5. 现算被拒则降级为 `INVALID` + `SDC_ALLOW_CHANGES`，由 Windows 挑模式。
+
+快照降级为**内存内**的"本次操作失败回滚材料"，绝不落盘。
+落盘/读盘函数（`_ccd_save_snapshot` / `_ccd_load_snapshot` / `topology_snapshot_path`）
+已删除，测试 `test_snapshot_helpers_are_memory_only` 守住。
+
+**真机依据**：`scripts/topo-declarative-probe.py --verify`（2026-11-27）验证
+现算值与 Windows 自己填的值逐位一致（path#0 `0x0001FFFF/0x00000002`、
+path#1 `0x0004FFFF/0x00030005`）。
+
+同时删掉整套屏幕状态账（`screen_state` / `screen_state_at` / `screen_off_tick`）；
+非拓扑模式下的亮灭结论改为 `unknown`，只采信 DDC `0xD6` 的"报了待机"这一个方向。
+测试从 76 → **92**。
+
 跨机器待办按用户要求暂缓；E3 的实现以本机 C2–C5 实测数据为依据，
 其余显卡 / Python 版本 / Windows 版本的行为仍需回传 `topology_probe.py --json` 再确认。
 

@@ -423,8 +423,8 @@ class FastFlipTest(TempConfigCase):
                                           (True, 4, "x"))[1]
 
         mb.screen_wake_flip([0])
-        # 第一次成功后 GUI 会把 screen_state 记成 on，第二次点击 expect_off=False；
-        # 但 8 秒内二击仍必须升级为完整阶梯（用户点第二次=第一次没亮）。
+        # 第二次点击 = 第一次没点亮，8 秒内必须升级为完整阶梯。
+        # （v2.01.0 起 expect_off 由当场探测给出，不再依赖"第一次成功后把记账改成 on"）
         mb.screen_wake_flip([0], expect_off=False)
         self.assertEqual(ladder, [("DISPLAY1", True)],
                          "第二次必须以 expect_off=True 走完整 _wake_one 阶梯")
@@ -446,9 +446,8 @@ class FastFlipTest(TempConfigCase):
     def test_switch_off_falls_back_to_v196_ladder(self):
         cfg = mb.default_config()
         cfg["wake_fast_flip"] = False
-        cfg["screen_state"] = "off"
         calls = []
-        mb.screen_on_cfg = lambda c, i: (calls.append("ladder"), ([0], []))[1]
+        mb.screen_on_cfg = lambda c, i, **k: (calls.append("ladder"), ([0], []))[1]
         mb.screen_wake_flip = lambda *a, **k: self.fail("关掉开关不得走快速路径")
 
         ok, errs = mb.screen_wake_entry(cfg, [0])
@@ -463,19 +462,34 @@ class FastFlipTest(TempConfigCase):
 
         calls = []
         mb.screen_wake_flip = lambda *a, **k: (calls.append("flip"), ([0], []))[1]
-        mb.screen_on_cfg = lambda c, i: (calls.append("ladder"), ([0], []))[1]
+        mb.screen_on_cfg = lambda c, i, **k: (calls.append("ladder"), ([0], []))[1]
 
-        cfg["screen_state"] = "on"                      # 屏亮着也进路由器（内部不翻转）
-        mb.screen_wake_entry(cfg, [0])
-        cfg["screen_state"] = "off"
-        cfg["wake_switch_input"] = False                # 用户禁用切源：回旧路径
-        mb.screen_wake_entry(cfg, [0])
-        cfg["wake_switch_input"] = True
-        cfg["screen_off_method"] = "system"             # 系统级点亮本来就是即时广播
-        mb.screen_wake_entry(cfg, [0])
-        cfg["screen_off_method"] = "ddc"
-        mb.screen_wake_entry(cfg, [0])
+        # v2.01.0：expect_off 现在靠当场探测；这里打桩成"读到待机"，避免碰真机 DDC。
+        with unittest.mock.patch.object(
+                mb, "probe_states",
+                return_value=[{"index": 0, "state": "off"}]):
+            mb.screen_wake_entry(cfg, [0])
+            cfg["wake_switch_input"] = False            # 用户禁用切源：回旧路径
+            mb.screen_wake_entry(cfg, [0])
+            cfg["wake_switch_input"] = True
+            cfg["screen_off_method"] = "system"         # 系统级点亮本来就是即时广播
+            mb.screen_wake_entry(cfg, [0])
+            cfg["screen_off_method"] = "ddc"
+            mb.screen_wake_entry(cfg, [0])
         self.assertEqual(calls, ["flip", "ladder", "ladder", "flip"])
+
+    def test_expect_off_comes_from_live_probe_not_config(self):
+        """v2.01.0：点亮策略不再读记账，只看当场探测到的待机值。"""
+        cfg = mb.default_config()
+        cfg["screen_state"] = "off"        # 残留的旧记账，不得参与决策
+        with unittest.mock.patch.object(
+                mb, "probe_states",
+                return_value=[{"index": 0, "state": "on"}]):
+            self.assertFalse(mb.wake_options(cfg)["expect_off"])
+        with unittest.mock.patch.object(
+                mb, "probe_states",
+                return_value=[{"index": 0, "state": "off"}]):
+            self.assertTrue(mb.wake_options(cfg)["expect_off"])
 
     def test_lit_screen_without_recent_flip_keeps_old_behavior(self):
         calls = []
@@ -806,13 +820,13 @@ class RebuildNoticeRegression(TempConfigCase):
 
 
 class TopologyVerdictTest(unittest.TestCase):
-    """E1 只读层：拓扑模式用 ACTIVE 当结论，默认 ddc 路径不受影响。"""
+    """E1 只读层：拓扑模式用 ACTIVE 当结论；非拓扑模式不再假装知道亮灭。"""
 
-    def _cfg(self, method="topology", anchors=None):
+    def _cfg(self, method="topology", anchors=None, **kw):
         cfg = mb.default_config()
         cfg["screen_off_method"] = method
         cfg["monitor_anchors"] = anchors or []
-        cfg["screen_state"] = "on"      # 记账故意与拓扑相反
+        cfg.update(kw)
         return cfg
 
     @staticmethod
@@ -820,13 +834,15 @@ class TopologyVerdictTest(unittest.TestCase):
         return {"anchor": anchor, "active": active, "connected": True,
                 "inUse": active, "vdd": vdd, "friendly": "Fake", "gdi": "\\\\.\\DISPLAY9"}
 
-    def test_topology_active_wins_over_bookkeeping(self):
+    def test_topology_active_is_the_only_verdict(self):
+        """拓扑 ACTIVE=1 是系统事实：不管配置里残留什么，结论都只能是它。"""
         row = self._row("LUID/0001/0002/1", True)
         with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
         self.assertEqual(v["state"], "on")
         self.assertIn("拓扑", v["text"])
-        self.assertFalse(v["woke_by_input"])
+        # 结论里不许出现"记账/上次操作"这类旧依据
+        self.assertNotIn("记账", v["detail"])
 
     def test_topology_inactive_wins_over_bookkeeping(self):
         row = self._row("LUID/0001/0002/1", False)
@@ -841,12 +857,45 @@ class TopologyVerdictTest(unittest.TestCase):
             v = mb.screen_verdict(self._cfg(), probes=[])
         self.assertEqual(v["state"], "unknown")
 
-    def test_default_ddc_path_unchanged(self):
+    def test_ddc_path_never_claims_on(self):
+        """v2.01.0：DDC/system 读不到可信的亮灭，0xD6=1 会撒谎，只能说不知道。"""
         row = self._row("LUID/0001/0002/1", False)
+        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
         with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
-            v = mb.screen_verdict(self._cfg(method="ddc"), probes=[])
-        self.assertEqual(v["state"], "on")
+            v = mb.screen_verdict(self._cfg(method="ddc"), probes=probes)
+        self.assertEqual(v["state"], "unknown")
         self.assertNotIn("拓扑", v["text"])
+        self.assertIn("以眼睛为准", v["detail"])
+
+    def test_ddc_standby_value_is_trusted_direction(self):
+        """0xD6 只会假阴性：它报了待机就是真待机，可以据此说 off。"""
+        probes = [{"index": 0, "state": "off", "why": "0xD6=2 待机"}]
+        v = mb.screen_verdict(self._cfg(method="system"), probes=probes)
+        self.assertEqual(v["state"], "off")
+        self.assertIn("待机", v["text"])
+
+    def test_screen_verdict_never_reads_state_bookkeeping(self):
+        """配置里塞进旧的 screen_state 也不影响结论——程序不认这个字段。"""
+        cfg = self._cfg(method="system", screen_state="off", screen_state_at="11-27 21:00")
+        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
+        v = mb.screen_verdict(cfg, probes=probes)
+        self.assertEqual(v["state"], "unknown")
+        self.assertNotIn("21:00", v["text"] + v["detail"])
+
+    def test_unknown_verdict_carries_short_evidence(self):
+        """GUI 提示行要直接显示"为什么不知道"，所以证据得单独给一份短的。"""
+        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
+        v = mb.screen_verdict(self._cfg(method="system"), probes=probes)
+        self.assertEqual(v["state"], "unknown")
+        self.assertIn("0=开", v["evidence"])
+        self.assertIn("依据：", v["detail"])      # 长版仍带前缀
+
+    def test_topology_verdict_carries_evidence(self):
+        row = self._row("LUID/0001/0002/1", True)
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+            v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
+        self.assertEqual(v["state"], "on")
+        self.assertTrue(v["evidence"])
 
 
 class MonitorIdentityTest(unittest.TestCase):
@@ -916,27 +965,23 @@ class TopologyGuiTest(TempConfigCase):
         got = mb.topology_inactive_rows(rows)
         self.assertEqual([r["anchor"] for r in got], ["A2"])
 
-    def test_enable_uses_snapshot_and_writes_brightness(self):
+    def test_enable_passes_anchor_to_current_topology(self):
+        """v2.01.0：启用不再查历史快照，直接把这块屏交给「现读现算」的接回。"""
         cfg = mb.default_config()
         cfg["screen_off_method"] = "topology"
-        snap = {"targetAnchors": ["A2"], "pathCount": 3, "modeCount": 3,
-                "pathsHex": "", "modesHex": ""}
-        with unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
-                unittest.mock.patch.object(mb, "screen_on_cfg",
-                                           return_value=([1], [])) as on:
+        with unittest.mock.patch.object(mb, "screen_on_cfg",
+                                        return_value=([1], [])) as on:
             ok, errs = mb.topology_enable_anchor(cfg, "A2")
         self.assertEqual((ok, errs), ([1], []))
-        on.assert_called_once_with(cfg, [])
+        on.assert_called_once_with(cfg, [], anchors=["A2"])
 
-    def test_enable_rejects_anchor_not_in_snapshot(self):
+    def test_enable_rejects_empty_anchor(self):
         cfg = mb.default_config()
         cfg["screen_off_method"] = "topology"
-        snap = {"targetAnchors": ["A2"]}
-        with unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
-                unittest.mock.patch.object(mb, "screen_on_cfg") as on:
-            ok, errs = mb.topology_enable_anchor(cfg, "OTHER")
+        with unittest.mock.patch.object(mb, "screen_on_cfg") as on:
+            ok, errs = mb.topology_enable_anchor(cfg, "")
         self.assertEqual(ok, [])
-        self.assertIn("快照里没有", errs[0][1])
+        self.assertIn("锚点", errs[0][1])
         on.assert_not_called()
 
     def test_panel_renders_disconnected_row_with_enable_button(self):
@@ -985,53 +1030,40 @@ class TopologyGuiTest(TempConfigCase):
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 
-    def test_schedule_state_uses_screen_action_result_only(self):
-        """E1-01：亮度成功但熄屏失败，不得记成 off。"""
+    def test_schedule_never_writes_screen_state(self):
+        """v2.01.0：定时任务只做动作，不往配置里记屏幕状态。
+
+        （原 E1-01 的问题是"亮度成功也算熄屏成功 → 记成 off"。状态账整个
+        取消了，这条回归改成：无论成败，apply_schedule 都不许写配置。）
+        """
         cfg = mb.default_config()
         cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80, "screen": "off"}])
-        marks = []
         with unittest.mock.patch.object(mb, "active_slot_dict",
                                         return_value={"level": 80, "screen": "off"}), \
                 unittest.mock.patch.object(mb, "set_brightness_many", return_value=([0], [])), \
                 unittest.mock.patch.object(mb, "screen_off_cfg",
                                            return_value=([], [(-1, "DDC 写失败")])), \
-                unittest.mock.patch.object(mb, "mark_screen_state",
-                                           side_effect=lambda c, s: marks.append(s)):
+                unittest.mock.patch.object(mb, "save_config") as save:
             level, screen, ok, errs = mb.apply_schedule(cfg)
-        self.assertEqual(marks, [])              # 关键：不能记账
+        save.assert_not_called()
+        self.assertNotIn("screen_state", cfg)
         self.assertEqual(ok, [0])                # 亮度成功仍保留在返回值里
         self.assertTrue(errs)                    # 屏幕动作错误必须上报
 
-    def test_save_config_merges_newer_disk_state(self):
-        """E1-02：GUI 陈旧内存保存时，磁盘上 CLI 写的新状态不能被覆盖。"""
+    def test_save_config_is_pure_write(self):
+        """v2.01.0：保存就是整份写盘，不再与磁盘合并运行态（已经没有运行态字段）。"""
         cfg = mb.default_config()
-        ok, _ = mb.save_config(cfg)              # 先写一份基线
-        self.assertTrue(ok)
-        disk = dict(cfg)
-        disk["screen_state"] = "off"
-        disk["screen_state_at"] = "11-27 21:00"
-        disk["screen_off_tick"] = 12345
+        self.assertTrue(mb.save_config(cfg)[0])
         with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(disk, f)
-        stale = dict(cfg)                        # GUI 内存：旧状态
-        stale["tray_enabled"] = False            # 用户刚改的无关设置
-        ok, _ = mb.save_config(stale)
+            json.dump(dict(cfg, legacy_note="disk"), f)
+        stale = dict(cfg)
+        stale["tray_enabled"] = False            # 用户刚改的设置
+        self.assertTrue(mb.save_config(stale)[0])
         with open(mb.CONFIG_FILE, encoding="utf-8") as f:
             saved = json.load(f)
-        self.assertEqual(saved["screen_state"], "off")      # CLI 的新账保住
-        self.assertEqual(saved["screen_off_tick"], 12345)
-        self.assertFalse(saved["tray_enabled"])              # GUI 的改动生效
-
-    def test_save_config_uses_memory_when_memory_is_newer(self):
-        """反向：刚 mark_screen_state 的内存值更新，必须写进磁盘。"""
-        cfg = mb.default_config()
-        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(dict(cfg, screen_state="off", screen_state_at="11-27 21:00"), f)
-        cfg["screen_state"] = "on"
-        cfg["screen_state_at"] = "11-27 21:05"
-        mb.save_config(cfg)
-        with open(mb.CONFIG_FILE, encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["screen_state"], "on")
+        self.assertFalse(saved["tray_enabled"])              # 内存值生效
+        self.assertNotIn("legacy_note", saved)               # 磁盘杂项不带进来
+        self.assertNotIn("screen_state", saved)              # 不再写状态账
 
     def test_caps_type_error_does_not_wipe_config(self):
         """E2-02：caps 类型写错不应把整份配置判为读坏。"""
@@ -1077,6 +1109,51 @@ class WalkthroughRound2Test(TempConfigCase):
         fake._polling = False
         mb.App._poll_read_queue(fake)
         self.assertEqual(calls, ["inner"])       # 正常调用放行
+
+    def test_force_realigns_tasks_when_disabled(self):
+        """E2-04：enabled=False 时 --force 不许被吞掉，要做反向对齐（清残留任务）。"""
+        cfg = mb.default_config()
+        cfg["enabled"] = False
+        with unittest.mock.patch.object(mb, "unregister_tasks",
+                                       return_value=(True, "OK")) as un, \
+                unittest.mock.patch.object(mb, "register_tasks") as reg:
+            ok, msg = mb.ensure_task_registration(cfg, force=True)
+        self.assertTrue(ok)
+        self.assertIn("已清理", msg)
+        un.assert_called_once()
+        reg.assert_not_called()
+
+    def test_disabled_without_force_touches_nothing(self):
+        cfg = mb.default_config()
+        cfg["enabled"] = False
+        with unittest.mock.patch.object(mb, "unregister_tasks") as un:
+            ok, msg = mb.ensure_task_registration(cfg, force=False)
+        self.assertTrue(ok)
+        self.assertIn("跳过", msg)
+        un.assert_not_called()
+
+    def test_force_failure_is_reported_not_swallowed(self):
+        cfg = mb.default_config()
+        cfg["enabled"] = False
+        with unittest.mock.patch.object(mb, "unregister_tasks",
+                                       return_value=(False, "Access denied")):
+            ok, msg = mb.ensure_task_registration(cfg, force=True)
+        self.assertFalse(ok)
+        self.assertIn("清理失败", msg)
+
+    def test_leaving_ddc_revokes_undeclared_permission(self):
+        """E2-05：ddc_allow_undeclared 不是单向阀门，离开 ddc 就收回授权。"""
+        cfg = dict(mb.default_config(), screen_off_method="ddc",
+                   ddc_allow_undeclared=True)
+        fake = types.SimpleNamespace(
+            cfg=cfg,
+            msg=types.SimpleNamespace(askyesno=lambda *a, **k: True),
+            status_var=types.SimpleNamespace(set=lambda t: None),
+            probe_screens=lambda: None)
+        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+            mb.App.apply_off_method(fake, "system")
+        self.assertFalse(fake.cfg["ddc_allow_undeclared"])
+        self.assertEqual(fake.cfg["screen_off_method"], "system")
 
 
 class WalkthroughFixTest(TempConfigCase):
@@ -1156,7 +1233,8 @@ class WalkthroughFixTest(TempConfigCase):
         self.assertEqual(cm.exception.code, 0)
         apply.assert_not_called()               # P-02 护栏：残留任务不执行
 
-    def test_wake_detection_persists_state(self):
+    def test_probe_result_never_written_back_to_config(self):
+        """v2.01.0：检测结果只用来渲染，不回写配置（程序不维护屏幕状态）。"""
         fake, fake_save, saved = self._app_stub()
         fake._probing = True
         fake._brighting = True
@@ -1170,12 +1248,12 @@ class WalkthroughFixTest(TempConfigCase):
         fake._fit_window = lambda: None
         fake._status_payload = lambda s, h: {"state": s, "hint": h}
         with unittest.mock.patch.object(mb, "screen_verdict",
-                                        return_value={"state": "on", "woke_by_input": True,
+                                        return_value={"state": "on",
                                                       "text": "t", "detail": "d"}), \
                 unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
             mb.App._render_states(fake, ([{"index": 0}], {}))
-        self.assertEqual(fake.cfg["screen_state"], "on")
-        self.assertTrue(any(c["screen_state"] == "on" for c in saved))  # P-03
+        self.assertNotIn("screen_state", fake.cfg)
+        self.assertEqual(saved, [])              # 一次都不许落盘
 
     def test_rebuild_name_is_distinct_from_module_apply(self):
         self.assertTrue(callable(mb.App.rebuild_schedule_tasks))
@@ -1217,11 +1295,14 @@ class TopologyActionTest(TempConfigCase):
 
     ROWS_RAW = [
         {"pathIndex": 0, "index": 0, "anchor": "A1", "active": True, "connected": True,
-         "gdi": "\\\\.\\DISPLAY1", "friendly": "P1", "vdd": False},
+         "gdi": "\\\\.\\DISPLAY1", "friendly": "P1", "vdd": False,
+         "srcId": 0, "tgtId": 100},
         {"pathIndex": 1, "index": 1, "anchor": "A2", "active": True, "connected": True,
-         "gdi": "\\\\.\\DISPLAY2", "friendly": "P2", "vdd": False},
+         "gdi": "\\\\.\\DISPLAY2", "friendly": "P2", "vdd": False,
+         "srcId": 1, "tgtId": 200},
         {"pathIndex": 2, "index": 2, "anchor": "V1", "active": False, "connected": True,
-         "gdi": "\\\\.\\DISPLAY92", "friendly": "VDD by MTT", "vdd": True},
+         "gdi": "\\\\.\\DISPLAY92", "friendly": "VDD by MTT", "vdd": True,
+         "srcId": 2, "tgtId": 300},
     ]
     TARGETS = [{"index": 0, "dev": "DISPLAY1", "primary": True},
                {"index": 1, "dev": "DISPLAY2", "primary": False}]
@@ -1231,14 +1312,42 @@ class TopologyActionTest(TempConfigCase):
         cfg.update(kw)
         return cfg
 
+    @staticmethod
+    def _modes():
+        """造 modes 数组：source/target/desktop 各两条，id 与 ROWS_RAW 对齐。
+
+        索引 → (infoType, id)：0→(1,0) 1→(2,100) 2→(3,100)
+                              3→(1,1) 4→(2,200) 5→(3,200)
+        """
+        modes = (mb._CcdModeInfo * 6)()
+        for i, (info_type, ident) in enumerate(
+                [(1, 0), (2, 100), (3, 100), (1, 1), (2, 200), (3, 200)]):
+            modes[i].infoType = info_type
+            modes[i].id = ident
+        return modes
+
     def _raw(self):
         paths = (mb._CcdPathInfo * 3)()
-        modes = (mb._CcdModeInfo * 3)()
+        modes = self._modes()
         paths[0].flags = mb._CCD_PATH_ACTIVE
         paths[1].flags = mb._CCD_PATH_ACTIVE
         for p in paths:
             p.targetInfo.targetAvailable = 1
-        return (paths, modes, 3, 3, [dict(r) for r in self.ROWS_RAW]), paths
+        return (paths, modes, 3, 6, [dict(r) for r in self.ROWS_RAW]), paths
+
+    def _off_raw(self):
+        """断开后的拓扑：只剩主屏 ACTIVE，A2 有一条 source=1 空闲的 path。"""
+        paths = (mb._CcdPathInfo * 4)()
+        modes = self._modes()
+        rows = [dict(r) for r in self.ROWS_RAW]
+        rows[1].update(active=False, gdi="")
+        rows.append({"pathIndex": 3, "index": -1, "anchor": "A2", "active": False,
+                     "connected": True, "gdi": "", "friendly": "P2", "vdd": False,
+                     "srcId": 1, "tgtId": 200})
+        paths[0].flags = mb._CCD_PATH_ACTIVE
+        for p in paths:
+            p.targetInfo.targetAvailable = 1
+        return paths, modes, 4, 6, rows
 
     def _base_patches(self, fake_query, apply_rc=0, verify=True):
         return (
@@ -1278,7 +1387,8 @@ class TopologyActionTest(TempConfigCase):
         self.assertFalse(errs)
         self.assertTrue(noop)
 
-    def test_off_saves_pre_action_snapshot_then_applies(self):
+    def test_off_snapshots_in_memory_then_applies(self):
+        """v2.01.0：断开只把内存快照拍在**动作前**（用于本次失败回滚），不落盘。"""
         seen = {}
 
         def fake_query(u32=None):
@@ -1286,20 +1396,23 @@ class TopologyActionTest(TempConfigCase):
             seen["original"] = bytes(paths).hex()
             return raw
 
-        def fake_save(snap):
-            seen["snap"] = snap
-            return "fake.json"
+        def fake_snap(paths, modes, pc, mc, anchors):
+            seen["snap_paths"] = bytes(paths).hex()
+            seen["snap_anchors"] = list(anchors)
+            return {"pathCount": pc, "modeCount": mc, "pathsHex": "",
+                    "modesHex": "", "targetAnchors": list(anchors)}
 
         patches = self._base_patches(fake_query)
         with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
-                unittest.mock.patch.object(mb, "_ccd_save_snapshot", side_effect=fake_save):
+                unittest.mock.patch.object(mb, "_ccd_make_snapshot",
+                                           side_effect=fake_snap):
             ok, errs = mb.topology_off([0, 1])
         self.assertEqual(ok, [1])   # 主屏虽被勾选，护栏跳过，不算成功
         self.assertEqual(errs, [])
         self.assertEqual(apply.call_count, 1)
-        self.assertEqual(seen["snap"]["targetAnchors"], ["A2"])
+        self.assertEqual(seen["snap_anchors"], ["A2"])
         # 快照必须来自动作之前：ACTIVE 位还在，且路径未被置 INVALID
-        self.assertEqual(seen["snap"]["pathsHex"], seen["original"])
+        self.assertEqual(seen["snap_paths"], seen["original"])
 
     def test_off_rolls_back_once_when_verify_fails(self):
         def fake_query(u32=None):
@@ -1308,7 +1421,10 @@ class TopologyActionTest(TempConfigCase):
         rollback = []
         patches = self._base_patches(fake_query, verify=False)
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-                unittest.mock.patch.object(mb, "_ccd_save_snapshot", return_value="x"), \
+                unittest.mock.patch.object(mb, "_ccd_make_snapshot",
+                                           return_value={"pathCount": 3, "modeCount": 3,
+                                                         "pathsHex": "", "modesHex": "",
+                                                         "targetAnchors": ["A2"]}), \
                 unittest.mock.patch.object(
                     mb, "_ccd_restore_from_bytes",
                     side_effect=lambda u32, snap: rollback.append(snap) or 0):
@@ -1317,29 +1433,31 @@ class TopologyActionTest(TempConfigCase):
         self.assertEqual(len(rollback), 1)
         self.assertIn("已回滚", errs[0][1])
 
-    def test_off_does_not_apply_when_snapshot_write_fails(self):
+    def test_off_never_applies_when_plan_rejected(self):
+        """护栏拦下时，一次 SetDisplayConfig 都不许发。"""
         def fake_query(u32=None):
             return self._raw()[0]
 
         patches = self._base_patches(fake_query)
-        with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
-                unittest.mock.patch.object(mb, "_ccd_save_snapshot", side_effect=OSError("disk")):
-            ok, errs = mb.topology_off([1])
+        with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5]:
+            ok, errs = mb.topology_off([2])          # VDD：永不作目标
         self.assertEqual(ok, [])
         self.assertEqual(apply.call_count, 0)
-        self.assertIn("快照写入失败", errs[0][1])
+        self.assertIn("没有可断开的副屏", errs[0][1])
 
-    def test_on_restores_verifies_then_writes_brightness(self):
-        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
-                "targetAnchors": ["A2"]}
+    def test_on_plans_from_current_topology_then_writes_brightness(self):
+        """接回 = 现读当前拓扑 → 现算 mode → 提交 → 回读 → 写亮度。"""
         calls = []
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
-                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes",
-                                           side_effect=lambda *a: calls.append("restore") or 0), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           return_value=self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply",
+                                           side_effect=lambda *a: calls.append("apply") or 0), \
                 unittest.mock.patch.object(mb, "_ccd_wait_state",
                                            side_effect=lambda *a, **k: calls.append("verify") or True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
                 unittest.mock.patch.object(mb, "current_level", return_value=80), \
                 unittest.mock.patch.object(mb, "set_brightness_many",
                                            side_effect=lambda idx, lv: (
@@ -1347,18 +1465,17 @@ class TopologyActionTest(TempConfigCase):
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(errs, [])
         self.assertEqual(ok, [1, 1])
-        self.assertEqual(calls[:2], ["restore", "verify"])
+        self.assertEqual(calls[:2], ["apply", "verify"])
         self.assertEqual(calls[2], ("brightness", [1], 80))
 
     def test_reconnect_writes_brightness_to_newly_restored_screen(self):
-        """回归：断开源恢复后才回到 EnumDisplayMonitors，不能拿断开前的旧序号写亮度。"""
-        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
-                "targetAnchors": ["A2"]}
+        """回归：断开源接回后才回到 EnumDisplayMonitors，不能拿断开前的旧序号写亮度。"""
         cfg = self._cfg(screen_off_method="topology")
-        # 断开期间算出的 indices 只有主屏 [0]；恢复后 A2 重新成为 [1]。
+        # 断开期间算出的 indices 只有主屏 [0]；接回后 A2 重新成为 [1]。
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
-                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes", return_value=0), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           return_value=self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
                 unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
                 unittest.mock.patch.object(mb, "topology_indices_for_anchors",
                                            return_value=[1]), \
@@ -1367,7 +1484,7 @@ class TopologyActionTest(TempConfigCase):
             bright.return_value = ([0, 1], [])
             ok, errs = mb.screen_on_cfg(cfg, [0])
         self.assertEqual(errs, [])
-        self.assertEqual(ok, [0, 0, 1])
+        self.assertEqual(ok, [1, 0, 1])
         bright.assert_called_once_with([0, 1], 80)
 
     def test_anchor_to_index_uses_active_gdi_only(self):
@@ -1384,17 +1501,29 @@ class TopologyActionTest(TempConfigCase):
                 unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
             self.assertEqual(mb.topology_indices_for_anchors(["A2"]), [1])
 
-    def test_on_does_not_write_brightness_when_restore_fails(self):
-        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
-                "targetAnchors": ["A2"]}
+    def test_on_does_not_write_brightness_when_apply_fails(self):
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
-                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes", return_value=87), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           return_value=self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", return_value=87), \
                 unittest.mock.patch.object(mb, "set_brightness_many") as bright:
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(ok, [])
         self.assertIn("rc=87", errs[0][1])
+        bright.assert_not_called()
+
+    def test_on_does_not_write_brightness_when_verify_fails(self):
+        cfg = self._cfg(screen_off_method="topology")
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_query_raw",
+                                           return_value=self._off_raw()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=False), \
+                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+            ok, errs = mb.screen_on_cfg(cfg, [1])
+        self.assertEqual(ok, [])
+        self.assertIn("回读未确认", errs[0][1])
         bright.assert_not_called()
 
     def test_schedule_off_skips_brightness_in_topology_mode(self):
@@ -1403,25 +1532,121 @@ class TopologyActionTest(TempConfigCase):
                                         return_value={"level": 0, "screen": "off"}), \
                 unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
                 unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
-                unittest.mock.patch.object(mb, "screen_off_cfg", return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "mark_screen_state"):
+                unittest.mock.patch.object(mb, "screen_off_cfg", return_value=([1], [])):
             level, screen, ok, errs = mb.apply_schedule(cfg)
         self.assertEqual((level, screen, ok, errs), (0, "off", [1], []))
         bright.assert_not_called()
 
     def test_schedule_on_defers_brightness_to_screen_on_cfg(self):
-        """D3：档位层不能在恢复拓扑之前写亮度；写亮度归 screen_on_cfg。"""
+        """D3：档位层不能在接回拓扑之前写亮度；写亮度归 screen_on_cfg。"""
         cfg = self._cfg(screen_off_method="topology")
         with unittest.mock.patch.object(mb, "active_slot_dict",
                                         return_value={"level": 75, "screen": "on"}), \
                 unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
                 unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
                 unittest.mock.patch.object(mb, "screen_wake_entry",
-                                           return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "mark_screen_state"):
+                                           return_value=([1], [])):
             level, screen, ok, errs = mb.apply_schedule(cfg)
         self.assertEqual((level, screen, ok, errs), (75, "on", [1], []))
         bright.assert_not_called()
+
+
+class TopologyPlanOnTest(unittest.TestCase):
+    """v2.01.0 声明式接回：不依赖历史快照，全部从**当前**拓扑现读现算。
+
+    设计纠偏背景：快照是"过去某一刻的整份拓扑字节"，恢复它会把用户其后在
+    Windows 设置里改过的排布 / 分辨率 / 主屏一起覆盖掉——那是程序在替用户
+    维护状态。现算依据（真机实测，scripts/topo-declarative-probe.py --verify）：
+      sourceInfo.modeInfoIdx = (sourceModeIdx << 16) | 0xFFFF
+      targetInfo.modeInfoIdx = (targetModeIdx << 16) | desktopModeIdx
+    """
+
+    ROWS = [
+        {"pathIndex": 0, "anchor": "A1", "active": True, "connected": True,
+         "vdd": False, "gdi": "\\\\.\\DISPLAY1", "srcId": 0, "tgtId": 100},
+        {"pathIndex": 1, "anchor": "A2", "active": False, "connected": True,
+         "vdd": False, "gdi": "", "srcId": 1, "tgtId": 200},
+        {"pathIndex": 2, "anchor": "A2", "active": False, "connected": True,
+         "vdd": False, "gdi": "", "srcId": 3, "tgtId": 200},
+        {"pathIndex": 3, "anchor": "V1", "active": False, "connected": True,
+         "vdd": True, "gdi": "", "srcId": 2, "tgtId": 300},
+    ]
+    ENTRIES = [(0, 1, 0), (1, 2, 100), (2, 3, 100),
+               (3, 1, 1), (4, 2, 200), (5, 3, 200)]
+
+    def test_plan_picks_free_source_and_computes_mode_indices(self):
+        plan, errs, noop = mb.topology_plan_on(["A2"], self.ROWS, self.ENTRIES)
+        self.assertEqual(errs, [])
+        self.assertFalse(noop)
+        self.assertEqual(len(plan), 1)
+        item = plan[0]
+        self.assertEqual(item["pathIndex"], 1)      # source id 小的胜出
+        self.assertEqual(item["sourceModeIdx"], 3)
+        self.assertEqual(item["targetModeIdx"], 4)
+        self.assertEqual(item["desktopModeIdx"], 5)
+
+    def test_plan_is_idempotent_for_already_active_anchor(self):
+        plan, errs, noop = mb.topology_plan_on(["A1"], self.ROWS, self.ENTRIES)
+        self.assertEqual((plan, errs), ([], []))
+        self.assertTrue(noop)
+
+    def test_plan_refuses_vdd_and_missing_anchor(self):
+        plan, errs, _ = mb.topology_plan_on(["V1"], self.ROWS, self.ENTRIES)
+        self.assertEqual(plan, [])
+        self.assertIn("虚拟屏", errs[0])
+        plan, errs, _ = mb.topology_plan_on(["NOPE"], self.ROWS, self.ENTRIES)
+        self.assertEqual(plan, [])
+        self.assertIn("没有已连接的 path", errs[0])
+
+    def test_plan_skips_source_used_by_another_active_screen(self):
+        rows = [dict(r) for r in self.ROWS]
+        rows[1]["srcId"] = 0                 # 和主屏抢同一个 source
+        rows[2]["srcId"] = 0
+        plan, errs, _ = mb.topology_plan_on(["A2"], rows, self.ENTRIES)
+        self.assertEqual(plan, [])
+        self.assertIn("没有空闲 source", errs[0])
+
+    def test_plan_returns_none_mode_when_mode_gone(self):
+        """mode 数组里查不到这块屏：plan 仍然给出，但三个下标为 None（交给 Windows 挑）。"""
+        plan, errs, _ = mb.topology_plan_on(["A2"], self.ROWS, [])
+        self.assertEqual(errs, [])
+        self.assertEqual(len(plan), 1)
+        self.assertIsNone(plan[0]["sourceModeIdx"])
+        self.assertIsNone(plan[0]["targetModeIdx"])
+        self.assertIsNone(plan[0]["desktopModeIdx"])
+
+    def test_apply_plan_writes_bitexact_layout(self):
+        paths = (mb._CcdPathInfo * 1)()
+        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": 3,
+                 "targetModeIdx": 4, "desktopModeIdx": 5}]
+        mb._ccd_apply_plan_on(paths, plan)
+        self.assertTrue(paths[0].flags & mb._CCD_PATH_ACTIVE)
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0x0003FFFF)
+        self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0x00040005)
+
+    def test_apply_plan_falls_back_to_invalid(self):
+        paths = (mb._CcdPathInfo * 1)()
+        plan = [{"pathIndex": 0, "anchor": "A2", "sourceModeIdx": None,
+                 "targetModeIdx": None, "desktopModeIdx": None}]
+        mb._ccd_apply_plan_on(paths, plan)
+        self.assertEqual(int(paths[0].sourceInfo.modeInfoIdx), 0xFFFFFFFF)
+        self.assertEqual(int(paths[0].targetInfo.modeInfoIdx), 0xFFFFFFFF)
+
+    def test_snapshot_helpers_are_memory_only(self):
+        """快照只活在内存里：落盘/读盘函数必须不存在，否则又变成"状态账"。"""
+        for name in ("_ccd_save_snapshot", "_ccd_load_snapshot",
+                     "topology_snapshot_path", "TOPO_SNAPSHOT_FILE"):
+            self.assertFalse(hasattr(mb, name), name)
+        self.assertTrue(callable(mb._ccd_make_snapshot))
+        self.assertTrue(callable(mb._ccd_restore_from_bytes))
+
+    def test_wanted_anchors_prefers_selection_else_all_disconnected(self):
+        cfg = mb.default_config()
+        cfg["monitor_anchors"] = ["A1", "A2"]
+        self.assertEqual(mb.topology_wanted_anchors(cfg, rows=[]), ["A1", "A2"])
+        cfg["monitor_anchors"] = []
+        got = mb.topology_wanted_anchors(cfg, rows=self.ROWS)
+        self.assertEqual(got, ["A2"])        # 只取 disconnected 的非 VDD 物理屏
 
 
 if __name__ == "__main__":

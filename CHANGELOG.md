@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+### 2026-11-27 · 设计纠偏 v2.01.0：程序不维护任何屏幕状态
+
+> 用户纠偏原文："拓扑就是可以被修改的，这个软件的职责只是读取当前状态和调整当前状态。
+> 它不需要维护任何状态。定时任务的话是可以在指定时间调整到指定状态的。"
+
+这条纠正推翻了我此前把"上次操作结果"当成"当前事实"的设计，走查第 2 轮保留的
+4 项全部是它的衍生问题。本轮按"现读 / 现算 / 不记账"重做。
+
+**1) 删掉屏幕状态账**
+
+- 删除配置项 `screen_state` / `screen_state_at` / `screen_off_tick`，
+  以及 `mark_screen_state()`、`_screen_woke_by_input()`、`_merge_runtime_state()`、
+  `screen_time_text()`、`coerce_setting` 的 `stamp` / `screenstate` 分支。
+- `screen_verdict()` 重写：拓扑模式用 CCD 的 ACTIVE flag 当结论；`system`/`ddc`
+  模式**不再给亮灭断言**——Windows 没有可靠的显示器电源读取接口（实测 `0xD6`
+  在面板已黑时仍报 1），只有一个可信方向：**报了待机（2/3/4/5）才算灭**，
+  其余一律 `unknown`，把寄存器值和"上次输入距今多久"摊给用户自己判断。
+- `wake_options()` 的 `expect_off` 改为**当场探测**，不再读记账；
+  `_render_states` / `_finish_screen_*` / `cli_screen` / 托盘 tooltip 一律不再回写状态。
+- `save_config()` 回到纯原子写（不需要跨进程合并运行态，因为没有运行态）。
+
+**2) 拓扑接回不再恢复历史快照（这是"第 1 个问题"本身）**
+
+- 旧实现：断开时把整份 CCD 字节快照落盘，接回时原样恢复。期间用户在 Windows
+  设置里改过的排布 / 分辨率 / 主屏会被旧快照覆盖 —— 典型的"程序替用户维护状态"。
+- 新实现 `topology_plan_on()` + `_ccd_apply_plan_on()`：现读当前拓扑，
+  按锚点挑一条**空闲 source**（未被其它 ACTIVE path 占用，取 id 最小者），
+  再从**当前** modes 数组现算 `sourceInfo.modeInfoIdx = (srcMode<<16)|0xFFFF`、
+  `targetInfo.modeInfoIdx = (tgtMode<<16)|desktopMode`。
+- 真机实测支撑（`scripts/topo-declarative-probe.py --verify`，2026-11-27）：
+  现算出的三元组与 Windows 自己填的值**逐位一致**
+  （path#0 `0x0001FFFF/0x00000002`、path#1 `0x0004FFFF/0x00030005`）。
+- 两级尝试：现算 mode 被拒时降级为 `INVALID` 交 `SDC_ALLOW_CHANGES` 由 Windows 挑。
+- 快照只活在**内存**里，仅供本次操作失败回滚；`_ccd_save_snapshot` /
+  `_ccd_load_snapshot` / `topology_snapshot_path` / `TOPO_SNAPSHOT_FILE` 全部删除。
+- `topology_enable_anchor()` 不再检查"快照里有没有它"，只问当前拓扑 connected+inactive。
+- `_ccd_wait_state()` 改为要求**每个**目标锚点都出现且状态一致，多屏接回少接一块
+  不再误报成功。
+
+**3) 走查第 2 轮保留的另两项（同源）**
+
+- E2-04 `--force` 被 `enabled=False` 吞掉 → `ensure_task_registration` 的 force
+  变成"对齐"语义，两个方向都做：启用则重建，未启用则清残留任务。
+- E2-05 `ddc_allow_undeclared` 单向阀门 → 离开 ddc 方式时收回授权，
+  避免"旧屏点过一次同意、换屏后风险被继承"。
+
+- 新增 `TopologyPlanOnTest`（9 项）+ 改写受影响用例 → **92 tests OK**。
+- 用户可见变化：非拓扑模式下状态卡不再显示"屏幕亮着/已熄灭"
+  （读不到就不假装知道）；拓扑模式仍显示准确结论。
+
 ### 2026-11-27 · 场景走查第 2 轮（探索会话 + 收敛）
 
 - 2 个 SBTM 探索会话（状态残留 / 少用入口）发现 16 项，新增 7 项回归测试 → **76 tests OK**。
