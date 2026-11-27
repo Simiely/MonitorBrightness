@@ -845,5 +845,59 @@ class TopologyVerdictTest(unittest.TestCase):
         self.assertNotIn("拓扑", v["text"])
 
 
+class MonitorIdentityTest(unittest.TestCase):
+    """E2：monitor_anchors 优先于旧 monitor_ids / 下标；任一层没命中就往下兜。"""
+
+    TARGETS = [{"index": 0, "dev": "DISPLAY1"}, {"index": 1, "dev": "DISPLAY2"}]
+    ROWS = [
+        {"anchor": "A1", "gdi": "\\\\.\\DISPLAY2", "aliases": ["\\\\.\\DISPLAY3"],
+         "vdd": False, "active": True},
+        {"anchor": "VDD1", "gdi": "\\\\.\\DISPLAY9", "aliases": [],
+         "vdd": True, "active": True},
+    ]
+
+    def _cfg(self, **kw):
+        cfg = mb.default_config()
+        cfg.update(kw)
+        return cfg
+
+    def _patch(self):
+        return (unittest.mock.patch.object(mb, "enumerate_targets",
+                                           return_value=list(self.TARGETS)),
+                unittest.mock.patch.object(mb, "release_targets"),
+                unittest.mock.patch.object(mb, "ccd_probe_topology",
+                                           return_value=list(self.ROWS)))
+
+    def test_anchor_wins_over_old_ids_and_indices(self):
+        a, b, c = self._patch()
+        with a, b, c:
+            cfg = self._cfg(monitor_anchors=["A1"], monitor_ids=["DISPLAY1"], monitors=[0])
+            self.assertEqual(mb.resolve_monitors(cfg), [1])
+
+    def test_unmatched_anchor_falls_back_to_ids(self):
+        a, b, c = self._patch()
+        with a, b, c:
+            cfg = self._cfg(monitor_anchors=["NOPE"], monitor_ids=["DISPLAY1"], monitors=[1])
+            self.assertEqual(mb.resolve_monitors(cfg), [0])
+
+    def test_vdd_anchor_never_resolves(self):
+        a, b, c = self._patch()
+        with a, b, c:
+            cfg = self._cfg(monitor_anchors=["VDD1"], monitors=[0])
+            self.assertEqual(mb.resolve_monitors(cfg), [0])
+
+    def test_legacy_config_without_anchors(self):
+        a, b, c = self._patch()
+        with a, b, c:
+            cfg = self._cfg(monitor_ids=["DISPLAY2"], monitors=[0])
+            self.assertEqual(mb.resolve_monitors(cfg), [1])
+
+    def test_selection_anchors_and_empty_selection(self):
+        a, b, c = self._patch()
+        with a, b, c:
+            self.assertEqual(mb.selection_anchors([1]), ["A1"])
+            self.assertEqual(mb.selection_anchors([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

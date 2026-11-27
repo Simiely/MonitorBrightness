@@ -57,7 +57,11 @@
   - `SETTINGS` 新增 `monitor_anchors`（kind=anchors，E2 迁移用）
   - `--diag` 新增"四、显示拓扑"段：每块屏的 ACTIVE / 锚点 / GDI 名 / 同源别名
   - 实测 `QDC_ALL_PATHS` 约 0.10ms（233 条 path），折叠后 3 块屏；39 tests OK
-- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、39 tests OK
+- **E2 身份层迁移**：`monitor_anchors` 成为第一优先，`monitor_ids` / `monitors` 依次兜底；
+  任一层没命中就继续往下走，绝不静默清空用户选择。新增 `selection_anchors()`，
+  GUI 两处保存路径（勾选记忆 / 定时保存）都写入锚点；VDD 锚点永不参与解析。
+  `--diag` 打印锚点与解析结果。真机闭环验证：勾选 0,1 → 两个 EDID 锚点 → 解析回 [0,1]
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、44 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
 

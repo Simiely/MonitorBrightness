@@ -1895,26 +1895,71 @@ def current_level(cfg=None, now=None):
     return active_slot(_slot_minutes(cfg), _minutes(now))[1]
 
 
+def _short_dev(name):
+    """'\\\\.\\DISPLAY1' / 'DISPLAY1' -> 'display1'（大小写、前缀都归一）。"""
+    return str(name or "").split("\\")[-1].strip().lower()
+
+
+def selection_anchors(indices, targets=None):
+    """给勾选的下标生成 CCD 稳定锚点（E2）。
+
+    锚点来自 `ccd_probe_topology()`：显卡 LUID + EDID mfr/prod + connectorInstance。
+    QDC_ALL_PATHS 下同一块屏有多个 source（DISPLAY1/2/3/4），要按 short dev 匹配。
+    取不到就返回 []，绝不把不确定的锚点写进配置。
+    """
+    idx = normalize_indices(indices)
+    if not idx:
+        return []                          # 空选择 = 全部，不锚死
+    owned = targets is None
+    if owned:
+        targets = enumerate_targets()
+    try:
+        wanted = {_short_dev(t["dev"]) for t in targets if t["index"] in idx}
+        rows = ccd_probe_topology()
+        out = []
+        for r in rows:
+            if r["vdd"]:
+                continue
+            names = [_short_dev(r.get("gdi"))] + [_short_dev(a) for a in r.get("aliases", [])]
+            if wanted.intersection(names) and r["anchor"] not in out:
+                out.append(r["anchor"])
+        return out
+    finally:
+        if owned:
+            release_targets(targets)
+
+
 def resolve_monitors(cfg):
     """把"用户选过的显示器"解析成**当前**的下标列表。
 
-    配置里存两份：monitors（下标）+ monitor_ids（设备名，如 DISPLAY1）。
-    设备名由输出口决定、同一次会话内稳定；下标却会随显卡驱动与接线重排。
-    只存下标就会出现"熄的是这块、开机后点的是那块"——这是换电脑/换线后
-    点亮失效最典型的一种形态，所以解析时优先认设备名。
+    优先级（新 → 旧）：
+      1. `monitor_anchors`：CCD 稳定锚点，跨 `DISPLAYn` 重排仍认得人；
+      2. `monitor_ids`：旧的设备名锚点（DISPLAY1 这类），兼容旧配置；
+      3. `monitors`：纯下标，最后兜底。
 
+    任一层"没命中"都继续往下走，绝不静默把用户选择清空。
     返回 [] 表示"全部显示器"（与界面上"一个都不勾 = 全部"一致）。
     """
+    anchors = cfg.get("monitor_anchors") or []
     ids = cfg.get("monitor_ids") or []
-    if ids:
+    if anchors or ids:
         targets = enumerate_targets()
         try:
-            by_dev = {t["dev"]: t["index"] for t in targets}
+            by_dev = {_short_dev(t["dev"]): t["index"] for t in targets}
         finally:
             release_targets(targets)      # 只借一瞬，别把句柄漏在这
-        hit = sorted({by_dev[d] for d in ids if d in by_dev})
+        hit = set()
+        if anchors:
+            for r in ccd_probe_topology():
+                if r["vdd"] or r["anchor"] not in anchors:
+                    continue
+                names = [_short_dev(r.get("gdi"))] + [
+                    _short_dev(a) for a in r.get("aliases", [])]
+                hit.update(by_dev[n] for n in names if n in by_dev)
+        if not hit and ids:
+            hit.update(by_dev[d] for d in (_short_dev(i) for i in ids) if d in by_dev)
         if hit:
-            return hit
+            return sorted(hit)
     return normalize_indices(cfg.get("monitors"))
 
 
@@ -2734,8 +2779,9 @@ def cli_diag():
     cfg = load_config()
     _out("配置：presets=%s · 熄灭方式=%s · 记录屏幕状态=%s"
          % (cfg.get("presets"), cfg.get("screen_off_method"), cfg.get("screen_state")))
-    _out("配置里的显示器选择：monitors=%s · monitor_ids=%s"
-         % (cfg.get("monitors"), cfg.get("monitor_ids")))
+    _out("配置里的显示器选择：monitors=%s · monitor_ids=%s · monitor_anchors=%s"
+         % (cfg.get("monitors"), cfg.get("monitor_ids"), cfg.get("monitor_anchors")))
+    _out("锚点优先解析结果：%s" % (resolve_monitors(cfg) or "[]（= 全部）"))
 
     targets = enumerate_targets()
     if not targets:
@@ -4750,6 +4796,7 @@ class App:
         idx, ids = selection_payload(self.selected_indices())
         self.cfg["monitors"] = idx
         self.cfg["monitor_ids"] = ids
+        self.cfg["monitor_anchors"] = selection_anchors(idx)
 
     # ---------- 熄屏 / 点亮 ----------
     def _queue_screen_action(self, action):
@@ -5109,7 +5156,8 @@ class App:
         if slots is None:
             return
         idx, ids = selection_payload(self.selected_indices())
-        part = {"monitors": idx, "monitor_ids": ids, "enabled": True,
+        part = {"monitors": idx, "monitor_ids": ids,
+                "monitor_anchors": selection_anchors(idx), "enabled": True,
                 "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True)),
                 "slots": slots}
         self.cfg.update(part)
