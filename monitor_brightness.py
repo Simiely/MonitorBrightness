@@ -112,6 +112,51 @@ from core.logging import (                         # noqa: E402
     _write_event_log, dlog, diag_dump, diag_enabled, diag_export,
     diag_set_enabled, read_recent_events, read_session_events,
 )
+# v2.03.0 R2：硬件层已沉到 hw/ 与 service.py，统一再导出。
+from hw.ddc import (                                # noqa: E402
+    PHYSICAL_MONITOR, _dxva2, _read_vcp, _write_vcp, enumerate_targets, release_targets,
+    _select, _capabilities, _DISPLAY_DEVICE, _display_uid, _display_key, _capabilities_cached,
+    _caps_model, _caps_inputs, _caps_power, monitor_model, monitor_label, _luminance_max,
+    _raw_from_percent, set_brightness_many, get_brightness_many, probe_states, _idle_seconds, _human_gap,
+    NO_MONITOR_MSG, VCP_BRIGHTNESS, VCP_INPUT_SOURCE, VCP_POWER_MODE, POWER_ON, POWER_STANDBY,
+    POWER_SUSPEND, POWER_SOFT_OFF, POWER_OFF, POWER_LABEL, _DXVA2_READY, _EDID_CACHE,
+    _MAX_LUM,
+)
+from hw.ccd_structs import (                                # noqa: E402
+    _CcdLuid, _CcdRational, _CcdSourceInfo, _CcdTargetInfo, _CcdPathInfo, _CcdPoint,
+    _CcdSourceMode, _CcdModeInfo, _CcdInfoHeader, _CcdSourceName, _CcdTargetName, _Ccd2D,
+    _CcdVideoSignalInfo, _CcdTargetPreferredMode, _QDC_ALL_PATHS, _QDC_VIRTUAL_MODE_AWARE, _CCD_PATH_ACTIVE, _CCD_GET_SOURCE_NAME,
+    _CCD_GET_TARGET_NAME, _DC_GET_TARGET_PREFERRED_MODE, _CCD_PIXELFORMAT_NONGDI, _CCD_EDID_IDS_VALID, _CCD_TARGET_IN_USE, _SDC_USE_SUPPLIED,
+    _SDC_APPLY, _SDC_SAVE_TO_DATABASE, _SDC_ALLOW_CHANGES, _SDC_VIRTUAL_MODE_AWARE, _CCD_APPLY_FLAGS, _CCD_MODE_IDX_INVALID,
+    TOPO_VERIFY_TIMEOUT, _CCD_TYPE_SOURCE, _CCD_TYPE_TARGET, _CCD_TYPE_DESKTOP,
+)
+from hw.ccd import (                                # noqa: E402
+    _ccd_setup_probe_api, _ccd_query_all_paths, _ccd_rows_from_paths, _ccd_merge_rows_by_anchor, ccd_probe_topology, topology_state_for,
+    screen_verdict, _ccd_api, _ccd_query_raw, _ccd_slice_bytes, _ccd_make_snapshot, _ccd_apply,
+    _ccd_restore_from_bytes, _ccd_wait_state, _ccd_mode_entries, _ccd_pick_mode,
+)
+from hw.topology import (                                # noqa: E402
+    topology_plan_off, _fold_raw_rows, topology_plan_on, _ccd_preferred_size, _ccd_live_size, _ccd_layout_rects,
+    _ccd_layout_by_anchor, _ccd_free_origin, _ccd_place, _ccd_append_source_mode, _ccd_capture_positions, _ccd_fill_missing_source_modes,
+    _ccd_apply_plan_on, _topo_off_handover_shift, _topo_off_capture_positions, _topo_off_activate_heir, _topo_off_shift_other_modes, _topo_off_detach,
+    _topo_off_apply_and_verify, _topo_off_report_and_follow, topology_off, topology_inactive_rows, topology_indices_for_anchors, topology_wanted_anchors,
+    _ccd_query_raw_rows, topology_on,
+)
+from hw.power import (                                # noqa: E402
+    _broadcast_monitor_power, screen_off_system, screen_on_system, _nudge_user_input, _switch_input_roundtrip, _wake_one,
+    _output_recycle, screen_off_many, screen_wake_many, _monitor_count, _system_ok_targets, _wake_info,
+    reset_wake_info, take_wake_info, pick_flip_source, _fast_flip_recent, _mark_fast_flip, _fast_flip_one,
+    screen_wake_flip, SC_MONITORPOWER, SC_OFF, SC_ON, _WM_SYSCOMMAND, _HWND_BROADCAST,
+    WAKE_STAGE_LABEL, FAST_FLIP_WINDOW_S, _FAST_FLIP_AT, _FAST_FLIP_LOCK, _WAKE_INFO, _WAKE_INFO_LOCK,
+)
+from service import (                                # noqa: E402
+    screen_off_cfg, screen_on_row, screen_on_cfg, screen_wake_entry, topology_enable_anchor, current_level,
+    wake_options, selection_anchors, _minutes, _slot_minutes, active_slot, active_slot_dict,
+)
+from hw.winfollow import (                                # noqa: E402
+    _WinRect, _user32, _window_rect, iter_app_windows, win_snapshot, win_follow,
+    _SWP_NOSIZE, _SWP_NOZORDER, _SWP_NOACTIVATE, _GWL_EXSTYLE, _WS_EX_TOOLWINDOW, _WS_EX_NOACTIVATE,
+)
 
 # Pillow 只有 GUI 需要（抗锯齿圆角贴图）。**必须有守卫**：
 # 缺 Pillow 时 CLI（--set / --apply-schedule / --diag / --selftest）照常工作，
@@ -311,37 +356,8 @@ TASK_SHORT = {TASK_SCHEDULE: "定时", TASK_CATCHUP: "登录校准"}
 
 
 
-# ============================================================
-# 二、显示器枚举与亮度控制（DDC/CI，dxva2 内置后端）
-# ------------------------------------------------------------
-# v1.7.0 起不再依赖 monitorcontrol，原因有三（都是实测，不是猜的）：
-#   1. monitorcontrol 4.2.0 在 Python 3.14 上枚举直接抛
-#      TypeError: expected LP_PHYSICAL_MONITOR instance —— 新版 ctypes 对
-#      "数组冒充指针"更严格，源码态根本列不出显示器；
-#   2. 它和 enum_displays() 各自枚举一遍，两套顺序一旦不同，就会出现
-#      "熄的是这块、点的是那块"——正是"换电脑后有时点不亮"的形态之一；
-#   3. 只需要它 capabilities 里的 model 字段，为这个背一个会崩的依赖不值。
-# 现在全程序只有 enumerate_targets() 一个枚举源：界面标签、亮度读写、熄屏点亮、
-# 状态探测全部按它的下标走，序号天然一致。
-# ============================================================
-NO_MONITOR_MSG = (
-    "未检测到支持 DDC/CI 的显示器。\n请确认：\n"
-    "1. 显示器 OSD 菜单已开启 DDC/CI\n"
-    "2. 使用 HDMI / DP / DVI 直连（避免 KVM / USB 转接）"
-)
 
-# VCP 特性码
-VCP_BRIGHTNESS = 0x10
-VCP_INPUT_SOURCE = 0x60
-VCP_POWER_MODE = 0xD6
 
-# 0xD6 电源模式取值（MCCS 标准）
-POWER_ON = 1
-POWER_STANDBY = 2
-POWER_SUSPEND = 3
-POWER_SOFT_OFF = 4
-POWER_OFF = 5
-POWER_LABEL = {1: "开", 2: "待机", 3: "挂起", 4: "软关", 5: "硬关"}
 
 # 0x60 输入源取值（只列常见项，其余照原样显示数字）
 INPUT_LABEL = {1: "模拟1", 2: "模拟2", 3: "DVI-1", 4: "DVI-2", 5: "复合1",
@@ -349,226 +365,30 @@ INPUT_LABEL = {1: "模拟1", 2: "模拟2", 3: "DVI-1", 4: "DVI-2", 5: "复合1",
                19: "HDMI-3"}
 
 
-class PHYSICAL_MONITOR(ctypes.Structure):
-    """dxva2 的 PHYSICAL_MONITOR：一个物理显示器句柄 + 描述文字。"""
-    _fields_ = [("hPhysicalMonitor", wintypes.HANDLE),
-                ("szPhysicalMonitorDescription", wintypes.WCHAR * 128)]
 
 
-_DXVA2_READY = False
 
 
-def _dxva2():
-    """返回已声明好函数签名的 dxva2（只声明一次）。
-
-    为什么必须显式声明：
-      - 64 位下 HANDLE 不声明会被按 C int 截断，句柄高位丢失后表现为
-        "偶尔某块屏调不动"，且现象随启动顺序变化，极难复现；
-      - 数组参数统一用 c_void_p + byref 传，绕开新版 ctypes 对
-        "数组冒充 POINTER" 的严格检查（monitorcontrol 4.2.0 就栽在这）。
-    """
-    global _DXVA2_READY
-    lib = ctypes.windll.dxva2
-    if _DXVA2_READY:
-        return lib
-    try:
-        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
-            wintypes.HMONITOR, ctypes.POINTER(wintypes.DWORD)]
-        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-        lib.GetPhysicalMonitorsFromHMONITOR.argtypes = [
-            wintypes.HMONITOR, wintypes.DWORD, ctypes.c_void_p]
-        lib.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-        lib.GetVCPFeatureAndVCPFeatureReply.argtypes = [
-            wintypes.HANDLE, wintypes.BYTE, ctypes.c_void_p,
-            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
-        lib.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
-        lib.SetVCPFeature.argtypes = [wintypes.HANDLE, wintypes.BYTE, wintypes.DWORD]
-        lib.SetVCPFeature.restype = wintypes.BOOL
-        lib.DestroyPhysicalMonitor.argtypes = [wintypes.HANDLE]
-        lib.DestroyPhysicalMonitor.restype = wintypes.BOOL
-        lib.GetCapabilitiesStringLength.argtypes = [
-            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        lib.GetCapabilitiesStringLength.restype = wintypes.BOOL
-        lib.CapabilitiesRequestAndCapabilitiesReply.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
-        lib.CapabilitiesRequestAndCapabilitiesReply.restype = wintypes.BOOL
-    except Exception:
-        pass
-    _DXVA2_READY = True
-    return lib
 
 
-def _read_vcp(handle, code):
-    """读一个 VCP 特性，返回 (当前值, 最大值)；失败返回 None。"""
-    try:
-        cur, mx = wintypes.DWORD(), wintypes.DWORD()
-        if _dxva2().GetVCPFeatureAndVCPFeatureReply(
-                handle, wintypes.BYTE(code), None,
-                ctypes.byref(cur), ctypes.byref(mx)):
-            return cur.value, mx.value
-    except Exception:
-        pass
-    return None
 
 
-def _write_vcp(handle, code, value):
-    """写一个 VCP 特性，返回是否成功。"""
-    try:
-        return bool(_dxva2().SetVCPFeature(handle, wintypes.BYTE(code),
-                                           wintypes.DWORD(int(value))))
-    except Exception:
-        return False
 
 
-def enumerate_targets():
-    """枚举显示器 —— 全程序唯一的枚举源。
-
-    返回 list[dict]，顺序即 EnumDisplayMonitors 顺序（界面行号 = 下标 = index）：
-      {index, dev, w, h, primary, handle, desc}
-
-    ⚠️ 一台物理屏同时插了 DP 和 HDMI 两条线时，Windows 会为**每个输出**各建一个
-    HMONITOR，这里就会出现两条指向同一块面板的记录。此时"点亮"必须跳过已经亮着的
-    那条，否则会把面板的信号源切到 Windows 没在驱动的那个空口上 → 黑屏。
-    """
-    if os.name != "nt":
-        return []
-    hmons = []
-    try:
-        user32 = ctypes.windll.user32
-
-        class MONITORINFOEXW(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
-                        ("szDevice", wintypes.WCHAR * 32)]
-
-        def _cb(hmon, hdc, lprect, lparam):
-            mi = MONITORINFOEXW()
-            mi.cbSize = ctypes.sizeof(mi)
-            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-                hmons.append((hmon, mi))
-            return 1
-
-        proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-                                  ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
-        user32.EnumDisplayMonitors(None, None, proc(_cb), None)
-    except Exception:
-        return []
-
-    targets = []
-    lib = _dxva2()
-    for hmon, mi in hmons:
-        rc = mi.rcMonitor
-        base = {"dev": str(mi.szDevice).split("\\")[-1] or str(mi.szDevice),
-                "w": rc.right - rc.left, "h": rc.bottom - rc.top,
-                "primary": bool(mi.dwFlags & 1)}
-        try:
-            count = wintypes.DWORD()
-            if not lib.GetNumberOfPhysicalMonitorsFromHMONITOR(
-                    hmon, ctypes.byref(count)):
-                continue
-            arr = (PHYSICAL_MONITOR * max(1, count.value))()
-            if not lib.GetPhysicalMonitorsFromHMONITOR(
-                    hmon, count.value, ctypes.byref(arr)):
-                continue
-            for p in list(arr)[:count.value]:
-                item = dict(base)
-                item["handle"] = p.hPhysicalMonitor
-                item["desc"] = str(p.szPhysicalMonitorDescription)
-                item["index"] = len(targets)
-                targets.append(item)
-        except Exception:
-            continue
-    return targets
 
 
-def release_targets(targets):
-    """释放 enumerate_targets() 拿到的物理句柄。
-
-    旧版从不释放：反复操作会一点点吃掉 DDC 句柄，长跑后表现为"越用越不灵"。
-    """
-    lib = _dxva2()
-    for t in targets or []:
-        try:
-            lib.DestroyPhysicalMonitor(t["handle"])
-        except Exception:
-            pass
 
 
-def _select(targets, indices):
-    """按序号挑目标，返回 (选中列表, [(越界序号, 错误), ...])。空 indices = 全部。"""
-    if not indices:
-        return list(targets), []
-    known = {t["index"] for t in targets}
-    picked = [t for t in targets if t["index"] in indices]
-    return picked, [(i, "序号超出范围") for i in indices if i not in known]
 
 
-def _capabilities(handle):
-    """读 MCCS 能力串（实测约 3 秒/台，必须放后台线程）。失败返回 ""。"""
-    try:
-        lib = _dxva2()
-        n = wintypes.DWORD()
-        if not lib.GetCapabilitiesStringLength(handle, ctypes.byref(n)) or not n.value:
-            return ""
-        buf = ctypes.create_string_buffer(n.value + 1)
-        if not lib.CapabilitiesRequestAndCapabilitiesReply(handle, buf, n.value):
-            return ""
-        return buf.value.decode("ascii", "replace")
-    except Exception:
-        return ""
 
 
-_EDID_CACHE = {}
 
 
-class _DISPLAY_DEVICE(ctypes.Structure):
-    _fields_ = [("cb", wintypes.DWORD),
-                ("DeviceName", wintypes.WCHAR * 32),
-                ("DeviceString", wintypes.WCHAR * 128),
-                ("StateFlags", wintypes.DWORD),
-                ("DeviceID", wintypes.WCHAR * 128),
-                ("DeviceKey", wintypes.WCHAR * 128)]
 
 
-def _display_uid(dev):
-    """取该输出口对应显示器的稳定标识（8 位短哈希）。
-
-    为什么不能只按 dev 名（DISPLAY1/DISPLAY2）缓存：拔线换面板后输出口名不变，
-    旧的能力串/亮度上限会继续套在新面板上（例如上限 255 的屏被当成 100）。
-
-    最稳的是 EDID；但本机（Lenovo Legion）实测 MONITOR 枚举键下没有
-    `Device Parameters\\EDID`，故改用 EnumDisplayDevicesW 的 DeviceID
-    （形如 `MONITOR\\LEN68C7\\{...}\\0005`）：它按"显示器设备实例"区分，
-    两块同型号屏也是不同实例；换面板时 Windows 会生成新实例，标识随之变化。
-    取不到时返回 ""，退回 dev-only 键 —— 只是退回旧行为，不会更糟。
-    """
-    if not dev:
-        return ""
-    if dev in _EDID_CACHE:
-        return _EDID_CACHE[dev]
-    uid = ""
-    try:
-        user32 = ctypes.windll.user32
-        dd = _DISPLAY_DEVICE()
-        dd.cb = ctypes.sizeof(dd)
-        # 枚举显示器的 lpDevice 必须是适配器全名 "\\.\DISPLAY1"；
-        # 本项目内部存的是短名 "DISPLAY1"，直接传会一直返回失败。
-        adapter = str(dev) if str(dev).startswith("\\\\.\\") else "\\\\.\\" + str(dev)
-        if user32.EnumDisplayDevicesW(adapter, 0, ctypes.byref(dd), 0):
-            did = str(dd.DeviceID).strip()
-            if did:
-                uid = hashlib.sha1(did.encode("utf-8")).hexdigest()[:8]
-    except Exception:
-        uid = ""
-    _EDID_CACHE[dev] = uid
-    return uid
 
 
-def _display_key(t):
-    """缓存键：`DISPLAY1#a1b2c3d4`。取不到显示器标识时退回 `DISPLAY1`。"""
-    dev = str(t.get("dev") or "")
-    uid = _display_uid(dev)
-    return ("%s#%s" % (dev, uid)) if uid else dev
 
 
 # 能力串缓存：display key -> 能力串。能力串是面板的静态固件属性（实测 3.1s/台），
@@ -577,2321 +397,234 @@ def _display_key(t):
 # 换显示器后 EDID 变化 → key 不命中 → 首次实测刷新。
 
 
-def _capabilities_cached(handle, key):
-    """优先读缓存的能力串；key 为空或缓存未命中时实读（读到了就缓存）。"""
-    if key:
-        got = _CAPS_CACHE.get(key)
-        if got:
-            return got
-    caps = _capabilities(handle)
-    if caps and key:
-        _CAPS_CACHE[key] = caps
-    return caps
-
-
-def _caps_model(caps):
-    """从能力串里取型号（纯解析，不发 DDC 请求）。"""
-    m = re.search(r"model\(([^)]*)\)", caps or "", re.I)
-    return (m.group(1).strip() if m else "") or None
-
-
-def _caps_inputs(caps):
-    """从能力串里取 0x60 声明支持的输入源列表（纯解析）。
-
-    ⚠️ 能力串里的数值是**不带 0x 的十六进制**。本机实测 `60(11 12 0F)`
-    = HDMI-1(17) / HDMI-2(18) / DP-1(15)；按十进制解析会得到 11/12/0 这种
-    根本不存在的口，拿它去切信号源就是把画面切进黑洞。
-    """
-    m = re.search(r"\b60\(([^)]*)\)", caps or "")
-    if not m:
-        return []
-    out = []
-    for tok in m.group(1).split():
-        try:
-            code = int(tok, 16)
-        except Exception:
-            continue
-        if 1 <= code <= 19:          # MCCS 0x60 的有效取值区间
-            out.append(code)
-    return out
-
-
-def _caps_power(caps):
-    """能力串里 0xD6 声明的电源模式取值（十六进制，如本机的 [1, 4, 5]）。
-
-    ⚠️ 只能当"提示"用（ddcutil 文档原话：capabilities string 经常是错的），
-    但**未声明的值绝不盲写**：MS Learn 的 SetVCPFeature 文档明确写着
-    "Many monitors don't fully implement that standard; so your use of these
-    commands might result in undefined monitor behavior"。
-    本机面板声明 D6(01 04 05) 而**不含 02（待机）**——v1.7.0 那次"屏幕黑了
-    唤不回来"的事故，就是盲写 02 落进未定义状态造成的。
-    """
-    m = re.search(r"\bD6\(([^)]*)\)", caps or "", re.I)
-    if not m:
-        return []
-    out = []
-    for tok in m.group(1).split():
-        try:
-            code = int(tok, 16)
-        except Exception:
-            continue
-        if 1 <= code <= 5:              # MCCS 0xD6 只有 01~05
-            out.append(code)
-    return out
-
-
-def monitor_model(handle, key=None):
-    """从能力串里取型号（如 'Legion R27qe Gen2'）。取不到返回 None。
-
-    传 display key（见 _display_key）走缓存；不传则实读（保持旧语义）。
-    """
-    return _caps_model(_capabilities_cached(handle, key))
-
-
-def monitor_label(index, info=None, model=None):
-    """显示器列表里那一行的文字。model 需要 DDC 往返，由后台线程补齐。"""
-    parts = []
-    if model:
-        parts.append(model)
-    if info:
-        name, w, h, primary = info
-        parts.append("%d×%d" % (w, h))
-        parts.append("主显示器" if primary else "副显示器")
-        parts.append(name)
-    if not parts:
-        parts.append("显示器 %d" % index)
-    return "%d: %s" % (index, " · ".join(parts))
-
-
-# display key（DEV#EDID）-> 0x10 的上限（多数是 100，少数 255）。按面板缓存，
-# 避免每次写都多跑一趟 DDC；换面板后 key 变化，不会沿用旧上限。
-_MAX_LUM = {}
-
-
-def _luminance_max(t):
-    key = _display_key(t)
-    if key not in _MAX_LUM:
-        got = _read_vcp(t["handle"], VCP_BRIGHTNESS)
-        _MAX_LUM[key] = got[1] if got and got[1] else 100
-    return _MAX_LUM[key]
-
-
-def _raw_from_percent(t, level):
-    """把 0-100 的亮度换算成该屏 0x10 的原始值（上限不是 100 的屏必须换算）。"""
-    mx = _luminance_max(t)
-    return level if mx == 100 else int(round(level * mx / 100.0))
-
-
-def set_brightness_many(indices, value):
-    """批量设亮度。indices 为空 → 全部显示器。返回 (成功序号, [(序号, 错误), ...])。"""
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    level = clamp_level(value)
-    ok, errs = [], []
-    try:
-        picked, bad = _select(targets, indices)
-        errs.extend(bad)
-        for t in picked:
-            if _write_vcp(t["handle"], VCP_BRIGHTNESS, _raw_from_percent(t, level)):
-                ok.append(t["index"])
-            else:
-                errs.append((t["index"], "写入失败（显示器未响应 DDC/CI）"))
-    finally:
-        release_targets(targets)
-    return ok, errs
-
-
-def get_brightness_many(indices):
-    """批量读亮度。返回 ({序号: 亮度 or None}, [(序号, 错误), ...])。"""
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    values, errs = {}, []
-    try:
-        picked, bad = _select(targets, indices)
-        errs.extend(bad)
-        for t in picked:
-            got = _read_vcp(t["handle"], VCP_BRIGHTNESS)
-            if got is None:
-                values[t["index"]] = None
-                errs.append((t["index"], "读取失败"))
-                continue
-            cur, mx = got
-            values[t["index"]] = int(round(cur * 100.0 / mx)) if mx else cur
-    finally:
-        release_targets(targets)
-    return values, errs
-
-
-# ---- 亮灭状态探测 ---------------------------------------------------------
-def probe_states(indices=None):
-    """探测每台显示器"现在亮着还是灭着"，并把判断依据一起带回去。
-
-    判据（全部是 DDC/CI 只读命令，不写任何寄存器）：
-      1) 0xD6 电源模式：1=开；2/3/4/5=待机/挂起/软关/硬关；读不到=无回读；
-      2) 0x10 亮度是否可读：能读说明面板还有供电、AUX/I2C 通道还在；
-    ⚠️ 本机 v1.5.0 事故证明：0xD6 回读在某些机型上与面板事实不符（寄存器值≠面板
-       实际状态），所以这里只把它当"证据"之一，界面会把依据一并写明，不假装能
-       100% 确定。完全读不到的屏标 unknown，而不是猜成"灭"。
-
-    返回 [{index, dev, power, brightness, state(on/off/unknown), why}]。
-    """
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    out = []
-    try:
-        picked, _bad = _select(targets, indices)
-        for t in picked:
-            pr = _read_vcp(t["handle"], VCP_POWER_MODE)
-            power = pr[0] if pr else None
-            br = _read_vcp(t["handle"], VCP_BRIGHTNESS)
-            bright = (int(round(br[0] * 100.0 / br[1])) if br[1] else br[0]) if br else None
-            if power == POWER_ON:
-                state, why = "on", "0xD6=1 开"
-            elif power in POWER_LABEL:
-                state, why = "off", "0xD6=%d %s" % (power, POWER_LABEL[power])
-            elif bright is not None:
-                state, why = "on", "亮度可读"
-            else:
-                state, why = "unknown", "DDC 无回读"
-            out.append({"index": t["index"], "dev": t["dev"], "power": power,
-                        "brightness": bright, "state": state, "why": why})
-    finally:
-        release_targets(targets)
-    return out
-
-
-def _idle_seconds():
-    """距最后一次键鼠输入的秒数；取不到返回 None。
-
-    系统级熄灭后，屏幕是被"输入"唤醒的，所以这个数字能解释
-    "记账说熄灭、屏幕却亮着"的情况（人一动鼠标就亮了，记账还没更新）。
-    """
-    class LASTINPUTINFO(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-
-    info = LASTINPUTINFO()
-    info.cbSize = ctypes.sizeof(info)
-    try:
-        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
-            return None
-        now = ctypes.windll.kernel32.GetTickCount()
-        return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
-    except Exception:
-        return None
-
-
-def _human_gap(seconds):
-    """秒数 -> '3 秒前 / 12 分钟前 / 2 小时前'。"""
-    if seconds < 60:
-        return "%d 秒前" % int(seconds)
-    if seconds < 3600:
-        return "%d 分钟前" % int(seconds // 60)
-    return "%d 小时前" % int(seconds // 3600)
-
-
-# ---- CCD 只读拓扑（拓扑模式的状态层；只查不写）-------------------------
-# 依据：Windows CCD API（QueryDisplayConfig / DisplayConfigGetDeviceInfo）。
-# 只用于"现在这块屏在不在桌面拓扑里"的判断；真正的断开/接回在阶段 E3 才接入。
-class _CcdLuid(ctypes.Structure):
-    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
-
-
-class _CcdRational(ctypes.Structure):
-    _fields_ = [("Numerator", wintypes.DWORD), ("Denominator", wintypes.DWORD)]
-
-
-class _CcdSourceInfo(ctypes.Structure):
-    _fields_ = [("adapterId", _CcdLuid), ("id", wintypes.UINT),
-                ("modeInfoIdx", wintypes.UINT), ("statusFlags", wintypes.UINT)]
-
-
-class _CcdTargetInfo(ctypes.Structure):
-    _fields_ = [("adapterId", _CcdLuid), ("id", wintypes.UINT),
-                ("modeInfoIdx", wintypes.UINT), ("outputTechnology", wintypes.UINT),
-                ("rotation", wintypes.UINT), ("scaling", wintypes.UINT),
-                ("refreshRate", _CcdRational), ("scanLineOrdering", wintypes.UINT),
-                ("targetAvailable", ctypes.c_int), ("statusFlags", wintypes.UINT)]
-
-
-class _CcdPathInfo(ctypes.Structure):
-    _fields_ = [("sourceInfo", _CcdSourceInfo), ("targetInfo", _CcdTargetInfo),
-                ("flags", wintypes.UINT)]
-
-
-class _CcdPoint(ctypes.Structure):
-    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-
-
-class _CcdSourceMode(ctypes.Structure):
-    _fields_ = [("width", wintypes.UINT), ("height", wintypes.UINT),
-                ("pixelFormat", wintypes.UINT), ("position", _CcdPoint),
-                ("reserved", wintypes.UINT)]
-
-
-class _CcdModeInfo(ctypes.Structure):
-    _fields_ = [("infoType", wintypes.UINT), ("id", wintypes.UINT),
-                ("adapterId", _CcdLuid), ("sourceMode", _CcdSourceMode),
-                ("tail", ctypes.c_uint64 * 3)]
-
-
-class _CcdInfoHeader(ctypes.Structure):
-    _fields_ = [("type", wintypes.UINT), ("size", wintypes.UINT),
-                ("adapterId", _CcdLuid), ("id", wintypes.UINT)]
-
-
-class _CcdSourceName(ctypes.Structure):
-    _fields_ = [("header", _CcdInfoHeader),
-                ("viewGdiDeviceName", wintypes.WCHAR * 32)]
-
-
-class _CcdTargetName(ctypes.Structure):
-    _fields_ = [("header", _CcdInfoHeader), ("flags", wintypes.UINT),
-                ("outputTechnology", wintypes.UINT),
-                ("edidManufactureId", wintypes.WORD),
-                ("edidProductCodeId", wintypes.WORD),
-                ("connectorInstance", wintypes.UINT),
-                ("monitorFriendlyDeviceName", wintypes.WCHAR * 64),
-                ("monitorDevicePath", wintypes.WCHAR * 128)]
-
-
-class _Ccd2D(ctypes.Structure):
-    _fields_ = [("cx", wintypes.UINT), ("cy", wintypes.UINT)]
-
-
-class _CcdVideoSignalInfo(ctypes.Structure):
-    _fields_ = [("pixelRate", ctypes.c_uint64),
-                ("hSyncFreq", _CcdRational), ("vSyncFreq", _CcdRational),
-                ("activeSize", _Ccd2D), ("totalSize", _Ccd2D),
-                ("videoStandard", wintypes.UINT),
-                ("scanLineOrdering", wintypes.UINT)]
-
-
-class _CcdTargetPreferredMode(ctypes.Structure):
-    """DISPLAYCONFIG_TARGET_PREFERRED_MODE：这块屏的首选分辨率。"""
-
-    _fields_ = [("header", _CcdInfoHeader), ("width", wintypes.UINT),
-                ("height", wintypes.UINT), ("targetMode", _CcdVideoSignalInfo)]
-
-
-_QDC_ALL_PATHS = 0x1
-_QDC_VIRTUAL_MODE_AWARE = 0x10
-_CCD_PATH_ACTIVE = 0x1
-_CCD_GET_SOURCE_NAME = 1
-_CCD_GET_TARGET_NAME = 2
-_DC_GET_TARGET_PREFERRED_MODE = 3          # DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE
-_CCD_PIXELFORMAT_NONGDI = 4                # Windows 给 source mode 用的就是它，不是 32BPP
-_CCD_EDID_IDS_VALID = 0x4          # DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.edidIdsValid
-_CCD_TARGET_IN_USE = 0x1          # DISPLAYCONFIG_TARGET_IN_USE
-
-
-def _ccd_setup_probe_api(u32):
-    """声明只读探测用到的三个 API 签名（不调用）。"""
-    u32.GetDisplayConfigBufferSizes.argtypes = [wintypes.UINT,
-                                                ctypes.POINTER(wintypes.UINT),
-                                                ctypes.POINTER(wintypes.UINT)]
-    u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
-    u32.QueryDisplayConfig.argtypes = [wintypes.UINT, ctypes.POINTER(wintypes.UINT),
-                                       ctypes.c_void_p, ctypes.POINTER(wintypes.UINT),
-                                       ctypes.c_void_p, ctypes.c_void_p]
-    u32.QueryDisplayConfig.restype = wintypes.LONG
-    u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
-    u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
-
-
-def _ccd_query_all_paths(u32, flags):
-    """QDC_ALL_PATHS 查询，缓冲区不足（122）时最多重试 4 次。
-
-    返回 (paths, modes, mc) 或 None。只读，失败一律 None。
-    """
-    paths = modes = None
-    for _ in range(4):
-        pc, mc = wintypes.UINT(), wintypes.UINT()
-        if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
-                                           ctypes.byref(mc)) != 0:
-            return None
-        paths = (_CcdPathInfo * pc.value)()
-        modes = (_CcdModeInfo * mc.value)()
-        rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
-                                    ctypes.byref(mc), ctypes.byref(modes), None)
-        if rc == 0:
-            return paths, modes, mc.value
-        if rc != 122:                 # ERROR_INSUFFICIENT_BUFFER 才重试
-            return None
-    return None
-
-
-def _ccd_rows_from_paths(u32, paths, modes, mc):
-    """把每条 path 翻成一行（同一块屏可能有多条 path，由折叠步骤处理）。"""
-    rows = []
-    for p in list(paths):
-        tgt = p.targetInfo
-        if not tgt.targetAvailable:   # 线不在 / 设备不存在：不参与状态判定
-            continue
-        tname = _CcdTargetName()
-        tname.header.type = _CCD_GET_TARGET_NAME
-        tname.header.size = ctypes.sizeof(tname)
-        tname.header.adapterId = tgt.adapterId
-        tname.header.id = tgt.id
-        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
-            continue
-        sname = _CcdSourceName()
-        sname.header.type = _CCD_GET_SOURCE_NAME
-        sname.header.size = ctypes.sizeof(sname)
-        sname.header.adapterId = p.sourceInfo.adapterId
-        sname.header.id = p.sourceInfo.id
-        u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header))
-
-        luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
-                              p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
-        if tname.flags & _CCD_EDID_IDS_VALID:
-            anchor = "%s/%04X/%04X/%d" % (luid, tname.edidManufactureId,
-                                          tname.edidProductCodeId,
-                                          tname.connectorInstance)
-        else:
-            anchor = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
-        pos = size = ""
-        smi = p.sourceInfo.modeInfoIdx >> 16
-        if smi != 0xFFFF and smi < len(modes):
-            sm = modes[smi].sourceMode
-            pos = "(%d,%d)" % (sm.position.x, sm.position.y)
-            size = "%dx%d" % (sm.width, sm.height)
-        rows.append({
-            "anchor": anchor,
-            "active": bool(p.flags & _CCD_PATH_ACTIVE),
-            "connected": True,
-            "inUse": bool(tgt.statusFlags & _CCD_TARGET_IN_USE),
-            "friendly": tname.monitorFriendlyDeviceName,
-            "gdi": sname.viewGdiDeviceName,
-            "vdd": any(k in (tname.monitorFriendlyDeviceName or "").lower()
-                       for k in ("vdd", "virtual", "iddcx")),
-            "pos": pos, "size": size,
-        })
-    return rows
-
-
-def _ccd_merge_rows_by_anchor(rows):
-    """按锚点折叠：active 的那条胜出，其余 gdi 存进 aliases。
-
-    QDC_ALL_PATHS 会为同一块屏返回多个 source（实测 233 条 path 只有 3 块屏）。
-    """
-    merged = []
-    for r in rows:
-        hit = next((x for x in merged if x["anchor"] == r["anchor"]), None)
-        if hit is None:
-            r["aliases"] = [r["gdi"]] if r["gdi"] else []
-            merged.append(r)
-            continue
-        if r["gdi"] and r["gdi"] not in hit["aliases"]:
-            hit["aliases"].append(r["gdi"])
-        if r["active"] and not hit["active"]:
-            old_aliases = hit["aliases"]
-            hit.update(r)
-            hit["aliases"] = old_aliases
-    return merged
-
-
-def ccd_probe_topology():
-    """只读返回当前桌面拓扑（含 inactive 但 targetAvailable=1 的屏）。
-
-    每项：anchor / active / connected / inUse / friendly / gdi / vdd / pos / size。
-    失败一律返回 []（只读探测不能拖垮 CLI 或 GUI）。
-    实测开销：QDC_ALL_PATHS 约 0.1ms（233 条 path）。
-    """
-
-    if os.name != "nt":
-        return []
-    try:
-        u32 = ctypes.windll.user32
-        _ccd_setup_probe_api(u32)
-        got = _ccd_query_all_paths(u32, _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE)
-        if not got:
-            return []
-        paths, modes, mc = got
-        return _ccd_merge_rows_by_anchor(
-            _ccd_rows_from_paths(u32, paths, modes, mc))
-    except Exception:
-        return []
-
-
-def topology_state_for(cfg, rows=None):
-    """把拓扑行折叠成一句状态；只认 monitor_anchors，没配置就不猜。
-
-    判据（官方定义）：ACTIVE=1 表示 Windows 正在这条 path 上输出；
-    targetAvailable=1 表示设备仍连接（被禁用也仍是 1）。
-    官方文档另外说明拔线瞬间可能出现 ACTIVE=1 但 targetAvailable=0（瞬时），
-    这种路径已被 ccd_probe_topology() 过滤，不会误判成"显示中"。
-    """
-    if rows is None:
-        rows = ccd_probe_topology()
-    anchors = [str(a) for a in (cfg.get("monitor_anchors") or [])]
-    if anchors:
-        rows = [r for r in rows if r["anchor"] in anchors and not r["vdd"]]
-    else:
-        rows = [r for r in rows if not r["vdd"]]
-    if not rows:
-        return {"state": "unknown", "detail": "拓扑里没有匹配的物理屏（未配置锚点？）",
-                "rows": []}
-    active = [r for r in rows if r["active"]]
-    if active:
-        state = "on"
-        detail = "拓扑 ACTIVE=%d/%d" % (len(active), len(rows))
-    else:
-        state = "off"
-        detail = "拓扑 inactive=%d/%d，设备仍连接" % (len(rows), len(rows))
-    return {"state": state, "detail": detail, "rows": rows}
-
-
-def screen_verdict(cfg, probes=None):
-    """给出"屏幕现在是亮还是灭"的结论 + 一行依据——**只依据当场读到的信号**。
-
-    ⚠️ v2.01.0 设计纠偏：程序**不维护任何屏幕状态账**。
-    拓扑和系统才是唯一事实源，每次要结论就现场读，读不到就说"不知道"：
-
-      topology  → CCD 的 ACTIVE flag 是系统事实，直接当结论（on/off/unknown）。
-      system /  → Windows 没有公开可靠的"显示器电源"读取接口，
-      ddc          实测 `0xD6` 在面板已黑时仍报 1（会撒谎）。
-                   所以：
-                     · 读到 0xD6=2/3/4/5 → 可信地说明它待机了 → off
-                       （0xD6 只会假阴性，不会假阳性）
-                     · 其余情况 → unknown，把读到的寄存器、上次输入距今时间
-                       摊开给用户自己判断
-                   给个假结论比说"不知道"更糟：v1.5.0 就是
-                   "程序说亮着、屏幕其实黑着"。
-
-    返回 {"state": "on"/"off"/"unknown", "text": "...", "detail": "..."}。
-    """
-    if cfg.get("screen_off_method") == "topology":
-        try:
-            topo = topology_state_for(cfg)
-        except Exception as e:
-            topo = {"state": "unknown", "detail": "拓扑读取失败：%s" % e, "rows": []}
-        state = topo["state"]
-        if state == "on":
-            text = "屏幕：显示中（拓扑）"
-            tail = "物理电源键、Windows 自动熄屏不在拓扑追踪范围内"
-        elif state == "off":
-            text = "屏幕：已断开（拓扑）"
-            tail = "接回时按当前拓扑现算，再写亮度"
-        else:
-            text = "屏幕：状态未知（拓扑）"
-            tail = topo["detail"]
-        return {"state": state, "text": text,
-                "evidence": topo["detail"],
-                "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else "")}
-
-    if probes is None:
-        try:
-            probes = probe_states()
-        except Exception:
-            probes = []
-    idle = _idle_seconds()
-    offs = [p for p in (probes or []) if p.get("state") == "off"]
-
-    if offs:
-        state = "off"
-        text = "屏幕：已熄灭（DDC 报待机）"
-        tail = "点「点亮屏幕」恢复；键鼠输入未必唤得回来"
-    else:
-        state = "unknown"
-        text = "屏幕：状态未知"
-        tail = "Windows 没有可靠的显示器电源读取接口，亮灭请以眼睛为准"
-
-    bits = []
-    if probes:
-        # 原始寄存器值留给 --probe / --diag，结论行只给人话
-        bits.append("DDC 回读 %s"
-                    % "、".join("%d=%s" % (p["index"],
-                                          {"on": "开", "off": "灭"}.get(p["state"], "未知"))
-                                for p in probes))
-    else:
-        bits.append("DDC 无回读")
-    if idle is not None:
-        bits.append("上次输入 %s" % ("刚发生" if idle < 2 else _human_gap(idle)))
-    evidence = " · ".join(bits)
-    return {"state": state, "text": text, "evidence": evidence,
-            "detail": "依据：" + evidence + ("｜" + tail if tail else "")}
-
-
-# ---- 拓扑动作层（E3）-----------------------------------------------------
-# 只服务于 screen_off_method == "topology"；默认 ddc / system 的路径完全不经过这里。
-# 事实依据见 docs/拓扑探针.md C2–C5：
-#   - 副屏断开 rc=0 / 805ms，接回 986ms（含进程启动）；
-#   - 主屏断开 rc=87，Windows 不允许直接移除主屏；
-#   - inactive 时 DDC 读不到，所以「点亮」必须先恢复拓扑、再写亮度；
-#   - 回读失败时原始字节快照可原样恢复（C5 强制失败实验验证过）。
-# 快照落在 %APPDATA%\MonitorBrightness\topology-snapshot.json（仓库外，不入库）。
-_SDC_USE_SUPPLIED = 0x00000020
-_SDC_APPLY = 0x00000080
-_SDC_SAVE_TO_DATABASE = 0x00000200
-_SDC_ALLOW_CHANGES = 0x00000400
-_SDC_VIRTUAL_MODE_AWARE = 0x00008000
-_CCD_APPLY_FLAGS = (_SDC_USE_SUPPLIED | _SDC_APPLY | _SDC_SAVE_TO_DATABASE |
-                    _SDC_ALLOW_CHANGES | _SDC_VIRTUAL_MODE_AWARE)
-_CCD_MODE_IDX_INVALID = 0xFFFFFFFF
-TOPO_VERIFY_TIMEOUT = 2.0          # D3：接回回读有界轮询 ≤2s
-
-
-def _ccd_api():
-    """拿一份声明好函数签名的 user32；非 Windows 返回 None。"""
-    if os.name != "nt":
-        return None
-    u32 = ctypes.windll.user32
-    u32.GetDisplayConfigBufferSizes.argtypes = [
-        wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)]
-    u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
-    u32.QueryDisplayConfig.argtypes = [
-        wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.c_void_p,
-        ctypes.POINTER(wintypes.UINT), ctypes.c_void_p, ctypes.c_void_p]
-    u32.QueryDisplayConfig.restype = wintypes.LONG
-    u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
-    u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
-    return u32
-
-
-def _ccd_query_raw(u32=None):
-    """返回 (paths, modes, pc, mc, rows)；失败返回 None。
-
-    rows 每条 path 一项（不折叠）：anchor / active / connected / gdi /
-    friendly / vdd / pathIndex。paths + modes 是原始字节快照的来源。
-    """
-    u32 = u32 if u32 is not None else _ccd_api()
-    if u32 is None:
-        return None
-    flags = _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE
-    for _ in range(4):
-        pc, mc = wintypes.UINT(), wintypes.UINT()
-        if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
-                                           ctypes.byref(mc)) != 0:
-            return None
-        paths = (_CcdPathInfo * pc.value)()
-        modes = (_CcdModeInfo * mc.value)()
-        rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
-                                    ctypes.byref(mc), ctypes.byref(modes), None)
-        if rc == 0:
-            break
-        if rc != 122:                  # ERROR_INSUFFICIENT_BUFFER 才重试
-            return None
-    else:
-        return None
-
-    rows = []
-    for i, p in enumerate(list(paths)):
-        tgt = p.targetInfo
-        item = {"pathIndex": i, "anchor": "",
-                "active": bool(p.flags & _CCD_PATH_ACTIVE),
-                "connected": bool(tgt.targetAvailable),
-                # 接回时要现算 modeInfoIdx，必须知道这条 path 用哪个 source/target。
-                # srcId 是 adapter 内的独占资源：已被 ACTIVE 占用的 id 不能再置 ACTIVE。
-                # 判断"占没占用"必须带 adapter —— source id 只在 adapter 内唯一，
-                # 混着比会把另一块显卡上的空闲 source 误判成被占（VDD 就是例子）。
-                "srcId": int(p.sourceInfo.id), "tgtId": int(tgt.id),
-                "luidLow": int(p.sourceInfo.adapterId.LowPart) & 0xFFFFFFFF,
-                "luidHigh": int(p.sourceInfo.adapterId.HighPart) & 0xFFFFFFFF,
-                "tgtAdapterLow": int(tgt.adapterId.LowPart) & 0xFFFFFFFF,
-                "tgtAdapterHigh": int(tgt.adapterId.HighPart) & 0xFFFFFFFF,
-                "srcModeInfoIdx": int(p.sourceInfo.modeInfoIdx),
-                "tgtModeInfoIdx": int(tgt.modeInfoIdx),
-                "gdi": "", "friendly": "", "vdd": False}
-        if not tgt.targetAvailable:
-            rows.append(item)
-            continue
-        tname = _CcdTargetName()
-        tname.header.type = _CCD_GET_TARGET_NAME
-        tname.header.size = ctypes.sizeof(tname)
-        tname.header.adapterId = tgt.adapterId
-        tname.header.id = tgt.id
-        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
-            rows.append(item)
-            continue
-        luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
-                              p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
-        if tname.flags & _CCD_EDID_IDS_VALID:
-            item["anchor"] = "%s/%04X/%04X/%d" % (
-                luid, tname.edidManufactureId, tname.edidProductCodeId,
-                tname.connectorInstance)
-        else:
-            item["anchor"] = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
-        item["friendly"] = tname.monitorFriendlyDeviceName
-        item["vdd"] = any(k in (tname.monitorFriendlyDeviceName or "").lower()
-                          for k in ("vdd", "virtual", "iddcx"))
-        sname = _CcdSourceName()
-        sname.header.type = _CCD_GET_SOURCE_NAME
-        sname.header.size = ctypes.sizeof(sname)
-        sname.header.adapterId = p.sourceInfo.adapterId
-        sname.header.id = p.sourceInfo.id
-        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header)) == 0:
-            item["gdi"] = sname.viewGdiDeviceName
-        rows.append(item)
-    return paths, modes, pc.value, mc.value, rows
-
-
-def _ccd_slice_bytes(arr, count):
-    """只取数组**前 count 个元素**的原始字节。
-
-    ⚠️ 不能用 `bytes(arr)`：`GetDisplayConfigBufferSizes` 给的是"够用的上限"
-    （本机 modes 要 699 条），而 `QueryDisplayConfig` 只填真正用到的那些
-    （本机 6 条）并把计数改回 6。整个数组一起存，长度就和 count 对不上，
-    回滚时 memmove 会越界写坏堆 —— 实测表现为最后在某个 print 里段错误。
-    """
-    if count <= 0:
-        return b""
-    elem = ctypes.sizeof(arr) // max(1, len(arr))
-    return ctypes.string_at(ctypes.addressof(arr), elem * int(count))
-
-
-def _ccd_make_snapshot(paths, modes, pc, mc, target_anchors):
-    """把 CCD 原始字节打包成**内存内**回滚快照（用完即弃，绝不落盘）。"""
-    return {
-        "created": datetime.now().isoformat(timespec="seconds"),
-        "note": "CCD 快照；pathsHex/modesHex 为原始 ctypes 字节，仅用于本次操作失败回滚",
-        "pathCount": int(pc), "modeCount": int(mc),
-        "pathsHex": _ccd_slice_bytes(paths, pc).hex(),
-        "modesHex": _ccd_slice_bytes(modes, mc).hex(),
-        "targetAnchors": list(target_anchors),
-    }
-
-
-def _ccd_apply(u32, paths, modes, pc, mc):
-    """提交拓扑变更（带 SAVE_TO_DATABASE），原样返回 Windows 错误码。"""
-    u32.SetDisplayConfig.argtypes = [
-        wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
-    u32.SetDisplayConfig.restype = wintypes.LONG
-    rc = u32.SetDisplayConfig(pc, ctypes.byref(paths), mc, ctypes.byref(modes),
-                              _CCD_APPLY_FLAGS)
-    dlog("ccd.apply", pc=pc, mc=mc, flags="0x%08X" % _CCD_APPLY_FLAGS, rc=rc)
-    return rc
-
-
-def _ccd_restore_from_bytes(u32, snap):
-    """回读失败后的唯一一次回滚：原样写回动作前的完整字节快照。
-
-    从 hex 重新构造数组，绝不复用调用方已被改过的 paths/modes。
-    **长度对不上就一个字都不写**：宁可少一次回滚，也不要越界写坏堆。
-    """
-    paths = (_CcdPathInfo * int(snap["pathCount"]))()
-    modes = (_CcdModeInfo * int(snap["modeCount"]))()
-    pb = bytes.fromhex(snap["pathsHex"])
-    mb_ = bytes.fromhex(snap["modesHex"])
-    if len(pb) != ctypes.sizeof(paths) or len(mb_) != ctypes.sizeof(modes):
-        return -1                    # 快照与数组形状不符：拒绝提交
-    if len(pb):
-        ctypes.memmove(ctypes.byref(paths), pb, len(pb))
-    if len(mb_):
-        ctypes.memmove(ctypes.byref(modes), mb_, len(mb_))
-    return _ccd_apply(u32, paths, modes, snap["pathCount"], snap["modeCount"])
-
-
-def _ccd_wait_state(anchors, expect_active, timeout=TOPO_VERIFY_TIMEOUT, probe=None,
-                    allow_vdd=False):
-    """有界轮询回读；**目标每一个**都达到 expect_active 才算成功。
-
-    v2.01.0 修：原来只要"存在的那些都符合"就返回 True，多屏接回时
-    少接回来一块也会报成功。现在要求 wanted 全部出现在回读结果里且状态一致。
-
-    `allow_vdd=True` 给"交接主屏给虚拟显示器"用：平时 VDD 不算目标，
-    但那一刻它就是接班屏，必须看到它 ACTIVE。
-    """
-    probe = probe or ccd_probe_topology
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    wanted = set(anchors or [])
-    while True:
-        try:
-            rows = [r for r in probe()
-                    if r.get("anchor") in wanted
-                    and (allow_vdd or not r.get("vdd"))]
-        except Exception:
-            rows = []
-        got = {r.get("anchor") for r in rows}
-        if wanted and wanted <= got and all(
-                bool(r.get("active")) == bool(expect_active) for r in rows):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-
-
-def topology_plan_off(indices, rows, primary_gdis=None, dev_to_index=None, heir=None):
-    """纯函数：算出把这些屏从拓扑里摘掉要动哪些 path，**必要时交接主屏**。
-
-    Windows 没有"设置主显示器"的 API —— 主屏就是桌面原点 (0,0) 所在的那块屏，
-    而且不允许把它从拓扑里摘掉（实测 rc=87）。所以想断开主屏，只能先把 (0,0)
-    让给别人：接班屏平移到 (0,0)、其余屏跟着平移（相对布局不变），再摘原主屏。
-    这条路径在真机上验过（scripts/topology_handover_probe.py，SDC_VALIDATE 只读）：
-
-      | 做法 | rc |
-      |---|---|
-      | 只改 source mode 的 position | 0 |
-      | 接班屏移到 (0,0) + 摘掉原主屏 | 0 |
-      | VDD 当主屏 + 物理屏全摘（串流形态） | 0 |
-
-    护栏：VDD 永不作**断开目标**；断开后桌面必须还剩至少一块屏（否则黑屏）。
-
-    返回 (plan, errs, noop)，plan =
-      {"off": [锚点...],                 # 要摘掉的（可能包含当前主屏）
-       "heir": 锚点 or None,             # 接班当主屏的那块；None = 主屏不动
-       "heir_active": bool}              # False 表示它当前断着，需要先接回
-    平移量不在这里算 —— 要读 source mode，由 topology_off 按 hire 的位置算。
-    """
-    primary = {_short_dev(g) for g in (primary_gdis or [])}
-    idx = set(normalize_indices(indices))
-    wanted_names = None
-    if dev_to_index is not None:
-        wanted_names = {_short_dev(name) for name, i in dev_to_index.items()
-                        if i in idx} if idx else None
-    selected = []
-    for r in rows:
-        if r.get("vdd") or not r.get("anchor"):
-            continue
-        if wanted_names is not None:
-            # 只认 ACTIVE 的 source：aliases 里两块屏会互相混进 DISPLAYn，
-            # 拿它做选择匹配会把「只勾主屏」误判成「勾了副屏」。
-            if _short_dev(r.get("gdi")) not in wanted_names:
-                continue
-        elif idx and r.get("index") not in idx:
-            continue
-        selected.append(r)
-
-    off = []
-    for r in selected:
-        if r.get("active") and r["anchor"] not in off:
-            off.append(r["anchor"])
-    if not off:
-        if selected:
-            return {"off": [], "heir": None, "heir_active": False}, [], True
-        return ({"off": [], "heir": None, "heir_active": False},
-                ["没有可断开的屏（VDD 不作目标，未连接的屏也断不了）"], False)
-
-    # 当前主屏（摆在 0,0 的那块）在不在这次要摘的名单里？
-    cur_primary = [r["anchor"] for r in rows
-                   if r.get("active") and r.get("connected")
-                   and _short_dev(r.get("gdi")) in primary]
-    must_handover = any(a in off for a in cur_primary)
-    if not must_handover:
-        return {"off": off, "heir": None, "heir_active": False}, [], False
-
-    # 候选接班屏：连着、且不在这次要摘的名单里
-    cands = [r for r in rows
-             if r.get("connected") and r.get("anchor")
-             and r["anchor"] not in off]
-    if heir:
-        if not any(r["anchor"] == heir for r in cands):
-            return ({"off": [], "heir": None, "heir_active": False},
-                    ["指定接班的屏不在了（可能刚被拔掉），请重新选择"], False)
-        pick = next(r for r in cands if r["anchor"] == heir)
-    else:
-        if not cands:
-            return ({"off": [], "heir": None, "heir_active": False},
-                    ["断开后桌面上就一块屏都不剩（会黑屏），Windows 不允许。\n"
-                     "先留一块屏当主显示器，或把虚拟显示器接上再试。"], False)
-        # 自动选：优先物理屏（用户看得见），再考虑虚拟屏
-        phys = [r for r in cands if not r.get("vdd")]
-        pick = (phys or cands)[0]
-
-    heir_active = bool(pick.get("active"))
-    # 平移量要读 source mode，纯函数里拿不到 —— 由 topology_off 按 hire 的位置算
-    return ({"off": off, "heir": pick["anchor"], "heir_active": heir_active},
-            [], False)
-
-
-def _fold_raw_rows(raw_rows):
-    """把逐 path 的原始行按锚点折叠（同一块屏的多个 source 算一块）。"""
-    rows = []
-    for r in raw_rows:
-        hit = next((x for x in rows if x["anchor"] == r["anchor"]), None)
-        if hit is None:
-            rows.append(dict(r, aliases=[r["gdi"]] if r["gdi"] else []))
-        else:
-            if r["gdi"] and r["gdi"] not in hit["aliases"]:
-                hit["aliases"].append(r["gdi"])
-            if r["active"] and not hit["active"]:
-                hit["active"] = True
-    return rows
-
-
-# ---- 声明式接回（v2.01.0）------------------------------------------------
-# ⚠️ 设计纠偏：接回**不再恢复"断开前的历史快照"**。
-# 快照是"过去某一刻的整份拓扑字节"，一旦期间用户在 Windows 设置里改过排布、
-# 分辨率、主屏，恢复旧快照会把这些改动全部覆盖掉——这正是"程序自己维护状态"
-# 的典型错误。程序的职责只是「读当前拓扑 + 把要用的屏加回当前拓扑」。
-#
-# 现算依据（2026-11-27 真机实测，scripts/topo-declarative-probe.py --verify）：
-#   DISPLAYCONFIG_PATH_SOURCE_INFO.modeInfoIdx = (sourceModeIdx << 16) | 0xFFFF
-#   DISPLAYCONFIG_PATH_TARGET_INFO.modeInfoIdx = (targetModeIdx << 16) | desktopModeIdx
-#   按 (infoType, id) 在**当前** modes 数组里查，得到的三元组与 Windows 自己填的
-#   值逐位一致（path#0 0x0001FFFF/0x00000002、path#1 0x0004FFFF/0x00030005）。
-_CCD_TYPE_SOURCE = 1        # DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
-_CCD_TYPE_TARGET = 2        # DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
-_CCD_TYPE_DESKTOP = 3       # DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE
-
-
-def _ccd_mode_entries(modes, mc):
-    """把 modes 数组摘成 [(下标, infoType, id, adapterLow)]，供纯函数现算 modeInfoIdx。"""
-    out = []
-    for i in range(max(0, min(int(mc or 0), len(modes)))):
-        m = modes[i]
-        out.append((i, int(m.infoType), int(m.id),
-                    int(m.adapterId.LowPart) & 0xFFFFFFFF))
-    return out
-
-
-def _ccd_pick_mode(entries, info_type, ident, luid_low=None):
-    """按 (infoType, adapter, id) 找 mode 下标；找不到返回 None。
-
-    **必须带 adapter**：source/target id 只在 adapter 内唯一，不同显卡上撞 id
-    很常见（本机 VDD 的 src=0 与物理屏的 src=0 就撞了）。不带 adapter 会挑中
-    另一块显卡的 mode 项，提交必然 rc=87 —— 这正是 v2.01.2 前"借用别的屏的
-    source mode → 87"的真身。
-
-    entries 里没有 adapter 字段时（老的三元组）不做 adapter 过滤，向后兼容。
-    """
-    for e in entries:
-        if len(e) < 3:
-            continue
-        if int(e[1]) != info_type or int(e[2]) != int(ident):
-            continue
-        if luid_low is not None and len(e) > 3 and int(e[3]) != int(luid_low):
-            continue
-        return int(e[0])
-    return None
-
-
-def topology_plan_on(anchors, rows, mode_entries, allow_vdd=False):
-    """纯函数：算出「把 anchors 里的屏加回**当前**拓扑」要动哪几条 path。
-
-    全部输入都是本次现读的：rows=_ccd_query_raw 的逐 path 行，
-    mode_entries=当前 modes 数组摘要。不读快照、不记历史。
-
-    护栏：
-      - 只认 connected 的 path（拔了线的接不回来）；
-      - VDD 永不作目标；
-      - 已 ACTIVE 的锚点直接跳过（幂等：接两次和接一次结果一样）；
-      - source id 是 **adapter 内**独占资源，只挑没被同 adapter 的 ACTIVE path 占用的；
-      - source mode 缺失**不算错误**：真实断开后 Windows 一定会把它从 modes 数组
-        里摘掉，这时标记 `makeSourceMode`，由调用方现造一条补进去
-        （`_ccd_append_source_mode`；置 INVALID 必 rc=87）。
-
-    返回 (plan, errs, noop)。plan 每项含 pathIndex/anchor/srcId/tgtId/三个 modeIdx
-    以及 `makeSourceMode`（True 表示 sourceModeIdx 为 None，需要现造）。
-    target/desktop 可能为 None，表示交给 Windows 定。
-
-    `allow_vdd=True` 只给验证脚本用：VDD 是"连着但整块不在拓扑里"的现成样本，
-    拿它跑一次真接回就能验完整条链路，而不会碰到任何物理屏。产品路径永不传。
-    """
-    wanted = [str(a) for a in (anchors or []) if a]
-    rows = list(rows or [])
-    used = {(int(r.get("luidLow", 0)), int(r["srcId"])) for r in rows
-            if r.get("active") and r.get("connected") and r.get("srcId") is not None}
-    plan, errs = [], []
-    for anchor in wanted:
-        mine = [r for r in rows if r.get("anchor") == anchor and r.get("connected")]
-        if not mine:
-            errs.append("锚点 %s 在拓扑里没有已连接的 path（可能已拔线）" % anchor)
-            continue
-        if any(r.get("vdd") for r in mine) and not allow_vdd:
-            errs.append("虚拟屏 %s 不作接回目标" % anchor)
-            continue
-        if any(r.get("active") for r in mine):
-            continue                       # 已经亮着：no-op
-        key = lambda r: (int(r.get("luidLow", 0)), int(r["srcId"]))
-        free = [r for r in mine if key(r) not in used]
-        if not free:
-            errs.append("锚点 %s 没有空闲 source（全被其它屏占用）" % anchor)
-            continue
-        # 确定性：source id 最小 → pathIndex 最小。不依赖"上次用的是哪条"。
-        pick = min(free, key=lambda r: (int(r["srcId"]), int(r["pathIndex"])))
-        smode = _ccd_pick_mode(mode_entries, _CCD_TYPE_SOURCE, pick["srcId"],
-                               pick.get("luidLow"))
-        plan.append({
-            "pathIndex": int(pick["pathIndex"]), "anchor": anchor,
-            "srcId": int(pick["srcId"]), "tgtId": int(pick["tgtId"]),
-            "luidLow": int(pick.get("luidLow", 0)),
-            "luidHigh": int(pick.get("luidHigh", 0)),
-            "tgtAdapterLow": int(pick.get("tgtAdapterLow", 0)),
-            "tgtAdapterHigh": int(pick.get("tgtAdapterHigh", 0)),
-            "sourceModeIdx": smode,
-            # 真实断开后 source mode 必然不在 modes 数组里 → 由调用方现造一条
-            "makeSourceMode": smode is None,
-            "targetModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_TARGET,
-                                            pick["tgtId"], pick.get("tgtAdapterLow")),
-            "desktopModeIdx": _ccd_pick_mode(mode_entries, _CCD_TYPE_DESKTOP,
-                                             pick["tgtId"], pick.get("tgtAdapterLow")),
-        })
-        used.add((int(pick.get("luidLow", 0)), int(pick["srcId"])))
-    return plan, errs, (not plan and not errs)
-
-
-def _ccd_preferred_size(u32, adapter_low, adapter_high, target_id):
-    """问 Windows：这块屏的首选分辨率。查不到返回 None。"""
-    info = _CcdTargetPreferredMode()
-    info.header.type = _DC_GET_TARGET_PREFERRED_MODE
-    info.header.size = ctypes.sizeof(info)
-    info.header.adapterId.LowPart = int(adapter_low) & 0xFFFFFFFF
-    info.header.adapterId.HighPart = int(adapter_high)
-    info.header.id = int(target_id)
-    if u32.DisplayConfigGetDeviceInfo(ctypes.byref(info.header)) != 0:
-        return None
-    w, h = int(info.width), int(info.height)
-    return (w, h) if w and h else None
-
-
-def _ccd_live_size(rows, paths, modes):
-    """兜底尺寸：抄一块**正在用**的屏的 source mode。
-
-    同机同型号很常见；比硬编码 1920x1080 更可能被 Windows 接受。
-    一块都没有才退回 1920x1080。
-    """
-    for r in rows or []:
-        if not (r.get("active") and r.get("connected")):
-            continue
-        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
-        if idx == _CCD_MODE_IDX_INVALID:
-            continue
-        src = (idx >> 16) & 0xFFFF
-        if src >= len(modes):
-            continue
-        sm = modes[src].sourceMode
-        if sm.width and sm.height:
-            return int(sm.width), int(sm.height)
-    return 1920, 1080
-
-
-def _ccd_layout_rects(rows, paths, modes):
-    """当前桌面上每块活动屏的 (x, y, w, h)。"""
-    return list(_ccd_layout_by_anchor(rows, paths, modes).values())
-
-
-def _ccd_layout_by_anchor(rows, paths, modes):
-    """{锚点: (x, y, w, h)} —— 当前桌面上每块活动屏的位置。"""
-    out = {}
-    for r in rows or []:
-        if not (r.get("active") and r.get("connected")):
-            continue
-        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
-        if idx == _CCD_MODE_IDX_INVALID:
-            continue
-        src = (idx >> 16) & 0xFFFF
-        if src >= len(modes):
-            continue
-        sm = modes[src].sourceMode
-        if sm.width and sm.height:
-            out[r["anchor"]] = (int(sm.position.x), int(sm.position.y),
-                                int(sm.width), int(sm.height))
-    return out
-
-
-def _ccd_free_origin(rows, paths, modes):
-    """当前桌面最右边的 x —— 接回时"没记住原位置"的兜底落点。"""
-    rects = _ccd_layout_rects(rows, paths, modes)
-    return max([r[0] + r[2] for r in rects] or [0])
-
-
-def _ccd_place(want_xy, w, h, rects):
-    """给一块要接回的屏决定桌面位置：优先摆回**原位置**，重叠才退回最右边。
-
-    **重叠必须避免**：实测把新屏放在 (0,0) 与主屏重叠，`SetDisplayConfig`
-    直接 rc=87，接不回来。所以"摆回原位"和"不重叠"冲突时，宁可换位置。
-
-    原位置来自 `cfg["monitor_positions"]`（断开前抓的一次快照），没有就用
-    桌面最右边 —— 与 Windows 自己点「扩展这些显示器」的行为一致。
-    """
-    if want_xy is not None:
-        x, y = int(want_xy[0]), int(want_xy[1])
-        clash = any(x < rx + rw and rx < x + w and y < ry + rh and ry < y + h
-                    for rx, ry, rw, rh in rects)
-        if not clash:
-            return x, y
-    return max([rx + rw for rx, _ry, rw, _rh in rects] or [0]), 0
-
-
-# ============================================================================
-# 窗口跟随（v2.01.9）
-# ----------------------------------------------------------------------------
-# 拓扑一变，Windows 会把各应用的窗口挤到"还能显示"的地方，而且**不会**在
-# 拓扑恢复后搬回来。用户看到的就是"一改显示器设置，窗口全乱了"。
-#
-# 这里只在**一次操作内**做：动作前记下每个窗口属于哪块屏，动作后按这块屏的
-# 平移量把窗口跟着搬。不落盘、不跨操作 —— 跨操作记录会跟用户后来的手动摆放
-# 打架（他挪过的窗口会被我们又搬回去）。
-# ============================================================================
-_SWP_NOSIZE = 0x0001
-_SWP_NOZORDER = 0x0004
-_SWP_NOACTIVATE = 0x0010
-_GWL_EXSTYLE = -20
-_WS_EX_TOOLWINDOW = 0x00000080
-_WS_EX_NOACTIVATE = 0x08000000
-
-
-class _WinRect(ctypes.Structure):
-    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-
-def _user32():
-    return ctypes.windll.user32 if os.name == "nt" else None
-
-
-def _window_rect(u32, hwnd):
-    r = _WinRect()
-    if not u32.GetWindowRect(hwnd, ctypes.byref(r)):
-        return None
-    return (int(r.left), int(r.top),
-            int(r.right - r.left), int(r.bottom - r.top))
-
-
-def iter_app_windows(u32=None):
-    """枚举"用户看得见的应用窗口"。
-
-    排除：不可见、最小化、无标题、工具窗/不激活窗（输入法、悬浮条）、
-    本进程自己的窗口。收起的窗口不碰 —— 动它等于把它还原，那是另一回事。
-    """
-    u32 = u32 or _user32()
-    if u32 is None:
-        return []
-    out = []
-    me = os.getpid()
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _cb(hwnd, _lp):
-        try:
-            if not u32.IsWindowVisible(hwnd) or u32.IsIconic(hwnd):
-                return True
-            if u32.GetWindowTextLengthW(hwnd) == 0:
-                return True
-            ex = u32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-            if ex & (_WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE):
-                return True
-            pid = wintypes.DWORD()
-            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value == me:
-                return True
-            out.append(int(hwnd))
-        except Exception:
-            pass
-        return True
-
-    u32.EnumWindows(_cb, 0)
-    return out
-
-
-def win_snapshot(layout, u32=None):
-    """记下每个应用窗口现在落在哪块屏上。layout = {锚点: (x, y, w, h)}。"""
-    u32 = u32 or _user32()
-    if u32 is None or not layout:
-        return []
-    snap = []
-    for hwnd in iter_app_windows(u32):
-        rect = _window_rect(u32, hwnd)
-        if not rect:
-            continue
-        cx, cy = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
-        for anchor, (x, y, w, h) in layout.items():
-            if x <= cx < x + w and y <= cy < y + h:
-                snap.append({"hwnd": hwnd, "rect": rect, "anchor": anchor})
-                break
-    return snap
-
-
-def win_follow(snap, shift, dropped, u32=None):
-    """按屏的平移量把窗口搬到新位置；所在屏没了的不动（交给 Windows）。
-
-    只改位置不改大小，并且**只在窗口确实被挪走时才动**：如果它已经在目标
-    位置，说明 Windows 没碰它，我们也不碰。
-    """
-    u32 = u32 or _user32()
-    if u32 is None or not snap or tuple(shift) == (0, 0):
-        return 0
-    dropped = set(dropped or ())
-    moved = 0
-    for it in snap:
-        if it["anchor"] in dropped:
-            continue
-        hwnd = it["hwnd"]
-        try:
-            if not u32.IsWindow(hwnd):
-                continue
-            want = (it["rect"][0] + shift[0], it["rect"][1] + shift[1])
-            cur = _window_rect(u32, hwnd)
-            if cur is None or (cur[0], cur[1]) == want:
-                continue
-            u32.SetWindowPos(hwnd, 0, want[0], want[1], 0, 0,
-                             _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
-            moved += 1
-        except Exception:
-            continue
-    return moved
-
-
-def _ccd_append_source_mode(modes, mc, adapter_low, adapter_high, source_id,
-                            width, height, x, y):
-    """在 modes 数组末尾**追加**一条 SOURCE mode 项，返回 (新数组, 新下标)。
-
-    为什么必须自己造：一块屏被断开之后，Windows 就把它从 modes 数组里摘掉了，
-    接回时没有任何下标可引用（引用 INVALID 必 rc=87）。实测只有这条路能过：
-
-      | 做法                                   | rc |
-      |----------------------------------------|----|
-      | source = INVALID                        | 87 |
-      | 借用别的屏的 source mode 项             | 87 |
-      | 自己补一条（pf=NONGDI，位置不重叠）     | 0  |
-      | 自己补一条但 pf=32BPP                   | 87 |
-      | 自己补一条但位置 (0,0) 与主屏重叠       | 87 |
-
-    pixelFormat 必须是 `DISPLAYCONFIG_PIXELFORMAT_NONGDI(4)` —— Windows 自己给
-    source mode 填的就是 4，填 32BPP(3) 会被拒。证据：scripts/topology_mode_synthesis.py
-    """
-    out = (_CcdModeInfo * (mc + 1))()
-    ctypes.memmove(ctypes.byref(out), ctypes.byref(modes),
-                   ctypes.sizeof(_CcdModeInfo) * mc)
-    i = mc
-    out[i].infoType = _CCD_TYPE_SOURCE
-    out[i].id = int(source_id)
-    out[i].adapterId.LowPart = int(adapter_low) & 0xFFFFFFFF
-    out[i].adapterId.HighPart = int(adapter_high)
-    out[i].sourceMode.width = int(width)
-    out[i].sourceMode.height = int(height)
-    out[i].sourceMode.pixelFormat = _CCD_PIXELFORMAT_NONGDI
-    out[i].sourceMode.position.x = int(x)
-    out[i].sourceMode.position.y = int(y)
-    return out, i
-
-
-def _ccd_capture_positions(anchors, paths, modes, mc, rows):
-    """记下这些屏**此刻**的桌面位置与尺寸，供下次接回摆回原位。
-
-    只在"断开之前"调用 —— 断开之后 Windows 会把该屏的 mode 项摘掉，
-    位置就再也读不到了。
-
-    为什么这不是"状态账"：它存的是摆放偏好，且每次断开前都按当下的真实值
-    重写。用户在 Windows 里把屏挪到左边，这里下一次就变成左边，不会像
-    "上次操作结果"那样越用越离谱。
-    """
-    want = set(anchors or [])
-    out = {}
-    for r in rows or []:
-        if r.get("anchor") not in want or not r.get("active") or r.get("vdd"):
-            continue
-        idx = int(paths[int(r["pathIndex"])].sourceInfo.modeInfoIdx)
-        if idx == _CCD_MODE_IDX_INVALID:
-            continue
-        src = (idx >> 16) & 0xFFFF
-        if src >= int(mc or 0) or src >= len(modes):
-            continue
-        sm = modes[src].sourceMode
-        if not (sm.width and sm.height):
-            continue
-        out[r["anchor"]] = [int(sm.position.x), int(sm.position.y),
-                            int(sm.width), int(sm.height)]
-    return out
-
-
-def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan, want=None):
-    """给 plan 里 source mode 已缺失的项**现造**一条补进 modes 数组。
-
-    真实断开后这是常态而非异常（Windows 会把断开屏的 SOURCE mode 从 modes
-    数组里摘掉），所以不能报错，只能自己补。返回 (新 modes 数组, 新计数)。
-
-    尺寸：`want` 里记着就照记着的（保真），否则问首选分辨率，再不行抄一块
-    正在用的屏；
-    位置：`want` 里记着就摆回原位（不与现有屏重叠的前提下），否则桌面最右边。
-    """
-    need = [it for it in plan if it.get("makeSourceMode")]
-    if not need:
-        return modes, mc
-    want = want or {}
-    rects = _ccd_layout_rects(rows, paths, modes)
-    dlog("topo.on.synth.enter", need=[it["anchor"] for it in need],
-         want=want, layout=rects)
-    for it in need:
-        saved = want.get(it["anchor"])
-        if saved and len(saved) == 4:
-            w, h = int(saved[2]), int(saved[3])
-        else:
-            w, h = (_ccd_preferred_size(u32, it["tgtAdapterLow"],
-                                        it["tgtAdapterHigh"], it["tgtId"])
-                    or _ccd_live_size(rows, paths, modes))
-        x, y = _ccd_place(saved[:2] if saved else None, w, h, rects)
-        rects.append((x, y, w, h))
-        modes, idx = _ccd_append_source_mode(
-            modes, mc, it["luidLow"], it["luidHigh"], it["srcId"], w, h, x, y)
-        mc += 1
-        it["sourceModeIdx"] = idx
-        it["makeSourceMode"] = False
-        # 这条只进 diag.log：它是"为了接回而临时造了一条 source mode"，
-        # 属于实现细节，写进 events.log 只会让界面挂着看不懂的术语。
-        dlog("topo.on.synth.item", anchor=it["anchor"], size=[w, h], pos=[x, y],
-             modeIdx=idx, saved=bool(saved))
-    return modes, mc
-
-
-def _ccd_apply_plan_on(paths, plan):
-    """把接回计划就地写进 paths 数组。返回真正改动的锚点列表。
-
-    ⚠️ **sourceInfo.modeInfoIdx 绝不能置 INVALID**（v2.01.1 真机定论）：
-    同一份数组只把这一个字段换成 0xFFFFFFFF，`SetDisplayConfig` 立刻
-    rc=87 ERROR_INVALID_PARAMETER；换成 targetInfo.modeInfoIdx=INVALID
-    反而 rc=0。所以"两个都交 Windows 挑"是错的，source 必须有有效值。
-    证据：scripts/topology_repro87.py 步骤 6（只用 SDC_VALIDATE，不改拓扑）。
-    """
-    done = []
-    for item in plan:
-        s = item.get("sourceModeIdx")
-        if s is None:
-            # plan 阶段已经拦过；真走到这里只能跳过，硬写 INVALID 必然 rc=87。
-            # 注意必须在置 ACTIVE 之前判：半改的数组一旦提交就是 rc=87。
-            continue
-        t = item.get("targetModeIdx")
-        d = item.get("desktopModeIdx")
-        p = paths[item["pathIndex"]]
-        p.flags |= _CCD_PATH_ACTIVE
-        p.sourceInfo.modeInfoIdx = ((int(s) << 16) | 0xFFFF) & 0xFFFFFFFF
-        if None in (t, d):
-            # 这块屏的 target/desktop mode 已不在 modes 数组里 → 交 Windows 定
-            p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
-        else:
-            p.targetInfo.modeInfoIdx = ((int(t) << 16) | int(d)) & 0xFFFFFFFF
-        p.sourceInfo.statusFlags = 0
-        p.targetInfo.statusFlags = 0
-        done.append(item["anchor"])
-        dlog("ccd.plan.write", anchor=item.get("anchor"), path=item.get("pathIndex"),
-             srcId=item.get("srcId"), tgtId=item.get("tgtId"),
-             srcModeIdx="0x%08X" % int(p.sourceInfo.modeInfoIdx),
-             tgtModeIdx="0x%08X" % int(p.targetInfo.modeInfoIdx))
-    return done
-
-
-def _topo_off_handover_shift(paths, modes, mc, raw_rows, heir_anchor, heir_active):
-    """算「把接班屏挪到 (0,0)」需要的平移量；不需要交接时返回 (0,0)。
-
-    主屏就是 (0,0) 那块，所以平移接班屏到 (0,0) 就等于把主屏角色交给它；
-    其余屏跟着平移，相对布局完全不变（真机验证见 topology_plan_off 注释）。
-    """
-    shift = (0, 0)
-    if heir_anchor and heir_active:
-        row = next((r for r in raw_rows
-                    if r["anchor"] == heir_anchor and r.get("active")), None)
-        if row is not None:
-            idx = int(paths[row["pathIndex"]].sourceInfo.modeInfoIdx)
-            if idx != _CCD_MODE_IDX_INVALID:
-                s = (idx >> 16) & 0xFFFF
-                if s < mc:
-                    shift = (-int(modes[s].sourceMode.position.x),
-                             -int(modes[s].sourceMode.position.y))
-        dlog("topo.off.handover", heir=heir_anchor, heir_active=True, shift=list(shift))
-    return shift
-
-
-def _topo_off_capture_positions(cfg, shift, anchors, paths, modes, mc, raw_rows):
-    """断开前记下这些屏此刻的位置（平移后的坐标），已有记录不覆盖。
-
-    断开之后 Windows 会把这块屏的 mode 项摘掉，位置就再也读不到了，
-    所以必须趁现在记。记平移后的坐标，接回时正好落在新主屏旁边。
-    """
-    if cfg is None:
-        return
-    pos = _ccd_capture_positions(anchors, paths, modes, mc, raw_rows)
-    if not pos:
-        return
-    pos = {a: [v[0] + shift[0], v[1] + shift[1], v[2], v[3]]
-           for a, v in pos.items()}
-    merged = dict(cfg.get("monitor_positions") or {})
-    # **已有记录不覆盖**（v2.01.11）。交接主屏会把接班屏挪到桌面原点，
-    # 于是"断开那一刻的位置"已经不是用户摆的位置了；照它记下来，
-    # 下次接回就会把副屏丢到右边去（实测：两块屏的记录都被写成 (0,0)）。
-    # 用户真想更新布局，用设置里的「记住当前显示器布局」。
-    for a, v in pos.items():
-        merged.setdefault(a, v)
-    cfg["monitor_positions"] = _coerce_positions(merged)
-    save_config(cfg)
-    dlog("topo.off.positions", captured=pos,
-         kept=list(cfg["monitor_positions"]))
-
-
-def _topo_off_activate_heir(u32, heir_anchor, heir_active, raw_rows, paths,
-                            modes, mc):
-    """接班屏断着就先接回并放到 (0,0)。
-
-    返回 (cur_modes, cur_mc, heir_active, errs)：
-      - 不用交接 / 它其实已亮 → 原样返回；
-      - 接不回来 → errs 非空，调用方直接失败返回。
-    """
-    if not heir_anchor or heir_active:
-        return modes, mc, heir_active, []
-    p_on, e_on, n_on = topology_plan_on(
-        [heir_anchor], raw_rows, _ccd_mode_entries(modes, mc), allow_vdd=True)
-    if e_on:
-        dlog("topo.off.handover", heir=heir_anchor, errs=e_on)
-        return modes, mc, heir_active, [(-1, e) for e in e_on]
-    if n_on:                       # 它其实已经亮着，按"在拓扑里"处理
-        return modes, mc, True, []
-    cur_modes, cur_mc = _ccd_fill_missing_source_modes(
-        u32, paths, modes, mc, raw_rows, p_on, want={})
-    midx = p_on[0]["sourceModeIdx"]
-    cur_modes[midx].sourceMode.position.x = 0
-    cur_modes[midx].sourceMode.position.y = 0
-    _ccd_apply_plan_on(paths, p_on)
-    dlog("topo.off.handover", heir=heir_anchor, heir_active=False,
-         synthMode=midx, size=[int(cur_modes[midx].sourceMode.width),
-                               int(cur_modes[midx].sourceMode.height)])
-    return cur_modes, cur_mc, heir_active, []
-
-
-def _topo_off_shift_other_modes(cur_modes, cur_mc, raw_rows, paths, anchors, shift):
-    """交接主屏后，其余屏跟着平移（按 mode 下标去重，避免同一块屏被移两次）。"""
-    if shift == (0, 0):
-        return
-    moved = set()
-    for r in raw_rows:
-        if not (r.get("active") and r.get("connected")):
-            continue
-        if r["anchor"] in anchors:
-            continue
-        idx = int(paths[r["pathIndex"]].sourceInfo.modeInfoIdx)
-        if idx == _CCD_MODE_IDX_INVALID:
-            continue
-        s = (idx >> 16) & 0xFFFF
-        if s in moved or s >= cur_mc:
-            continue
-        moved.add(s)
-        cur_modes[s].sourceMode.position.x = \
-            int(cur_modes[s].sourceMode.position.x) + shift[0]
-        cur_modes[s].sourceMode.position.y = \
-            int(cur_modes[s].sourceMode.position.y) + shift[1]
-
-
-def _topo_off_detach(paths, raw_rows, anchors):
-    """把目标屏的 ACTIVE path 置为断开。
-
-    与 topology_switch.py 的 C2/C4 实测口径一致：只清 ACTIVE 的那条 path，
-    同一块屏的其它 source 原样保留，快照负责兜底恢复。
-    """
-    for i in range(len(paths)):
-        info = next((x for x in raw_rows if x["pathIndex"] == i), None)
-        if (not info or info["anchor"] not in anchors
-                or not info["connected"] or not info["active"]):
-            continue
-        p = paths[i]
-        p.flags &= ~_CCD_PATH_ACTIVE
-        p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
-        p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
-        p.sourceInfo.statusFlags = 0
-        p.targetInfo.statusFlags = 0
-
-
-def _topo_off_apply_and_verify(u32, paths, cur_modes, pc, cur_mc, anchors,
-                               heir_anchor, snap):
-    """提交拓扑 → 回读验证；任一项不过就按快照回滚一次。返回 (成功?, errs)。"""
-    rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
-    if rc != 0:
-        dlog("topo.off.fail", stage="apply", rc=rc)
-        return False, [(-1, "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc)]
-    ok_off = _ccd_wait_state(anchors, False)
-    ok_heir = (not heir_anchor) or _ccd_wait_state([heir_anchor], True, allow_vdd=True)
-    if ok_off and ok_heir:
-        return True, []
-    back = _ccd_restore_from_bytes(u32, snap)
-    why = "回读未确认断开，已回滚"
-    if not ok_heir:
-        why = "主屏接班没生效，已回滚"
-    if back != 0:
-        why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
-    dlog("topo.off.fail", stage="verify", rollback=back,
-         ok_off=ok_off, ok_heir=ok_heir)
-    return False, [(-1, why)]
-
-
-def _topo_off_report_and_follow(raw_rows, anchors, dev_to_index, indices,
-                                heir_anchor, win_snap, shift):
-    """算出"真正被断开"的下标、记完成日志，并把窗口搬回跟着它的屏。"""
-    done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
-                 if r["anchor"] in anchors and r["connected"] and r["active"]}
-    done = sorted({i for name, i in dev_to_index.items()
-                   if _short_dev(name) in done_devs})
-    dlog("topo.off.done", anchors=anchors, indices=done, heir=heir_anchor)
-    # 拓扑已经稳定，再把窗口搬回"跟着它的屏"的位置
-    if win_snap:
-        moved = win_follow(win_snap, shift, set(anchors))
-        dlog("topo.off.windows", moved=moved, total=len(win_snap),
-             shift=list(shift), dropped=len(anchors))
-    return done or list(normalize_indices(indices))
-
-
-def topology_off(indices, cfg=None, heir=None):
-    """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
-
-    如果这次要摘的屏里包含**当前主屏**，会先把主屏角色交接给 `heir`
-    （不指定就自动选：优先物理屏，其次虚拟屏）：接班屏平移到 (0,0)、
-    其余屏跟着平移（相对布局不变），再摘原主屏。交接的技术依据见
-    `topology_plan_off` 的注释与 scripts/topology_handover_probe.py。
-
-    这样"禁用所有物理屏、只留虚拟显示器"（串流场景）也能走纯拓扑操作，
-    全程不碰面板电源，没有 DDC 待机唤不回的风险。
-
-    `cfg` 给了就把这些屏**此刻**的桌面位置写进 `monitor_positions`，供下次
-    接回摆回原位（记录的是平移后的坐标，接回时正好落在新主屏旁边）。
-
-    返回 (成功下标列表, [(下标, 错误), ...])，与 screen_off_many 同形状。
-    """
-    u32 = _ccd_api()
-    if u32 is None:
-        return [], [(-1, "拓扑模式仅支持 Windows")]
-    raw = _ccd_query_raw(u32)
-    if raw is None:
-        return [], [(-1, "CCD 查询失败，未做任何改动")]
-    paths, modes, pc, mc, raw_rows = raw
-    dlog("topo.off", indices=normalize_indices(indices), pc=pc, mc=mc, heir=heir,
-         active=[r["anchor"] for r in raw_rows if r.get("active")],
-         connected=[r["anchor"] for r in raw_rows if r.get("connected")])
-    try:
-        targets = enumerate_targets()
-    except Exception:
-        targets = []
-    primary = [t.get("dev") for t in targets if t.get("primary")]
-    dev_to_index = {t.get("dev"): t.get("index") for t in targets}
-    release_targets(targets)
-    plan, errs, noop = topology_plan_off(
-        indices, _fold_raw_rows(raw_rows), primary, dev_to_index, heir)
-    dlog("topo.off.plan", plan=plan, errs=errs, noop=noop, primary=primary)
-    if errs:
-        return [], [(-1, e) for e in errs]
-    if noop:
-        return list(normalize_indices(indices)), []
-    anchors = plan["off"]
-    heir_anchor = plan.get("heir")
-    heir_active = bool(plan.get("heir_active"))
-
-    # D6：动作前拍一份**本进程内**的原始字节快照，只用于"这次操作失败就原样撤回"。
-    # v2.01.0 起不再落盘：快照一旦落盘就会被当成"状态"，接回时恢复旧快照
-    # 会把用户其后在 Windows 设置里做的改动一起覆盖掉（设计纠偏，见 topology_plan_on）。
-    snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
-
-    # 接班屏已在拓扑里 → 算出"把它挪到 (0,0)"需要的平移量。
-    shift = _topo_off_handover_shift(paths, modes, mc, raw_rows,
-                                     heir_anchor, heir_active)
-
-    # 趁断开前把位置记下来（上面已说明为什么必须现在记）
-    _topo_off_capture_positions(cfg, shift, anchors, paths, modes, mc, raw_rows)
-
-    cur_modes, cur_mc = modes, mc
-
-    # 动作前记下"每个应用窗口在哪块屏上"：交接会让所有屏平移，Windows 这时
-    # 会把窗口挤到一起且不会搬回来。只在 shift≠0（真会平移）时才记。
-    win_snap = []
-    if shift != (0, 0) and bool((cfg or {}).get("window_follow", True)):
-        win_snap = win_snapshot(_ccd_layout_by_anchor(raw_rows, paths, modes))
-        dlog("topo.off.windows.snap", count=len(win_snap))
-
-    # 接班屏当前是断着的（虚拟显示器）→ 先把它接回，并直接放到 (0,0)
-    cur_modes, cur_mc, heir_active, h_errs = _topo_off_activate_heir(
-        u32, heir_anchor, heir_active, raw_rows, paths, cur_modes, cur_mc)
-    if h_errs:
-        return [], h_errs
-
-    # 其余屏跟着平移（按 mode 下标去重：同一块屏的多条 path 共用一条 mode 项）
-    _topo_off_shift_other_modes(cur_modes, cur_mc, raw_rows, paths, anchors, shift)
-
-    _topo_off_detach(paths, raw_rows, anchors)
-
-    ok, v_errs = _topo_off_apply_and_verify(
-        u32, paths, cur_modes, pc, cur_mc, anchors, heir_anchor, snap)
-    if not ok:
-        return [], v_errs
-    return _topo_off_report_and_follow(raw_rows, anchors, dev_to_index, indices,
-                                       heir_anchor, win_snap, shift), []
-
-
-def topology_inactive_rows(rows=None):
-    """给 GUI 用：拓扑里「设备还连着但 ACTIVE=0」的屏——**全部**列出来。
-
-    对齐 Windows 设置 → 屏幕：那里会把"断开但还接在机器上"的屏画出来，
-    虚拟显示器（VDD）也画。所以这里**不再排除 VDD**，只把 `vdd` 标记带出去，
-    由界面决定怎么呈现（VDD 不给「启用」按钮：它归串流软件管，
-    本程序断开/接回它是没有意义的，硬断还会让串流黑屏）。
-
-    纯函数，便于单测。VDD 仍然**永不作断开目标**——那是 topology_plan_off 的护栏，
-    和"能不能看见"是两件事。
-    """
-    rows = rows if rows is not None else ccd_probe_topology()
-    out = []
-    for r in rows:
-        if r.get("active") or not r.get("anchor"):
-            continue
-        if not r.get("connected", True):
-            continue
-        out.append({"anchor": r["anchor"],
-                    "friendly": r.get("friendly") or "",
-                    "gdi": r.get("gdi") or "",
-                    "vdd": bool(r.get("vdd"))})
-    return out
-
-
-def topology_enable_anchor(cfg, anchor):
-    """GUI「启用」按钮：把这一块屏加回**当前**拓扑（不再查历史快照）。
-
-    v2.01.0 起不再要求"断开时留下的快照里得有它"——那等于要求程序维护状态账。
-    现在只问当前拓扑：这块屏 connected 且 inactive 吗？是就直接接回。
-    校验由 topology_plan_on 现读现判，这里不做重复预检。
-    """
-    anchor = str(anchor or "")
-    if not anchor:
-        return [], [(-1, "缺少显示器锚点")]
-    return screen_on_cfg(cfg, [], anchors=[anchor])
-
-
-def topology_indices_for_anchors(anchors):
-    """把恢复出来的锚点映射回**当前**显示器下标（只认 ACTIVE source 的 GDI）。
-
-    不能走 resolve_monitors()：它的 aliases 会把同一块屏的 4 个 DISPLAYn 混在一起，
-    只勾副屏时会误中主屏。接回后 enumeratetargets 才重新看到副屏，所以必须现算。
-    """
-    wanted = set(anchors or [])
-    if not wanted:
-        return []
-    targets = enumerate_targets()
-    try:
-        by_dev = {_short_dev(t.get("dev")): t.get("index") for t in targets}
-    finally:
-        release_targets(targets)
-    out = []
-    for r in ccd_probe_topology():
-        if r["anchor"] in wanted and not r["vdd"]:
-            i = by_dev.get(_short_dev(r.get("gdi")))
-            if i is not None and i not in out:
-                out.append(i)
-    return sorted(out)
-
-
-def topology_wanted_anchors(cfg, rows=None):
-    """拓扑模式「点亮」要接回哪些屏——**每次现算**，不读任何记账。
-
-    优先用用户勾选时存下的锚点（monitor_anchors）；没存过就表示"全部接回"，
-    取当前拓扑里所有 connected + inactive 的物理屏（VDD 除外）。
-    """
-    saved = [str(a) for a in (cfg.get("monitor_anchors") or []) if a]
-    if saved:
-        return saved
-    rows = rows if rows is not None else _ccd_query_raw_rows()
-    return sorted({r["anchor"] for r in rows
-                   if r.get("connected") and not r.get("active")
-                   and not r.get("vdd") and r.get("anchor")})
-
-
-def _ccd_query_raw_rows():
-    """只读：当前拓扑的逐 path 行（失败返回空列表）。"""
-    raw = _ccd_query_raw()
-    return list(raw[4]) if raw else []
-
-
-def topology_on(anchors, cfg=None):
-    """拓扑接回：把 anchors 里的屏加回**当前**拓扑（声明式，无历史快照）。
-
-    步骤：现读拓扑 → 现算要动哪几条 path / 哪个 mode → 提交 → 有界回读。
-    同一块屏接两次与接一次结果相同（已 ACTIVE 的锚点直接跳过）。
-
-    两档，每档都重新现读、绝不复用被改过的数组；**只有上一档被拒才降级**，
-    所以 events.log 里每一句"改用…重试"都是真的发生过（v2.01.1 修：原来那句
-    提示写在第一档里无条件输出，一次成功也被写成了"降级后成功"）：
-      1) 现算 source/target/desktop 三个 modeInfoIdx —— 忠于这块屏原来的
-         分辨率和桌面位置（`--verify` 证明与 Windows 自己填的逐位一致）。
-      2) source 仍用现算值，target/desktop 交 INVALID 让 Windows 定
-         （真机验证过：只把 target 置 INVALID 能过校验，rc=0）。
-
-    ⚠️ 两条真机定论（都用 SDC_VALIDATE 验的，没有一次改动拓扑；
-      scripts/topology_repro87.py 可复跑）：
-      - **sourceInfo.modeInfoIdx 一旦置 INVALID 就必然 rc=87**，加多少
-        ALLOW_CHANGES / PATH_PERSIST / FORCE_MODE_ENUMERATION 都救不回来。
-        所以"两个都交 Windows 挑"这条老路是死的，source mode 必须有有效值。
-      - **全量提交（整份 QDC_ALL_PATHS 233 条）本身是合法的，rc=0**。
-        曾经怀疑"224 条未连接组合导致 87"并改成 SDC_TOPOLOGY_SUPPLIED 部分
-        提交——实测部分提交才是 87，那个方向是错的，已撤销。
-
-    而 source mode "算不出来"是**常态**，不是异常：一块屏被断开之后，Windows
-    就把它从 modes 数组里摘掉了，接回时没有任何下标可引用。这时现造一条补进
-    数组末尾（`_ccd_append_source_mode`），尺寸取该屏首选分辨率、位置取桌面
-    最右边。真机矩阵见 scripts/topology_mode_synthesis.py。
-
-    返回 (成功下标列表, [(下标, 错误), ...], restored_anchors)。
-    亮度不在这里写：断开源在接回后才重新出现在 EnumDisplayMonitors 里，
-    必须由 screen_on_cfg 用接回后的下标写，否则刚接回的屏拿不到亮度。
-    """
-    u32 = _ccd_api()
-    if u32 is None:
-        return [], [(-1, "拓扑模式仅支持 Windows")], []
-    tries = ("full", "windows-picks-target")
-    last_err = "CCD 查询失败，未做任何改动"
-    dlog("topo.on", anchors=list(anchors or []),
-         saved_positions=(cfg or {}).get("monitor_positions"))
-    for n, mode in enumerate(tries):
-        raw = _ccd_query_raw(u32)
-        if raw is None:
-            return [], [(-1, last_err)], []
-        paths, modes, pc, mc, raw_rows = raw
-        plan, errs, noop = topology_plan_on(anchors, raw_rows,
-                                            _ccd_mode_entries(modes, mc))
-        dlog("topo.on.plan", tier=mode, pc=pc, mc=mc, plan=plan,
-             errs=errs, noop=noop)
-        if errs:
-            return [], [(-1, e) for e in errs], []
-        if noop:                       # 已经全亮：不提交、不写日志
-            return [], [], []
-        if mode != "full":
-            for item in plan:
-                item["targetModeIdx"] = item["desktopModeIdx"] = None
-        # 真实断开后 Windows 会把这块屏的 SOURCE mode 从 modes 数组里摘掉，
-        # 空手引用必然 rc=87；这里现造一条补进数组末尾。
-        # 位置优先摆回"断开前那一刻"的原位（cfg.monitor_positions），
-        # 没记过、或会和现有屏重叠，才退回桌面最右边。
-        cur_modes, cur_mc = _ccd_fill_missing_source_modes(
-            u32, paths, modes, mc, raw_rows, plan,
-            want=(cfg or {}).get("monitor_positions"))
-        restored = _ccd_apply_plan_on(paths, plan)
-        rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
-        if rc == 0:
-            if not _ccd_wait_state(restored, True):
-                dlog("topo.on.fail", tier=mode, stage="verify", restored=restored)
-                return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
-            dlog("topo.on.done", tier=mode, restored=restored, mc=cur_mc)
-            return topology_indices_for_anchors(restored), [], restored
-        last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
-        dlog("topo.on.fail", tier=mode, stage="apply", rc=rc, mc=cur_mc, pc=pc)
-        if n + 1 < len(tries):
-            # 降级是用户能感知的（结果一样但过程换了路），说人话，别甩参数名
-            _write_event_log("接回显示器：第一套参数被 Windows 拒绝（rc=%d），"
-                             "已自动换一种方式重试" % rc)
-    return [], [(-1, last_err)], []
-
-
-# ---- 熄屏 / 点亮 ----------------------------------------------------------
-# ⚠️ 硬件红线，两条，都有本机实测事故背书：
-# 1) **绝不用 `0xD6=4/5`（软关/硬关）** —— 面板进固件级熄灭，DDC 点亮 / 驱动重启 /
-#    拓扑重握手 / 信号源切换全部唤不醒，只有物理电源键能救。
-# 2) **v1.7.0 现场事故：`0xD6=2`（待机）也不该用来熄灭** ——
-#    本机写 `0xD6=2` 后：回读仍是 `1`、亮度照样读得到，但面板背光真的灭了；
-#    随后 `0xD6=1`、写亮度、`0x60` 切源（4 秒往返 + 补发）全部救不回来，
-#    最后靠物理电源键恢复。结论：**"熄灭"容易，"点亮"却不由软件决定**。
-#
-# 所以 v1.7.1 起，熄灭改走 Windows 系统级：
-#     SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)
-#   - 恢复由系统负责（`SC_MONITORPOWER -1` 一定亮回来），不依赖面板固件；
-#   - 代价是只能整组熄灭，不能只灭其中几台 —— 对防窥场景没有区别。
-#   DDC 待机方式保留为高级选项（`screen_off_method=ddc`），默认关闭。
-SC_MONITORPOWER = 0xF170
-SC_OFF = 2          # 关闭显示器（比 1 低功耗更彻底，系统仍能恢复）
-SC_ON = -1          # 点亮显示器
-_WM_SYSCOMMAND = 0x0112
-_HWND_BROADCAST = 0xFFFF
-
-# 唤醒分级：DDC 方式下的顺序，从"最标准、最不可能把屏搞黑"的一招开始。
-# 为什么不再一上来就切信号源（v1.6.x 的做法）：
-#   旧代码把"切到另一个输入"写死成 4（DVI-2）。现代显示器基本没有 DVI-2，
-#   切过去等于切到无信号口 → 面板进省电，再切回来能不能醒取决于链路重训练，
-#   于是表现为"有时行、有时不行"。若这台屏还同时插了 DP+HDMI 两根线，
-#   切到 HDMI 正好切到 Windows 没在驱动的那个空口上，画面直接黑在空口。
-WAKE_STAGE_LABEL = {1: "电源模式", 2: "写亮度", 3: "系统输入", 4: "切信号源"}
-
-
-def _broadcast_monitor_power(flag):
-    """向系统广播"显示器电源"命令，返回是否下发成功。"""
-    try:
-        return bool(ctypes.windll.user32.SendMessageTimeoutW(
-            _HWND_BROADCAST, _WM_SYSCOMMAND, SC_MONITORPOWER, flag, 0, 2000, None))
-    except Exception:
-        return False
-
-
-def screen_off_system():
-    """系统级熄灭全部显示器（可恢复）。"""
-    return _broadcast_monitor_power(SC_OFF)
-
-
-def screen_on_system():
-    """系统级点亮，并补一次输入事件（Windows 有时不主动重发画面）。"""
-    ok = _broadcast_monitor_power(SC_ON)
-    _nudge_user_input()
-    return ok
-
-
-def _nudge_user_input():
-    """喂一次真实的用户输入事件。
-
-    Windows 有时在收到点亮命令后仍不重发画面（它仍认为显示器处于关闭状态），
-    一次微小的鼠标移动就能把它踢回"有显示"。移 1 像素再移回来，肉眼无感。
-    """
-    try:
-        u = ctypes.windll.user32
-        u.mouse_event(0x0001, 1, 0, 0, 0)      # MOUSEEVENTF_MOVE
-        u.mouse_event(0x0001, -1, 0, 0, 0)
-        return True
-    except Exception:
-        return False
-
-
-def _switch_input_roundtrip(t):
-    """切到"另一个真实支持的输入源"，等 2 秒再切回来。返回两端是否都下发成功。
-
-    选源规则（顺序即优先级）：
-      1) 能力串里 0x60 声明支持的口（真实存在的口）；
-      2) 其中只留 DP/HDMI（15~19）—— 模拟/DVI/复合口切过去基本等于无信号；
-      3) 优先挑"与当前口异类"的：当前在 DP 就先试 HDMI，反之亦然，
-         因为双线接法下另一根线通常是另一种口，切过去有极大概率真的有信号。
-    **不再用旧版的 4（DVI-2）**：那是多数显示器根本没接的口，切过去即黑屏。
-    """
-    h = t["handle"]
-    got = _read_vcp(h, VCP_INPUT_SOURCE)
-    if not got:
-        return False
-    cur = got[0]
-    declared = [c for c in _caps_inputs(_capabilities_cached(h, _display_key(t)))
-                if 15 <= c <= 19]
-    cand = [c for c in (declared or [15, 16, 17, 18, 19]) if c != cur]
-    if not cand:
-        return False
-    cur_is_dp = 15 <= cur <= 16
-    cand.sort(key=lambda c: (cur_is_dp == (15 <= c <= 16), c))
-    if not _write_vcp(h, VCP_INPUT_SOURCE, cand[0]):
-        return False
-    time.sleep(2)
-    return _write_vcp(h, VCP_INPUT_SOURCE, cur)
-
-
-def _wake_one(t, allow_switch=True, expect_off=True, allow_recycle=True):
-    """分级唤醒单台显示器。返回 (命令是否都下发成功, 走到第几级, 说明)。
-
-    ⚠️ **不用 `0xD6` 回读判断"醒了没有"**（v1.7.0 现场取证）：
-    本机写入 `0xD6=2` 待机之后，回读仍是 `1`、`0x10` 亮度也照样读得到。
-    拿它当判据就会出现"程序说点亮成功、屏幕其实黑着"——和 v1.5.0 熄屏事故同源。
-    所以这里只保证"该发的命令都发到位"，真实亮灭交给「检测亮灭」+ 眼睛。
-
-    ⚠️ `allow_recycle=False`（v1.9.6）：只勾选了部分显示器时禁用第 3 级的
-    `SC_MONITORPOWER` 广播。那是**系统级**调用，会作用于所有显示器，把没勾选的
-    那台也黑一下再点亮。此时只用每台的 `0xD6=1` + 亮度写 + 输入注入。
-
-    顺序按"危害从小到大"，前三步都不碰信号源：
-      1 `0xD6=1` 电源模式=开（标准唤醒命令，无害）
-      2 写回当前亮度（部分固件靠收到 VCP 写入才醒）
-      3 **让系统把显示输出关一次再打开**（SC_MONITORPOWER 2→-1）+ 输入注入。
-        依据：显示器"亮着却黑屏"的公开排查一致指向 GPU 与面板握手失败，
-        标准恢复手段就是切一次显示模式 / 让输出重新上电。此时屏幕本来就是黑的，
-        重驱动不会造成额外闪烁。
-      4 切信号源（唯一可能把屏切到空口的一招：受 allow_switch 控制，
-        并且只在"软件确实熄过这块屏"时才做，避免给亮着的屏白闪 2 秒）
-    """
-    h = t["handle"]
-    wrote = False
-    stage = 0
-
-    if _write_vcp(h, VCP_POWER_MODE, POWER_ON):
-        wrote, stage = True, 1
-        time.sleep(0.35)
-
-    cur = _read_vcp(h, VCP_BRIGHTNESS)
-    if cur and _write_vcp(h, VCP_BRIGHTNESS, cur[0]):
-        wrote, stage = True, 2
-        time.sleep(0.35)
-
-    if not wrote:
-        # 两个最基本的写都不通，后面切信号源也不会通，早点收工别让用户干等
-        return False, 0, "显示器未响应 DDC/CI（电源 / 亮度写入均失败）"
-
-    output_recycled = False
-    if not expect_off:
-        _nudge_user_input()          # 屏幕本来就亮着：只喂输入，别去动输出
-    else:
-        if allow_recycle:
-            output_recycled = _output_recycle()
-        _nudge_user_input()
-    stage = max(stage, 3)
-    time.sleep(0.35)
-
-    if not allow_switch:
-        note = ("已下发电源/亮度/输出重驱动" if output_recycled
-                else "已下发电源/亮度/输入注入")
-        return wrote, stage, note + "（切信号源已禁用）"
-    if not expect_off:
-        return wrote, stage, "已下发电源/亮度/系统输入（未熄过屏，跳过切信号源）"
-    if not _switch_input_roundtrip(t):
-        note = "切信号源失败（前几级已下发）"
-        if output_recycled:
-            note += "，输出已重新驱动过"
-        return wrote, stage, note
-    return wrote, 4, "已下发电源/亮度/输出重驱动/信号源切换"
-
-
-def _output_recycle():
-    """把显示输出关一次再打开，强制 GPU 与面板重新握手。
-
-    返回是否两次下发都成功。依据见 _wake_one 第 3 步的说明。
-    """
-    off_ok = _broadcast_monitor_power(SC_OFF)
-    time.sleep(0.8)
-    on_ok = _broadcast_monitor_power(SC_ON)
-    return off_ok and on_ok
-
-
-def screen_off_many(indices, allow_undeclared=False):
-    """批量熄灭（DDC 待机 0xD6=2）。indices 空 -> 全部。
-
-    ⚠️ 先查面板能力串：**没声明支持 02（待机）的一律跳过**，不做"写写看"。
-    依据：MS Learn 的 SetVCPFeature 文档明确警告盲写未实现的 MCCS 值会导致
-    "undefined monitor behavior"；本机面板正是不支持 02 却被盲写，
-    结果进入了 DDC 能读、背光却唤不回来的状态。
-    """
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    ok, errs = [], []
-    try:
-        picked, bad = _select(targets, indices)
-        errs.extend(bad)
-        for t in picked:
-            declared = _caps_power(_capabilities_cached(t["handle"], _display_key(t)))
-            if POWER_STANDBY not in declared and not allow_undeclared:
-                errs.append((t["index"], "面板未声明支持待机(0xD6=2)%s，已跳过"
-                             "（要强制启用请重选「单屏待机」并确认风险）"
-                             % ("，只支持 %s" % "/".join(str(v) for v in declared)
-                                if declared else "（能力串也读不到）")))
-                continue
-            if _write_vcp(t["handle"], VCP_POWER_MODE, POWER_STANDBY):
-                ok.append(t["index"])
-            else:
-                errs.append((t["index"], "SetVCPFeature 失败"))
-    finally:
-        release_targets(targets)
-    return ok, errs
-
-
-def screen_wake_many(indices, allow_switch=True, expect_off=True):
-    """批量点亮（分级唤醒，并行执行）。indices 空 -> 全部。
-
-    并行是因为每台要 0.6~6 秒，两台串行就翻倍；不同显示器的 DDC 句柄互相独立，
-    并行写是安全的（型号名读取早就这么干了）。
-    allow_switch=False 关掉"切信号源"这最后一招（双线接法可避免切到空口）。
-    expect_off=False 表示"屏幕可能本来就亮着"，此时先探测、亮着就跳过。
-    返回 (成功序号, [(序号, 错误), ...])，错误文案带走到第几级。
-    """
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    picked, bad = _select(targets, indices)
-    # v1.9.6：只勾选部分显示器时，禁用系统级 SC_MONITORPOWER 重驱动
-    # （广播会把没勾选的那台也黑一下）。全选时保持原行为，逐字节不变。
-    allow_recycle = len(picked) == len(targets)
-    results = {}
-
-    def work(t):
-        try:
-            results[t["index"]] = _wake_one(t, allow_switch, expect_off, allow_recycle)
-        except Exception as e:
-            results[t["index"]] = (False, 0, str(e))
-
-    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(30)
-
-    ok, errs = [], list(bad)
-    try:
-        for t in picked:
-            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
-            if done:
-                ok.append(t["index"])
-            else:
-                errs.append((t["index"], "第 %d 级（%s）：%s"
-                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
-    finally:
-        release_targets(targets)
-    return ok, errs
-
-
-# ---- 对外统一入口：按配置的熄灭方式分派 -----------------------------------
-def _monitor_count():
-    """当前显示器台数（只为报数，句柄立刻还掉）。"""
-    targets = enumerate_targets()
-    try:
-        return len(targets)
-    finally:
-        release_targets(targets)
-
-
-def _system_ok_targets(indices):
-    """系统级动作没有"每台"的概念，用动作前选中的序号充数（空 = 全部）。"""
-    return normalize_indices(indices) or list(range(_monitor_count()))
-
-
-def screen_off_cfg(cfg, indices):
-    """熄灭显示器。ddc = 逐台 0xD6=2；topology = CCD 断开副屏；其余系统级。
-
-    返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状，
-    这样界面与 CLI 不用关心底层是哪种方式。
-    """
-    dlog("screen.off.enter", method=cfg.get("screen_off_method"),
-         indices=normalize_indices(indices))
-    if cfg.get("screen_off_method") == "ddc":
-        out = screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
-    elif cfg.get("screen_off_method") == "topology":
-        out = topology_off(indices, cfg)
-    elif not screen_off_system():
-        out = ([], [(-1, "系统级熄灭下发失败")])
-    else:
-        out = (_system_ok_targets(indices), [])
-    dlog("screen.off.exit", ok=out[0], errs=out[1])
-    return out
-
-
-def screen_on_row(cfg, index):
-    """行内「显示」：只点亮这一块。
-
-    拓扑模式下分两种情况，靠"有没有真的接回一块屏"来分：
-      - 它确实断开了 → 按拓扑接回，再写亮度；
-      - 它本来就在拓扑里（`restored` 为空）→ 那多半只是面板被待机了，
-        拓扑帮不上忙，改走 DDC 唤醒。**不许切信号源**：拓扑模式下切源
-        会把副屏切到空口，等于自找黑屏。
-    """
-    if cfg.get("screen_off_method") != "topology":
-        return screen_wake_entry(cfg, [index])
-    anchors = selection_anchors([index])
-    if not anchors:
-        return [], [(-1, "拿不到这块屏的锚点，无法单独点亮")]
-    ok, errs, restored = topology_on(anchors, cfg)
-    if errs:
-        return ok, errs
-    ids = topology_indices_for_anchors(restored) or [index]
-    bok, berrs = set_brightness_many(ids, current_level(cfg))
-    if restored:
-        dlog("screen.on.row", index=index, via="topology", ids=ids)
-        return ok + bok, errs + berrs
-    wok, werrs = screen_wake_many([index], allow_switch=False)
-    dlog("screen.on.row", index=index, via="ddc-wake", ok=wok, errs=werrs)
-    return wok + bok, werrs + berrs
-
-
-def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
-    """点亮显示器。ddc = 分级 DDC；topology = 现读现算接回后写亮度；其余系统级。"""
-    dlog("screen.on.enter", method=cfg.get("screen_off_method"),
-         indices=normalize_indices(indices), anchors=anchors)
-    if cfg.get("screen_off_method") == "ddc":
-        out = screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
-        dlog("screen.on.exit", ok=out[0], errs=out[1])
-        return out
-    if cfg.get("screen_off_method") == "topology":
-        want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
-        ok, errs, restored = topology_on(want, cfg)
-        if errs:
-            return ok, errs
-        # 断开的屏在接回后才回到 EnumDisplayMonitors；用「接回后」的下标写亮度，
-        # 否则副屏接回来了却拿不到亮度（D3）。
-        write_to = sorted(set(normalize_indices(indices))
-                          | set(topology_indices_for_anchors(restored)))
-        if not write_to:
-            return ok, errs
-        bok, berrs = set_brightness_many(write_to, current_level(cfg))
-        return ok + bok, errs + berrs
-    if not screen_on_system():
-        return [], [(-1, "系统级点亮下发失败")]
-    return _system_ok_targets(indices), []
-
-
-# ============================================================
-# 快速点亮（v1.9.7）：0x60 信号源翻转，0 等待
-# ------------------------------------------------------------
-# 现场依据：两次独立实测（Legion R27qe Gen2 / DISPLAY2，16:57 与 17:00）
-#   读 0x60 → 写 17 → 立即写回 15：动作 182~188ms，两次都把屏点亮，
-#   读回 0x60 均回到原值 15。
-# 为什么不用等：SetVCPFeature 返回只代表这次 DDC 写事务被面板 ACK，真正的点亮
-# 来自「离开当前口→再回来」这一个边沿——DP 接收端必须重跑链路训练并重锁时序。
-# 停在中途多久与重锁无关（v1.9.6 的 2 秒只是让第二次写不落在面板切换窗口里）。
-#
-# 边界：本路径只写 0x60；不写 0xD6 / 0x10，不发系统广播。
-# 失败（读不到当前源 / 无可用中间源 / 写失败）一律回退 v1.9.6 的完整阶梯；
-# 同一台 8 秒内第二次触发点亮时也升级为完整阶梯。
-# ============================================================
-FAST_FLIP_WINDOW_S = 8.0
-_FAST_FLIP_AT = {}                 # 显示器标识 -> 上次触发的时间（monotonic 秒）
-_FAST_FLIP_LOCK = threading.Lock()
-_WAKE_INFO = []                    # 本次点亮的说明行（后台线程写，界面/CLI 读）
-_WAKE_INFO_LOCK = threading.Lock()
-
-
-def _wake_info(text):
-    """追加一行本次点亮的说明（线程安全）。"""
-    with _WAKE_INFO_LOCK:
-        _WAKE_INFO.append(str(text))
-
-
-def reset_wake_info():
-    with _WAKE_INFO_LOCK:
-        del _WAKE_INFO[:]
-
-
-def take_wake_info():
-    """取走并清空本次点亮的说明行；界面状态行 / CLI 输出用。"""
-    with _WAKE_INFO_LOCK:
-        out = list(_WAKE_INFO)
-        del _WAKE_INFO[:]
-    return out
-
-
-def pick_flip_source(cur, declared):
-    """纯函数：为 0x60 翻转挑一个**与当前值不同**的中间源。
-
-    规则（按优先级）：
-      1) 优先 17（HDMI-1，现场实测在这台 Legion 上有效）；
-      2) 当前就是 17 时，从能力串声明的口里另选一个——优先 15（DP-1），
-         其次按 15/16/17/18/19 的顺序；
-      3) 能力串读不到时退回 MCCS 15~19 的通用候选（与 _switch_input_roundtrip 同口径）。
-    没有可用候选（例如能力串只声明了当前这一个口）返回 None。
-    ⚠️ 能力串里的数值是十六进制（见 _caps_inputs），这里接收的已是整数。
-    """
-    try:
-        cur = int(cur)
-    except Exception:
-        return None
-    cands = []
-    for c in (declared or []):
-        try:
-            c = int(c)
-        except Exception:
-            continue
-        if 15 <= c <= 19 and c not in cands:
-            cands.append(c)
-    if not cands:
-        cands = [15, 16, 17, 18, 19]
-    if 17 in cands and cur != 17:
-        return 17
-    for c in (15, 16, 17, 18, 19):
-        if c in cands and c != cur:
-            return c
-    return None
-
-
-def _fast_flip_recent(key, now=None):
-    """这台屏在 8 秒内是否已经快速点亮过一次（只读，不改时间戳）。"""
-    now = time.monotonic() if now is None else now
-    with _FAST_FLIP_LOCK:
-        last = _FAST_FLIP_AT.get(key)
-        return last is not None and (now - last) <= FAST_FLIP_WINDOW_S
-
-
-def _mark_fast_flip(key, now=None):
-    """记下这台屏的快速点亮时刻（后续 8 秒内再点亮就升级完整阶梯）。"""
-    now = time.monotonic() if now is None else now
-    with _FAST_FLIP_LOCK:
-        _FAST_FLIP_AT[key] = now
-
-
-def _fast_flip_one(t):
-    """对一台屏做 0x60 翻转，返回 (成功, 说明)。真实调用序列（无 sleep）：
-
-      GetVCPFeatureAndVCPFeatureReply(h, 0x60)   读当前源
-      SetVCPFeature(h, 0x60, 中间源)             切走
-      SetVCPFeature(h, 0x60, 当前源)             立即切回
-
-    ⚠️ 写本回失败时先立即补写一次（不等待），仍失败才判失败；
-    并把「可能停在中间源」写进说明，避免界面报"已点亮"而屏其实不在原口。
-    """
-    t0 = time.perf_counter()
-    h = t["handle"]
-    got = _read_vcp(h, VCP_INPUT_SOURCE)
-    if not got:
-        return False, "读 0x60 失败"
-    cur = int(got[0])
-    # 只有当前源正好是 17 时才需要读能力串另选一个口；其余情况直接用 17，
-    # 避免为了"快速"在缓存未命中时搭进去 3 秒的能力串实读。
-    declared = []
-    reason = ""
-    if cur == 17:
-        declared = _caps_inputs(_capabilities_cached(h, _display_key(t)))
-    mid = pick_flip_source(cur, declared)
-    if mid is None:
-        return False, "0x60 无可用中间源（当前 %d）" % cur
-    if cur == 17:
-        reason = "（当前已是 17，按能力串声明改选 %d）" % mid
-    if not _write_vcp(h, VCP_INPUT_SOURCE, mid):
-        return False, "写 0x60=%d 失败（当前 %d）" % (mid, cur)
-    if not _write_vcp(h, VCP_INPUT_SOURCE, cur):
-        _write_vcp(h, VCP_INPUT_SOURCE, cur)          # 立即补写一次，不等待
-        back = _read_vcp(h, VCP_INPUT_SOURCE)
-        if not back or int(back[0]) != cur:
-            return False, ("写回 0x60=%d 失败（现读 %s），屏可能停在中间源 %d"
-                           % (cur, ("%d" % back[0]) if back else "—", mid))
-    ms = (time.perf_counter() - t0) * 1000.0
-    return True, "翻转 0x60 %d→%d→%d，耗时 %.1f ms%s" % (cur, mid, cur, ms, reason)
-
-
-def screen_wake_flip(indices, allow_switch=True, expect_off=True):
-    """快速点亮：逐台 0x60 翻转。与 screen_wake_many 同形状返回。
-
-    全选/部分选择都只操作选中的屏，**绝不发系统广播**。
-    同一台 8 秒内第二次触发、或翻转做不成时，该台回退到 _wake_one 完整阶梯。
-    """
-    targets = enumerate_targets()
-    if not targets:
-        raise RuntimeError(NO_MONITOR_MSG)
-    picked, bad = _select(targets, indices)
-    # 与 screen_wake_many 同一口径：只有全选时才允许升级路径里的系统级重驱动
-    allow_recycle = len(picked) == len(targets)
-    now = time.monotonic()
-    results = {}
-
-    def work(t):
-        key = _display_key(t)
-        try:
-            if _fast_flip_recent(key, now):
-                _mark_fast_flip(key, now)
-                _wake_info("已升级为完整点亮（显示器 %d 在 8 秒内第二次点亮）" % t["index"])
-                # 用户 8 秒内再点一次 = 第一次没亮：强制按"屏仍黑"走完整阶梯
-                results[t["index"]] = _wake_one(t, allow_switch, True, allow_recycle)
-                return
-            if not expect_off:
-                # 屏亮着、且没有近期的快速点亮记录：不翻转（避免可见黑屏），按旧行为
-                results[t["index"]] = _wake_one(t, allow_switch, False, allow_recycle)
-                return
-            _mark_fast_flip(key, now)
-            ok, note = _fast_flip_one(t)
-            if ok:
-                _wake_info("快速点亮：" + note)
-                results[t["index"]] = (True, 1, note)
-                return
-            _wake_info("快速点亮不可用（%s），已回退完整阶梯" % note)
-            results[t["index"]] = _wake_one(t, allow_switch, expect_off, allow_recycle)
-        except Exception as e:
-            results[t["index"]] = (False, 0, str(e))
-
-    threads = [threading.Thread(target=work, args=(t,)) for t in picked]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(30)
-
-    ok, errs = [], list(bad)
-    try:
-        for t in picked:
-            done, stage, why = results.get(t["index"], (False, 0, "超时未返回"))
-            if done:
-                ok.append(t["index"])
-            else:
-                errs.append((t["index"], "第 %d 级（%s）：%s"
-                             % (stage, WAKE_STAGE_LABEL.get(stage, "-"), why)))
-    finally:
-        release_targets(targets)
-    return ok, errs
-
-
-def screen_wake_entry(cfg, indices):
-    """点亮统一入口（v1.9.7）：快速翻转优先，其余情况原样走 v1.9.6。
-
-    只有同时满足以下条件才走快速路径，任何一条不满足都完全回到旧行为：
-      - 开关 wake_fast_flip 打开（旧配置缺键 -> 默认 1）；
-      - 熄灭方式为 ddc（system 模式的 SC_MONITORPOWER -1 是即时广播，不需要翻转）；
-      - 允许切信号源（用户关掉「切信号源」时不得偷偷切换）。
-    `expect_off` 由 wake_options 当场探测得出（v2.01.0 起不读记账）：
-    探不到"确实待机"就按保守路径走，不翻转、不切源。
-
-    ⚠️ 这里只算一次 wake_options：它内部要读 DDC，算两次会让点亮慢一倍。
-    """
-    reset_wake_info()
-    if (not bool(cfg.get("wake_fast_flip", True))
-            or cfg.get("screen_off_method") != "ddc"):
-        return screen_on_cfg(cfg, indices)
-    opts = wake_options(cfg)
-    if not opts["allow_switch"]:
-        return screen_on_cfg(cfg, indices, wake_opts=opts)
-    return screen_wake_flip(indices, opts["allow_switch"], opts["expect_off"])
-
-
-
-
-def _minutes(now=None):
-    now = now or datetime.now()
-    return now.hour * 60 + now.minute
-
-
-def _slot_minutes(cfg):
-    """cfg["slots"] -> [(当日分钟, 亮度)]，按时间排序。"""
-    out = []
-    for x in cfg.get("slots", []):
-        out.append((parse_hhmm(x.get("time"), (0, 0)), clamp_level(x.get("level", 50))))
-    return sorted(out)
-
-
-def active_slot(slots, now_min):
-    """N 档调度核心：取 time <= now 的最后一档；一个都没有 -> 最后一档（跨午夜回绕）。
-
-    slots 为 [(当日分钟, 亮度)]，返回 (当日分钟, 亮度)。
-    """
-    best = None
-    for m, lv in sorted(slots):
-        if m <= now_min:
-            best = (m, lv)
-    if best is None:
-        best = sorted(slots)[-1]
-    return best
-
-
-def active_slot_dict(slots, now_min):
-    """同 active_slot 的选择规则，但作用于原始档位 dict（含 screen 动作）。
-
-    取 time <= now_min 的最后一档；一个都没有 -> 时间最大的最后一档（跨午夜回绕）。
-    """
-    best = None
-    best_m = None
-    for s in slots:
-        m = parse_hhmm(s.get("time"), (0, 0))
-        if m <= now_min and (best is None or m >= best_m):
-            best, best_m = s, m
-    if best is None:
-        best = max(slots, key=lambda x: parse_hhmm(x.get("time"), (0, 0)))
-    return best
-
-
-def current_level(cfg=None, now=None):
-    """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""
-    cfg = cfg or load_config()
-    return active_slot(_slot_minutes(cfg), _minutes(now))[1]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # _short_dev 已搬到 domain/decisions.py（v2.03.0 P3），顶部 import 重新导出。
 
 
-def selection_anchors(indices, targets=None):
-    """给勾选的下标生成 CCD 稳定锚点（E2）。
-
-    锚点来自 `ccd_probe_topology()`：显卡 LUID + EDID mfr/prod + connectorInstance。
-    **只按 `gdi`（当前 ACTIVE 的 source 名）匹配，绝不用 `aliases`**：
-    QDC_ALL_PATHS 下每块屏的 aliases 都会列出 DISPLAY1~4 全部四个 source 名，
-    用它匹配等于"任何选中都命中所有屏"——v2.01.8 实测：只点一块屏的「显示」，
-    实际拿到了两块屏的锚点，于是"点亮这一块"变成了"接回全部"。
-    取不到就返回 []，绝不把不确定的锚点写进配置。
-    """
-    idx = normalize_indices(indices)
-    if not idx:
-        return []                          # 空选择 = 全部，不锚死
-    owned = targets is None
-    if owned:
-        targets = enumerate_targets()
-    try:
-        wanted = {_short_dev(t["dev"]) for t in targets if t["index"] in idx}
-        rows = ccd_probe_topology()
-        out = []
-        for r in rows:
-            if r["vdd"]:
-                continue
-            # v2.01.18：只认 ACTIVE path 的 gdi（微软文档 DISPLAYCONFIG_PATH_ACTIVE
-            # = "路径处于活动状态且是桌面的一部分"）。断开屏没有 active path，
-            # 折叠后残留的 gdi 会和当前主屏撞名（都是 DISPLAY1）；不排除它，
-            # selection_anchors 会把主屏和断开屏一起命中 → 交接弹窗 skip 掉
-            # 两块 → 候选只剩 VDD（用户 19:46 截图实证）。
-            if not r.get("active"):
-                continue
-            if _short_dev(r.get("gdi")) in wanted and r["anchor"] not in out:
-                out.append(r["anchor"])
-        return out
-    finally:
-        if owned:
-            release_targets(targets)
 
 
 def topology_heir_candidates(off_anchors=(), rows=None):
@@ -3131,25 +864,6 @@ def selection_payload(indices, targets=None):
             release_targets(targets)
 
 
-def wake_options(cfg, probes=None):
-    """唤醒策略的两个开关，CLI 与界面共用。
-
-    `expect_off` 的意思是"这次点亮之前，屏幕可能真的是灭的"——它决定要不要
-    动用「切信号源」「快速翻转」这两招（会给本来就亮着的屏白闪两秒）。
-
-    v2.01.0：改成**当场探测**，不再读软件记账。判据只认可信方向：
-      读到任一屏 0xD6=2/3/4/5  → 确实待机过 → True
-      其余情况（含读不到）    → False，走保守路径
-    依据：`0xD6` 只会假阴性（待机时仍报 1），不会假阳性，所以"报了待机"
-    就是真的待机；"报了开"什么都不能证明。
-    """
-    if probes is None:
-        try:
-            probes = probe_states()
-        except Exception:
-            probes = []
-    return {"allow_switch": bool(cfg.get("wake_switch_input", True)),
-            "expect_off": any(p.get("state") == "off" for p in (probes or []))}
 
 
 def apply_schedule(cfg=None):

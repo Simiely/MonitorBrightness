@@ -8,6 +8,7 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import contextlib
 import ctypes
 import glob
 import html
@@ -24,7 +25,60 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.config as cfg_mod
 import core.logging as log_mod
+import hw.ccd as hw_ccd
+import hw.ccd_structs as hw_structs
+import hw.ddc as hw_ddc
+import hw.geometry as hw_geometry
+import hw.power as hw_power
+import hw.topology as hw_topology
+import hw.winfollow as hw_winfollow
 import monitor_brightness as mb
+import service as svc_mod
+
+# R2：同一个函数可能同时绑在主文件与多个 hw/service 模块里。测试 patch 必须
+# 覆盖**调用方所在的那个绑定**，否则 mock 根本不会被调用到。这里用同一个
+# mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
+_PATCH_MODULES = (mb, cfg_mod, log_mod, hw_ddc, hw_structs, hw_ccd,
+                  hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod)
+
+
+_UNSET = object()
+
+
+class _PatchAll:
+    def __init__(self, name, new, kwargs):
+        self.mock = new if new is not _UNSET else unittest.mock.MagicMock(**kwargs)
+        self.stack = contextlib.ExitStack()
+        for mod in _PATCH_MODULES:
+            if hasattr(mod, name):
+                self.stack.enter_context(
+                    unittest.mock.patch.object(mod, name, new=self.mock))
+
+    def __enter__(self):
+        self.stack.__enter__()
+        return self.mock
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+
+def patch_any(name, new=_UNSET, **kwargs):
+    return _PatchAll(name, new, kwargs)
+
+
+def set_any(name, value):
+    """直接赋值版打桩：把 value 写到所有持有 name 的模块，返回恢复记录。"""
+    saved = []
+    for mod in _PATCH_MODULES:
+        if hasattr(mod, name):
+            saved.append((mod, name, getattr(mod, name)))
+            setattr(mod, name, value)
+    return saved
+
+
+def restore_any(saved):
+    for mod, name, old in saved:
+        setattr(mod, name, old)
 
 _MODULE_TMP = None
 
@@ -350,23 +404,22 @@ class WakeSelectionTest(TempConfigCase):
                 {"index": 1, "handle": 0xB0, "dev": "DISPLAY2", "desc": "B"}]
 
     def _patch(self):
-        self._orig = (mb.enumerate_targets, mb.release_targets, mb._write_vcp,
-                      mb._read_vcp, mb._nudge_user_input, mb._output_recycle,
-                      mb._switch_input_roundtrip, mb.time.sleep)
         self.writes, self.switches, self.recycles = [], [], []
-        mb.enumerate_targets = self._targets
-        mb.release_targets = lambda ts: None
-        mb._write_vcp = lambda h, c, v: (self.writes.append((h, c, v)), True)[1]
-        mb._read_vcp = lambda h, c: (80, 100)
-        mb._nudge_user_input = lambda: None
-        mb._output_recycle = lambda: (self.recycles.append("recycle"), True)[1]
-        mb._switch_input_roundtrip = lambda t: (self.switches.append(t["handle"]), True)[1]
+        self._saves = []
+        self._saves.append(set_any("enumerate_targets", self._targets))
+        self._saves.append(set_any("release_targets", lambda ts: None))
+        self._saves.append(set_any("_write_vcp", lambda h, c, v: (self.writes.append((h, c, v)), True)[1]))
+        self._saves.append(set_any("_read_vcp", lambda h, c: (80, 100)))
+        self._saves.append(set_any("_nudge_user_input", lambda: None))
+        self._saves.append(set_any("_output_recycle", lambda: (self.recycles.append("recycle"), True)[1]))
+        self._saves.append(set_any("_switch_input_roundtrip", lambda t: (self.switches.append(t["handle"]), True)[1]))
+        self._old_sleep = mb.time.sleep
         mb.time.sleep = lambda s: None
 
     def _restore(self):
-        (mb.enumerate_targets, mb.release_targets, mb._write_vcp, mb._read_vcp,
-         mb._nudge_user_input, mb._output_recycle, mb._switch_input_roundtrip,
-         mb.time.sleep) = self._orig
+        for saved in reversed(self._saves):
+            restore_any(saved)
+        mb.time.sleep = self._old_sleep
 
     def test_subset_wake_writes_only_checked_monitor(self):
         self._patch()
@@ -409,22 +462,26 @@ class FastFlipTest(TempConfigCase):
 
     def setUp(self):
         super().setUp()
-        self._orig = (mb._read_vcp, mb._write_vcp, mb._capabilities_cached,
-                      mb._display_key, mb.enumerate_targets, mb.release_targets,
-                      mb.screen_on_cfg, mb.screen_wake_flip, mb._fast_flip_one,
-                      mb._wake_one, mb._broadcast_monitor_power, mb.time.sleep,
-                      dict(mb._FAST_FLIP_AT))
+        names = ("_read_vcp", "_write_vcp", "_capabilities_cached",
+                 "_display_key", "enumerate_targets", "release_targets",
+                 "screen_on_cfg", "screen_wake_flip", "_fast_flip_one",
+                 "_wake_one", "_broadcast_monitor_power")
+        self._orig = [(name, [(mod, getattr(mod, name))
+                              for mod in _PATCH_MODULES if hasattr(mod, name)])
+                      for name in names]
+        self._old_at = dict(mb._FAST_FLIP_AT)
+        self._old_sleep = mb.time.sleep
         mb._FAST_FLIP_AT.clear()
         self.sleeps = []
         mb.time.sleep = lambda s: self.sleeps.append(s)
 
     def tearDown(self):
-        (mb._read_vcp, mb._write_vcp, mb._capabilities_cached, mb._display_key,
-         mb.enumerate_targets, mb.release_targets, mb.screen_on_cfg,
-         mb.screen_wake_flip, mb._fast_flip_one, mb._wake_one,
-         mb._broadcast_monitor_power, mb.time.sleep, old_at) = self._orig
+        for name, saves in reversed(self._orig):
+            for mod, old in saves:
+                setattr(mod, name, old)
         mb._FAST_FLIP_AT.clear()
-        mb._FAST_FLIP_AT.update(old_at)
+        mb._FAST_FLIP_AT.update(self._old_at)
+        mb.time.sleep = self._old_sleep
         super().tearDown()
 
     def _targets(self):
@@ -433,10 +490,10 @@ class FastFlipTest(TempConfigCase):
 
     def test_flip_sequence_has_no_wait(self):
         writes = []
-        mb._read_vcp = lambda h, c: (15, 100) if c == mb.VCP_INPUT_SOURCE else None
-        mb._write_vcp = lambda h, c, v: (writes.append((h, c, v)), True)[1]
-        mb._capabilities_cached = lambda h, k: "60(11 12 0F)"
-        mb._display_key = lambda t: t["dev"]
+        set_any("_read_vcp", lambda h, c: (15, 100) if c == mb.VCP_INPUT_SOURCE else None)
+        set_any("_write_vcp", lambda h, c, v: (writes.append((h, c, v)), True)[1])
+        set_any("_capabilities_cached", lambda h, k: "60(11 12 0F)")
+        set_any("_display_key", lambda t: t["dev"])
 
         ok, note = mb._fast_flip_one({"index": 0, "handle": 0xA0, "dev": "DISPLAY1"})
         self.assertTrue(ok, note)
@@ -463,12 +520,12 @@ class FastFlipTest(TempConfigCase):
 
     def test_second_trigger_uses_full_ladder_and_says_so(self):
         ladder = []
-        mb.enumerate_targets = self._targets
-        mb.release_targets = lambda ts: None
-        mb._display_key = lambda t: t["dev"]
-        mb._fast_flip_one = lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms")
-        mb._wake_one = lambda t, a, e, r: (ladder.append((t["dev"], e)),
-                                          (True, 4, "x"))[1]
+        set_any("enumerate_targets", self._targets)
+        set_any("release_targets", lambda ts: None)
+        set_any("_display_key", lambda t: t["dev"])
+        set_any("_fast_flip_one", lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms"))
+        set_any("_wake_one", lambda t, a, e, r: (ladder.append((t["dev"], e)),
+                                                (True, 4, "x"))[1])
 
         mb.screen_wake_flip([0])
         # 第二次点击 = 第一次没点亮，8 秒内必须升级为完整阶梯。
@@ -480,11 +537,11 @@ class FastFlipTest(TempConfigCase):
 
     def test_fast_flip_never_broadcasts(self):
         broadcast = []
-        mb.enumerate_targets = self._targets
-        mb.release_targets = lambda ts: None
-        mb._display_key = lambda t: t["dev"]
-        mb._broadcast_monitor_power = lambda flag: (broadcast.append(flag), True)[1]
-        mb._fast_flip_one = lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms")
+        set_any("enumerate_targets", self._targets)
+        set_any("release_targets", lambda ts: None)
+        set_any("_display_key", lambda t: t["dev"])
+        set_any("_broadcast_monitor_power", lambda flag: (broadcast.append(flag), True)[1])
+        set_any("_fast_flip_one", lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms"))
 
         ok, errs = mb.screen_wake_flip([0, 1])
         self.assertEqual(sorted(ok), [0, 1])
@@ -495,8 +552,8 @@ class FastFlipTest(TempConfigCase):
         cfg = mb.default_config()
         cfg["wake_fast_flip"] = False
         calls = []
-        mb.screen_on_cfg = lambda c, i, **k: (calls.append("ladder"), ([0], []))[1]
-        mb.screen_wake_flip = lambda *a, **k: self.fail("关掉开关不得走快速路径")
+        set_any("screen_on_cfg", lambda c, i, **k: (calls.append("ladder"), ([0], []))[1])
+        set_any("screen_wake_flip", lambda *a, **k: self.fail("关掉开关不得走快速路径"))
 
         ok, errs = mb.screen_wake_entry(cfg, [0])
         self.assertEqual(calls, ["ladder"])
@@ -511,12 +568,12 @@ class FastFlipTest(TempConfigCase):
         self.assertTrue(cfg["wake_fast_flip"])
 
         calls = []
-        mb.screen_wake_flip = lambda *a, **k: (calls.append("flip"), ([0], []))[1]
-        mb.screen_on_cfg = lambda c, i, **k: (calls.append("ladder"), ([0], []))[1]
+        set_any("screen_wake_flip", lambda *a, **k: (calls.append("flip"), ([0], []))[1])
+        set_any("screen_on_cfg", lambda c, i, **k: (calls.append("ladder"), ([0], []))[1])
 
         # v2.01.0：expect_off 现在靠当场探测；这里打桩成"读到待机"，避免碰真机 DDC。
-        with unittest.mock.patch.object(
-                mb, "probe_states",
+        with patch_any(
+                "probe_states",
                 return_value=[{"index": 0, "state": "off"}]):
             mb.screen_wake_entry(cfg, [0])
             cfg["wake_switch_input"] = False            # 用户禁用切源：回旧路径
@@ -532,23 +589,23 @@ class FastFlipTest(TempConfigCase):
         """v2.01.0：点亮策略不再读记账，只看当场探测到的待机值。"""
         cfg = mb.default_config()
         cfg["screen_state"] = "off"        # 残留的旧记账，不得参与决策
-        with unittest.mock.patch.object(
-                mb, "probe_states",
+        with patch_any(
+                "probe_states",
                 return_value=[{"index": 0, "state": "on"}]):
             self.assertFalse(mb.wake_options(cfg)["expect_off"])
-        with unittest.mock.patch.object(
-                mb, "probe_states",
+        with patch_any(
+                "probe_states",
                 return_value=[{"index": 0, "state": "off"}]):
             self.assertTrue(mb.wake_options(cfg)["expect_off"])
 
     def test_lit_screen_without_recent_flip_keeps_old_behavior(self):
         calls = []
-        mb.enumerate_targets = self._targets
-        mb.release_targets = lambda ts: None
-        mb._display_key = lambda t: t["dev"]
-        mb._fast_flip_one = lambda t: self.fail("屏亮着且无近期记录时不得翻转")
-        mb._wake_one = lambda t, a, e, r: (calls.append((t["dev"], e, r)),
-                                          (True, 4, "x"))[1]
+        set_any("enumerate_targets", self._targets)
+        set_any("release_targets", lambda ts: None)
+        set_any("_display_key", lambda t: t["dev"])
+        set_any("_fast_flip_one", lambda t: self.fail("屏亮着且无近期记录时不得翻转"))
+        set_any("_wake_one", lambda t, a, e, r: (calls.append((t["dev"], e, r)),
+                                                (True, 4, "x"))[1])
 
         mb.screen_wake_flip([0, 1], expect_off=False)
         self.assertEqual(sorted(calls),
@@ -887,7 +944,7 @@ class TopologyVerdictTest(unittest.TestCase):
     def test_topology_active_is_the_only_verdict(self):
         """拓扑 ACTIVE=1 是系统事实：不管配置里残留什么，结论都只能是它。"""
         row = self._row("LUID/0001/0002/1", True)
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+        with patch_any("ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
         self.assertEqual(v["state"], "on")
         self.assertIn("拓扑", v["text"])
@@ -896,14 +953,14 @@ class TopologyVerdictTest(unittest.TestCase):
 
     def test_topology_inactive_wins_over_bookkeeping(self):
         row = self._row("LUID/0001/0002/1", False)
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+        with patch_any("ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
         self.assertEqual(v["state"], "off")
         self.assertIn("已断开", v["text"])
 
     def test_vdd_never_counts_as_selected_display(self):
         row = self._row("VDD/ANCHOR", True, vdd=True)
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+        with patch_any("ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(), probes=[])
         self.assertEqual(v["state"], "unknown")
 
@@ -911,7 +968,7 @@ class TopologyVerdictTest(unittest.TestCase):
         """v2.01.0：DDC/system 读不到可信的亮灭，0xD6=1 会撒谎，只能说不知道。"""
         row = self._row("LUID/0001/0002/1", False)
         probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+        with patch_any("ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(method="ddc"), probes=probes)
         self.assertEqual(v["state"], "unknown")
         self.assertNotIn("拓扑", v["text"])
@@ -942,7 +999,7 @@ class TopologyVerdictTest(unittest.TestCase):
 
     def test_topology_verdict_carries_evidence(self):
         row = self._row("LUID/0001/0002/1", True)
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+        with patch_any("ccd_probe_topology", return_value=[row]):
             v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
         self.assertEqual(v["state"], "on")
         self.assertTrue(v["evidence"])
@@ -965,10 +1022,10 @@ class MonitorIdentityTest(unittest.TestCase):
         return cfg
 
     def _patch(self):
-        return (unittest.mock.patch.object(mb, "enumerate_targets",
+        return (patch_any("enumerate_targets",
                                            return_value=list(self.TARGETS)),
-                unittest.mock.patch.object(mb, "release_targets"),
-                unittest.mock.patch.object(mb, "ccd_probe_topology",
+                patch_any("release_targets"),
+                patch_any("ccd_probe_topology",
                                            return_value=list(self.ROWS)))
 
     def test_anchor_wins_over_old_ids_and_indices(self):
@@ -1032,7 +1089,7 @@ class TopologyGuiTest(TempConfigCase):
         """v2.01.0：启用不再查历史快照，直接把这块屏交给「现读现算」的接回。"""
         cfg = mb.default_config()
         cfg["screen_off_method"] = "topology"
-        with unittest.mock.patch.object(mb, "screen_on_cfg",
+        with patch_any("screen_on_cfg",
                                         return_value=([1], [])) as on:
             ok, errs = mb.topology_enable_anchor(cfg, "A2")
         self.assertEqual((ok, errs), ([1], []))
@@ -1041,7 +1098,7 @@ class TopologyGuiTest(TempConfigCase):
     def test_enable_rejects_empty_anchor(self):
         cfg = mb.default_config()
         cfg["screen_off_method"] = "topology"
-        with unittest.mock.patch.object(mb, "screen_on_cfg") as on:
+        with patch_any("screen_on_cfg") as on:
             ok, errs = mb.topology_enable_anchor(cfg, "")
         self.assertEqual(ok, [])
         self.assertIn("锚点", errs[0][1])
@@ -1503,7 +1560,7 @@ class AppMethodTest(TempConfigCase):
         self.assertEqual(calls, [])
         fake._row_action_blocker = lambda: ""
         fake.cfg["screen_off_method"] = "topology"
-        with unittest.mock.patch.object(mb, "selection_anchors", return_value=[]):
+        with patch_any("selection_anchors", return_value=[]):
             mb.App.monitor_off(fake, 0)
         self.assertEqual(calls, [], "拿不到锚点也不能动")
 
@@ -1514,7 +1571,7 @@ class AppMethodTest(TempConfigCase):
             mon_info=[("DISPLAY1", 2560, 1440, True), ("DISPLAY2", 2560, 1440, False)],
             run_bg=lambda job, done, busy=False: started.append((job, done, busy)))
         fake.cfg["screen_off_method"] = "topology"
-        with unittest.mock.patch.object(mb, "selection_anchors", return_value=["A2"]):
+        with patch_any("selection_anchors", return_value=["A2"]):
             mb.App.monitor_off(fake, 1)
         self.assertEqual(len(started), 1)
         self.assertTrue(started[0][2])
@@ -1532,14 +1589,14 @@ class AppMethodTest(TempConfigCase):
         fake._schedule_reg_timer = None
         fake._register_after_edit = lambda: None
         fake.cfg["enabled"] = False
-        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+        with patch_any("save_config", return_value=(True, "")):
             mb.App.on_slots_changed(fake, [{"time": "07:00", "level": 40,
                                             "screen": "", "days": []}])
         self.assertEqual(fake.cfg["slots"][0]["time"], "07:00")
         self.assertEqual(seen, [], "未启用时不该重建任务")
 
         fake.cfg["enabled"] = True
-        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+        with patch_any("save_config", return_value=(True, "")):
             mb.App.on_slots_changed(fake, [{"time": "08:00", "level": 50,
                                             "screen": "", "days": []}])
         self.assertEqual(seen, [("after", 500)])
@@ -1553,7 +1610,7 @@ class AppMethodTest(TempConfigCase):
             showinfo=lambda *a: None, askyesno=lambda *a: True))
         fake._schedule_reg_timer = None
         fake.cfg["enabled"] = True
-        with unittest.mock.patch.object(mb, "save_config",
+        with patch_any("save_config",
                                         return_value=(False, "磁盘只读")):
             mb.App.on_slots_changed(fake, [{"time": "07:00", "level": 40,
                                             "screen": "", "days": []}])
@@ -1855,7 +1912,7 @@ class SelectionAnchorsTest(unittest.TestCase):
             {"anchor": "V1", "gdi": "\\\\.\\DISPLAY92", "vdd": True, "active": False,
              "aliases": []},
         ]
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+        with patch_any("ccd_probe_topology", return_value=rows):
             self.assertEqual(mb.selection_anchors([0], targets), ["A1"])
             self.assertEqual(mb.selection_anchors([1], targets), ["A2"])
             self.assertEqual(mb.selection_anchors([0, 1], targets), ["A1", "A2"])
@@ -1877,7 +1934,7 @@ class SelectionAnchorsTest(unittest.TestCase):
             {"anchor": "VDD", "gdi": "\\\\.\\DISPLAY92", "vdd": True,
              "active": False, "connected": True},
         ]
-        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+        with patch_any("ccd_probe_topology", return_value=rows):
             anchors = mb.selection_anchors([0], targets)
         self.assertEqual(anchors, ["A1"])          # 只命中主屏，不带 A2
         cands = mb.topology_heir_candidates(anchors, rows=rows)
@@ -2049,8 +2106,8 @@ class RememberLayoutTest(TempConfigCase):
 
     def test_records_current_layout(self):
         paths, modes, pc, mc, rows = self._topo()
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            return_value=(paths, modes, pc, mc, rows)):
             layout, err = mb.remember_layout_snapshot(self.cfg)
         self.assertEqual(err, None)
@@ -2059,8 +2116,8 @@ class RememberLayoutTest(TempConfigCase):
         self.assertEqual(self.saved, [self.cfg])
 
     def test_reports_when_nothing_active(self):
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a: (None, None, 0, 0, [])):
             layout, err = mb.remember_layout_snapshot(self.cfg)
         self.assertIsNone(layout)
@@ -2081,12 +2138,12 @@ class WalkthroughRound2Test(TempConfigCase):
         # 与默认值无关（v2.01.23 默认改 topology 后不能再依赖默认）。
         cfg["screen_off_method"] = "ddc"
         cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80, "screen": "off"}])
-        with unittest.mock.patch.object(mb, "active_slot_dict",
+        with patch_any("active_slot_dict",
                                         return_value={"level": 80, "screen": "off"}), \
-                unittest.mock.patch.object(mb, "set_brightness_many", return_value=([0], [])), \
-                unittest.mock.patch.object(mb, "screen_off_cfg",
+                patch_any("set_brightness_many", return_value=([0], [])), \
+                patch_any("screen_off_cfg",
                                            return_value=([], [(-1, "DDC 写失败")])), \
-                unittest.mock.patch.object(mb, "save_config") as save:
+                patch_any("save_config") as save:
             level, screen, ok, errs = mb.apply_schedule(cfg)
         save.assert_not_called()
         self.assertNotIn("screen_state", cfg)
@@ -2200,9 +2257,9 @@ class WalkthroughRound2Test(TempConfigCase):
         """E2-04：enabled=False 时 --force 不许被吞掉，要做反向对齐（清残留任务）。"""
         cfg = mb.default_config()
         cfg["enabled"] = False
-        with unittest.mock.patch.object(mb, "unregister_tasks",
+        with patch_any("unregister_tasks",
                                        return_value=(True, "OK")) as un, \
-                unittest.mock.patch.object(mb, "register_tasks") as reg:
+                patch_any("register_tasks") as reg:
             ok, msg = mb.ensure_task_registration(cfg, force=True)
         self.assertTrue(ok)
         self.assertIn("已清理", msg)
@@ -2212,7 +2269,7 @@ class WalkthroughRound2Test(TempConfigCase):
     def test_disabled_without_force_touches_nothing(self):
         cfg = mb.default_config()
         cfg["enabled"] = False
-        with unittest.mock.patch.object(mb, "unregister_tasks") as un:
+        with patch_any("unregister_tasks") as un:
             ok, msg = mb.ensure_task_registration(cfg, force=False)
         self.assertTrue(ok)
         self.assertIn("跳过", msg)
@@ -2221,7 +2278,7 @@ class WalkthroughRound2Test(TempConfigCase):
     def test_force_failure_is_reported_not_swallowed(self):
         cfg = mb.default_config()
         cfg["enabled"] = False
-        with unittest.mock.patch.object(mb, "unregister_tasks",
+        with patch_any("unregister_tasks",
                                        return_value=(False, "Access denied")):
             ok, msg = mb.ensure_task_registration(cfg, force=True)
         self.assertFalse(ok)
@@ -2237,7 +2294,7 @@ class WalkthroughRound2Test(TempConfigCase):
             status_var=types.SimpleNamespace(set=lambda t: None),
             refresh_monitors=lambda silent=False: None,
             probe_screens=lambda: None)
-        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+        with patch_any("save_config", return_value=(True, "")):
             mb.App.apply_off_method(fake, "system")
         self.assertFalse(fake.cfg["ddc_allow_undeclared"])
         self.assertEqual(fake.cfg["screen_off_method"], "system")
@@ -2279,7 +2336,7 @@ class WalkthroughFixTest(TempConfigCase):
 
     def test_schedule_enabled_single_writer_persists(self):
         fake, fake_save, saved = self._app_stub()
-        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+        with patch_any("save_config", side_effect=fake_save):
             ok = mb.App._set_schedule_enabled(fake, False, persist=True)
         self.assertTrue(ok)
         self.assertFalse(fake.cfg["enabled"])
@@ -2288,7 +2345,7 @@ class WalkthroughFixTest(TempConfigCase):
 
     def test_schedule_enabled_persist_failure_rolls_back_memory(self):
         fake, fake_save, _ = self._app_stub(enabled=True, save_ok=False)
-        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+        with patch_any("save_config", side_effect=fake_save):
             ok = mb.App._set_schedule_enabled(fake, False, persist=True)
         self.assertFalse(ok)
         self.assertTrue(fake.cfg["enabled"])            # 内存回滚
@@ -2296,7 +2353,7 @@ class WalkthroughFixTest(TempConfigCase):
 
     def test_tray_register_failure_uses_unified_rollback(self):
         fake, fake_save, saved = self._app_stub(enabled=True)
-        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+        with patch_any("save_config", side_effect=fake_save):
             mb.App._finish_tray_register(fake, (False, "boom"))
         self.assertFalse(fake.cfg["enabled"])
         self.assertEqual(fake.flags, [False])
@@ -2305,7 +2362,7 @@ class WalkthroughFixTest(TempConfigCase):
     def test_cancel_failure_restores_enabled(self):
         fake, fake_save, saved = self._app_stub(enabled=True)
         fake.refresh_task_status = lambda: None
-        with unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+        with patch_any("save_config", side_effect=fake_save):
             mb.App._finish_unregister(fake, (False, "still running"))
         self.assertTrue(fake.cfg["enabled"])     # P-02：失败后配置与任务一致
         self.assertEqual(fake.flags, [True])
@@ -2313,8 +2370,8 @@ class WalkthroughFixTest(TempConfigCase):
     def test_cli_apply_schedule_skips_when_disabled(self):
         cfg = mb.default_config()
         cfg["enabled"] = False
-        with unittest.mock.patch.object(mb, "load_config", return_value=cfg), \
-                unittest.mock.patch.object(mb, "apply_schedule") as apply:
+        with patch_any("load_config", return_value=cfg), \
+                patch_any("apply_schedule") as apply:
             with self.assertRaises(SystemExit) as cm:
                 mb.cli_apply_schedule()
         self.assertEqual(cm.exception.code, 0)
@@ -2334,10 +2391,10 @@ class WalkthroughFixTest(TempConfigCase):
         fake._last_verdict = {}
         fake._fit_window = lambda: None
         fake._status_payload = lambda s, h: {"state": s, "hint": h}
-        with unittest.mock.patch.object(mb, "screen_verdict",
+        with patch_any("screen_verdict",
                                         return_value={"state": "on",
                                                       "text": "t", "detail": "d"}), \
-                unittest.mock.patch.object(mb, "save_config", side_effect=fake_save):
+                patch_any("save_config", side_effect=fake_save):
             mb.App._render_states(fake, ([{"index": 0}], {}))
         self.assertNotIn("screen_state", fake.cfg)
         self.assertEqual(saved, [])              # 一次都不许落盘
@@ -2442,13 +2499,13 @@ class _TopoFixture(TempConfigCase):
 
     def _base_patches(self, fake_query, apply_rc=0, verify=True):
         return (
-            unittest.mock.patch.object(mb, "_ccd_api", return_value=object()),
-            unittest.mock.patch.object(mb, "_ccd_query_raw", side_effect=fake_query),
-            unittest.mock.patch.object(mb, "_ccd_apply", return_value=apply_rc),
-            unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=verify),
-            unittest.mock.patch.object(mb, "enumerate_targets",
+            patch_any("_ccd_api", return_value=object()),
+            patch_any("_ccd_query_raw", side_effect=fake_query),
+            patch_any("_ccd_apply", return_value=apply_rc),
+            patch_any("_ccd_wait_state", return_value=verify),
+            patch_any("enumerate_targets",
                                        return_value=list(self.TARGETS)),
-            unittest.mock.patch.object(mb, "release_targets"),
+            patch_any("release_targets"),
         )
 
 class TopologyActionTest(_TopoFixture):
@@ -2514,14 +2571,14 @@ class TopologyActionTest(_TopoFixture):
     def _on_patches(self, fake_query, apply_rc=0, verify=True, restored=None):
         """topology_on 需要的全套 mock（含现造 source mode 与索引回映）。"""
         return self._base_patches(fake_query, apply_rc=apply_rc, verify=verify) + (
-            unittest.mock.patch.object(
-                mb, "_ccd_fill_missing_source_modes",
+            patch_any(
+                "_ccd_fill_missing_source_modes",
                 side_effect=lambda u32, p, m, mc, rows, plan, want=None: (m, mc)),
-            unittest.mock.patch.object(
-                mb, "_ccd_apply_plan_on",
+            patch_any(
+                "_ccd_apply_plan_on",
                 return_value=list(restored or ["A2"])),
-            unittest.mock.patch.object(
-                mb, "topology_indices_for_anchors", return_value=[1]),
+            patch_any(
+                "topology_indices_for_anchors", return_value=[1]),
         )
 
     def test_on_restores_inactive_screen(self):
@@ -2552,7 +2609,7 @@ class TopologyActionTest(_TopoFixture):
         self.assertEqual(apply.call_count, 0)
 
     def test_on_without_ccd_reports_windows_only(self):
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=None):
+        with patch_any("_ccd_api", return_value=None):
             ok, errs, restored = mb.topology_on(["A1"])
         self.assertEqual((ok, restored), ([], []))
         self.assertIn("仅支持 Windows", errs[0][1])
@@ -2586,7 +2643,7 @@ class TopologyActionTest(_TopoFixture):
 
         patches = self._base_patches(fake_query)
         with patches[0], patches[1], patches[2] as apply, patches[3], patches[4], patches[5], \
-                unittest.mock.patch.object(mb, "_ccd_make_snapshot",
+                patch_any("_ccd_make_snapshot",
                                            side_effect=fake_snap):
             ok, errs = mb.topology_off([1])
         self.assertEqual(ok, [1])
@@ -2636,12 +2693,12 @@ class TopologyActionTest(_TopoFixture):
         rollback = []
         patches = self._base_patches(fake_query, verify=False)
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-                unittest.mock.patch.object(mb, "_ccd_make_snapshot",
+                patch_any("_ccd_make_snapshot",
                                            return_value={"pathCount": 3, "modeCount": 3,
                                                          "pathsHex": "", "modesHex": "",
                                                          "targetAnchors": ["A2"]}), \
-                unittest.mock.patch.object(
-                    mb, "_ccd_restore_from_bytes",
+                patch_any(
+                    "_ccd_restore_from_bytes",
                     side_effect=lambda u32, snap: rollback.append(snap) or 0):
             ok, errs = mb.topology_off([1])
         self.assertEqual(ok, [])
@@ -2664,17 +2721,17 @@ class TopologyActionTest(_TopoFixture):
         """接回 = 现读当前拓扑 → 现算 mode → 提交 → 回读 → 写亮度。"""
         calls = []
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply",
+                patch_any("_ccd_apply",
                                            side_effect=lambda *a: calls.append("apply") or 0), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state",
+                patch_any("_ccd_wait_state",
                                            side_effect=lambda *a, **k: calls.append("verify") or True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            side_effect=lambda idx, lv: (
                                                calls.append(("brightness", idx, lv)), ([1], []))[1]):
             ok, errs = mb.screen_on_cfg(cfg, [1])
@@ -2687,15 +2744,15 @@ class TopologyActionTest(_TopoFixture):
         """回归：断开源接回后才回到 EnumDisplayMonitors，不能拿断开前的旧序号写亮度。"""
         cfg = self._cfg(screen_off_method="topology")
         # 断开期间算出的 indices 只有主屏 [0]；接回后 A2 重新成为 [1]。
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", return_value=0), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many") as bright:
             bright.return_value = ([0, 1], [])
             ok, errs = mb.screen_on_cfg(cfg, [0])
         self.assertEqual(errs, [])
@@ -2710,19 +2767,19 @@ class TopologyActionTest(_TopoFixture):
             {"anchor": "A2", "gdi": "\\\\.\\DISPLAY2", "vdd": False,
              "aliases": ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY1"]},
         ]
-        with unittest.mock.patch.object(mb, "enumerate_targets",
+        with patch_any("enumerate_targets",
                                         return_value=list(self.TARGETS)), \
-                unittest.mock.patch.object(mb, "release_targets"), \
-                unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+                patch_any("release_targets"), \
+                patch_any("ccd_probe_topology", return_value=rows):
             self.assertEqual(mb.topology_indices_for_anchors(["A2"]), [1])
 
     def test_on_does_not_write_brightness_when_apply_fails(self):
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", return_value=87), \
-                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+                patch_any("_ccd_apply", return_value=87), \
+                patch_any("set_brightness_many") as bright:
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(ok, [])
         self.assertIn("rc=87", errs[0][1])
@@ -2730,12 +2787,12 @@ class TopologyActionTest(_TopoFixture):
 
     def test_on_does_not_write_brightness_when_verify_fails(self):
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=False), \
-                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+                patch_any("_ccd_apply", return_value=0), \
+                patch_any("_ccd_wait_state", return_value=False), \
+                patch_any("set_brightness_many") as bright:
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(ok, [])
         self.assertIn("回读未确认", errs[0][1])
@@ -2889,20 +2946,20 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
             seen["srcIdx"] = int(paths[1].sourceInfo.modeInfoIdx)
             return 0
 
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
-                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                patch_any("_ccd_mode_entries", return_value=[]), \
+                patch_any("_ccd_preferred_size",
                                            return_value=(2560, 1440)), \
-                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", side_effect=fake_apply), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log") as evt:
+                patch_any("_write_event_log") as evt:
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(errs, [])
         self.assertEqual(seen["mc"], 7)                       # 原 6 条 + 补 1 条
@@ -2924,17 +2981,17 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
             return 87 if len(seq) < 2 else 0
 
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", side_effect=fake_apply), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log",
+                patch_any("_write_event_log",
                                            side_effect=logs.append):
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(errs, [])
@@ -2958,17 +3015,17 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
         """回归：旧代码在第一档里无条件写"现算 mode 被拒"，一次成功也说降级过。"""
         logs = []
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", return_value=0), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log",
+                patch_any("_write_event_log",
                                            side_effect=logs.append):
             mb.screen_on_cfg(cfg, [1])
         self.assertEqual(logs, [])
@@ -3083,20 +3140,20 @@ class TopologyPositionTest(_TopoFixture):
                             int(sm.width), int(sm.height))
             return 0
 
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
-                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                patch_any("_ccd_mode_entries", return_value=[]), \
+                patch_any("_ccd_preferred_size",
                                            return_value=(2560, 1440)), \
-                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", side_effect=fake_apply), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log"):
+                patch_any("_write_event_log"):
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(errs, [])
         # 记过位置就用记的（连尺寸一起），不去问首选分辨率
@@ -3112,20 +3169,20 @@ class TopologyPositionTest(_TopoFixture):
                             int(sm.width), int(sm.height))
             return 0
 
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("_ccd_query_raw",
                                            side_effect=lambda *a, **k: self._off_raw()), \
-                unittest.mock.patch.object(mb, "_ccd_mode_entries", return_value=[]), \
-                unittest.mock.patch.object(mb, "_ccd_preferred_size",
+                patch_any("_ccd_mode_entries", return_value=[]), \
+                patch_any("_ccd_preferred_size",
                                            return_value=(2560, 1440)), \
-                unittest.mock.patch.object(mb, "_ccd_apply", side_effect=fake_apply), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
-                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                patch_any("_ccd_apply", side_effect=fake_apply), \
+                patch_any("_ccd_wait_state", return_value=True), \
+                patch_any("topology_indices_for_anchors",
                                            return_value=[1]), \
-                unittest.mock.patch.object(mb, "current_level", return_value=80), \
-                unittest.mock.patch.object(mb, "set_brightness_many",
+                patch_any("current_level", return_value=80), \
+                patch_any("set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log"):
+                patch_any("_write_event_log"):
             mb.screen_on_cfg(cfg, [1])
         self.assertEqual(seen["rect"], (0, 0, 2560, 1440))
 
@@ -3135,11 +3192,11 @@ class TopologyScheduleTest(_TopoFixture):
 
     def test_schedule_off_skips_brightness_in_topology_mode(self):
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "active_slot_dict",
+        with patch_any("active_slot_dict",
                                         return_value={"level": 0, "screen": "off"}), \
-                unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
-                unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
-                unittest.mock.patch.object(mb, "screen_off_cfg", return_value=([1], [])):
+                patch_any("resolve_monitors", return_value=[1]), \
+                patch_any("set_brightness_many") as bright, \
+                patch_any("screen_off_cfg", return_value=([1], [])):
             level, screen, ok, errs = mb.apply_schedule(cfg)
         self.assertEqual((level, screen, ok, errs), (0, "off", [1], []))
         bright.assert_not_called()
@@ -3147,11 +3204,11 @@ class TopologyScheduleTest(_TopoFixture):
     def test_schedule_on_defers_brightness_to_screen_on_cfg(self):
         """D3：档位层不能在接回拓扑之前写亮度；写亮度归 screen_on_cfg。"""
         cfg = self._cfg(screen_off_method="topology")
-        with unittest.mock.patch.object(mb, "active_slot_dict",
+        with patch_any("active_slot_dict",
                                         return_value={"level": 75, "screen": "on"}), \
-                unittest.mock.patch.object(mb, "resolve_monitors", return_value=[1]), \
-                unittest.mock.patch.object(mb, "set_brightness_many") as bright, \
-                unittest.mock.patch.object(mb, "screen_wake_entry",
+                patch_any("resolve_monitors", return_value=[1]), \
+                patch_any("set_brightness_many") as bright, \
+                patch_any("screen_wake_entry",
                                            return_value=([1], [])):
             level, screen, ok, errs = mb.apply_schedule(cfg)
         self.assertEqual((level, screen, ok, errs), (75, "on", [1], []))
@@ -3336,9 +3393,9 @@ class DefaultLayoutTest(TempConfigCase):
 
     def test_save_then_load_roundtrip(self):
         snap = self._snap()
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(
-                    mb, "_ccd_query_raw",
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any(
+                    "_ccd_query_raw",
                     return_value=tuple(self._topo_raw())):
             desc, err = mb.save_default_layout()
         self.assertIsNone(err)
@@ -3359,10 +3416,10 @@ class DefaultLayoutTest(TempConfigCase):
         """快照长度对不上时，一个 SetDisplayConfig 都不该发。"""
         bad = {"pathCount": 99, "modeCount": 1,
                "pathsHex": "00", "modesHex": "00", "targetAnchors": []}
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
-                unittest.mock.patch.object(mb, "dlog"), \
-                unittest.mock.patch.object(
-                    mb, "_ccd_apply", side_effect=AssertionError("不该 apply")):
+        with patch_any("_ccd_api", return_value=object()), \
+                patch_any("dlog"), \
+                patch_any(
+                    "_ccd_apply", side_effect=AssertionError("不该 apply")):
             err = mb.restore_default_layout(snap=bad)
         self.assertIn("结构不符", err)
 
@@ -3377,8 +3434,8 @@ class DefaultLayoutTest(TempConfigCase):
                 return 87 if flags & mb._SDC_VALIDATE else 0
 
         fake = FakeU32()
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=fake), \
-                unittest.mock.patch.object(mb, "dlog"):
+        with patch_any("_ccd_api", return_value=fake), \
+                patch_any("dlog"):
             err = mb.restore_default_layout(snap=self._snap())
         self.assertIn("校验", err)
         self.assertEqual(len(fake.calls), 1)      # 只有 VALIDATE，没有 APPLY
@@ -3403,13 +3460,13 @@ class DefaultLayoutTest(TempConfigCase):
             waited["anchors"] = list(anchors)
             return True
 
-        with unittest.mock.patch.object(mb, "_ccd_api", return_value=FakeU32()), \
-                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
-                unittest.mock.patch.object(
-                    mb, "ccd_probe_topology",
+        with patch_any("_ccd_api", return_value=FakeU32()), \
+                patch_any("_ccd_apply", return_value=0), \
+                patch_any(
+                    "ccd_probe_topology",
                     return_value=[{"anchor": "VDD", "vdd": True}]), \
-                unittest.mock.patch.object(mb, "_ccd_wait_state", fake_wait), \
-                unittest.mock.patch.object(mb, "dlog"):
+                patch_any("_ccd_wait_state", fake_wait), \
+                patch_any("dlog"):
             err = mb.restore_default_layout(snap=snap)
         self.assertIsNone(err)
         self.assertEqual(waited["anchors"], ["A1"])     # VDD 被排除
