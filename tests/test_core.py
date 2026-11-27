@@ -22,6 +22,8 @@ import unittest.mock
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import core.config as cfg_mod
+import core.logging as log_mod
 import monitor_brightness as mb
 
 _MODULE_TMP = None
@@ -38,13 +40,15 @@ def setUpModule():
     global _MODULE_TMP
     _MODULE_TMP = tempfile.mkdtemp(prefix="mb-test-module-")
     _MODULE_LEGACY = os.path.join(_MODULE_TMP, "legacy")
-    mb.CONFIG_DIR = _MODULE_TMP
-    mb.CONFIG_FILE = os.path.join(_MODULE_TMP, "config.json")
-    mb.LOG_DIR = _MODULE_TMP
-    mb.EVENTS_FILE = os.path.join(_MODULE_TMP, "events.log")
+    # R1：配置/日志函数已沉到 core/，必须把路径同时指向临时目录，
+    # 否则它们读的是自己模块里 import 时的真实 APPDATA 路径。
+    mb.CONFIG_DIR = cfg_mod.CONFIG_DIR = _MODULE_TMP
+    mb.CONFIG_FILE = cfg_mod.CONFIG_FILE = os.path.join(_MODULE_TMP, "config.json")
+    mb.LOG_DIR = log_mod.LOG_DIR = _MODULE_TMP
+    mb.EVENTS_FILE = log_mod.EVENTS_FILE = os.path.join(_MODULE_TMP, "events.log")
     # v2.01.20：save_config 会把配置镜像到 APPDATA，模块级也必须隔离，
     # 否则任何没继承 TempConfigCase 的用例都会写进用户真实配置。
-    mb._LEGACY_CONFIG_DIR = _MODULE_LEGACY
+    mb._LEGACY_CONFIG_DIR = cfg_mod._LEGACY_CONFIG_DIR = _MODULE_LEGACY
 
 
 def tearDownModule():
@@ -75,17 +79,24 @@ class TempConfigCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mb-test-")
         self._old = (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR)
-        mb.CONFIG_DIR = self.tmp
-        mb.CONFIG_FILE = os.path.join(self.tmp, "config.json")
-        mb.LOG_DIR = self.tmp
-        mb.EVENTS_FILE = os.path.join(self.tmp, "events.log")
-        mb.CONFIG_LOAD_ERROR = ""
-        mb._LEGACY_CONFIG_DIR = os.path.join(self.tmp, "legacy")
+                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR,
+                     cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE,
+                     cfg_mod.CONFIG_LOAD_ERROR, cfg_mod._LEGACY_CONFIG_DIR,
+                     log_mod.LOG_DIR, log_mod.EVENTS_FILE)
+        # R1：主文件与 core 模块各有一份 import 时绑定的路径常量，必须同步改。
+        mb.CONFIG_DIR = cfg_mod.CONFIG_DIR = self.tmp
+        mb.CONFIG_FILE = cfg_mod.CONFIG_FILE = os.path.join(self.tmp, "config.json")
+        mb.LOG_DIR = log_mod.LOG_DIR = self.tmp
+        mb.EVENTS_FILE = log_mod.EVENTS_FILE = os.path.join(self.tmp, "events.log")
+        mb.CONFIG_LOAD_ERROR = cfg_mod.CONFIG_LOAD_ERROR = ""
+        mb._LEGACY_CONFIG_DIR = cfg_mod._LEGACY_CONFIG_DIR = os.path.join(self.tmp, "legacy")
 
     def tearDown(self):
         (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR) = self._old
+         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR,
+         cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE,
+         cfg_mod.CONFIG_LOAD_ERROR, cfg_mod._LEGACY_CONFIG_DIR,
+         log_mod.LOG_DIR, log_mod.EVENTS_FILE) = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -104,14 +115,14 @@ class ConfigTest(TempConfigCase):
 
         got = mb.load_config()
         self.assertEqual(got["slots"], cfg["slots"])
-        self.assertEqual(mb.CONFIG_LOAD_ERROR, "")
+        self.assertEqual(cfg_mod.CONFIG_LOAD_ERROR, "")
 
     def test_bad_config_is_backed_up_and_reported(self):
         with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
             f.write("{ this is not json")
         cfg = mb.load_config()
-        self.assertTrue(mb.CONFIG_LOAD_ERROR, "读坏必须显式记录，不能静默")
-        self.assertIn("备份", mb.CONFIG_LOAD_ERROR)
+        self.assertTrue(cfg_mod.CONFIG_LOAD_ERROR, "读坏必须显式记录，不能静默")
+        self.assertIn("备份", cfg_mod.CONFIG_LOAD_ERROR)
         self.assertEqual(cfg["slots"], mb._coerce_slots(None))
         self.assertTrue(glob.glob(mb.CONFIG_FILE + ".bad-*.json"),
                         "坏配置必须留副本，避免下一次保存覆盖掉用户原文件")
@@ -2085,9 +2096,9 @@ class WalkthroughRound2Test(TempConfigCase):
     def test_save_failure_is_logged(self):
         """v2.03.0 P1：18 处调用里 7 处丢弃返回值，失败必须自己留痕。"""
         logged = []
-        with unittest.mock.patch.object(mb, "_atomic_write_text",
+        with unittest.mock.patch.object(cfg_mod, "_atomic_write_text",
                                         side_effect=OSError("磁盘只读")), \
-                unittest.mock.patch.object(mb, "_write_event_log",
+                unittest.mock.patch.object(cfg_mod, "_write_event_log",
                                            side_effect=lambda m: logged.append(m)):
             ok, err = mb.save_config(mb.default_config())
         self.assertFalse(ok)
@@ -2097,9 +2108,9 @@ class WalkthroughRound2Test(TempConfigCase):
 
     def test_save_failure_never_raises_when_log_also_fails(self):
         """"保存失败"不能升级成"程序崩溃"——日志再失败也要吞掉。"""
-        with unittest.mock.patch.object(mb, "_atomic_write_text",
+        with unittest.mock.patch.object(cfg_mod, "_atomic_write_text",
                                         side_effect=OSError("磁盘只读")), \
-                unittest.mock.patch.object(mb, "_write_event_log",
+                unittest.mock.patch.object(cfg_mod, "_write_event_log",
                                            side_effect=OSError("日志也写不了")):
             ok, err = mb.save_config(mb.default_config())
         self.assertFalse(ok)
@@ -2145,7 +2156,7 @@ class WalkthroughRound2Test(TempConfigCase):
         with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"caps": ["bad"], "monitors": [1], "enabled": True}, f)
         cfg = mb.load_config()
-        self.assertEqual(mb.CONFIG_LOAD_ERROR, "")
+        self.assertEqual(cfg_mod.CONFIG_LOAD_ERROR, "")
         self.assertEqual(cfg["monitors"], [1])   # 设置没被重置
         self.assertTrue(cfg["enabled"])
 
