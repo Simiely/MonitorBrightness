@@ -5,8 +5,8 @@
   - 时间解析与旧配置兼容
   - 启动自检只校验计划任务，绝不补执行、绝不熄屏（v1.9.4）
   - 计划任务参数拼装与落盘 XML 校验
-  - 「添加时间段」点击后 300ms 内出现可见弹窗，并能在弹窗里完成一次添加（需要可用 Tk）
-  - v1.9.2 任务重建成功：300ms 内可见「确认」窗，点确认销毁；失败/启动自愈不弹
+  - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
+  - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
 import glob
 import html
@@ -15,13 +15,25 @@ import os
 import shutil
 import sys
 import tempfile
-import time
 import types
 import unittest
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import monitor_brightness as mb
+
+
+def pump_ui(root, rounds=2):
+    """跑固定轮数的 Tk 事件循环，把 UI 回归用例从墙钟时间上摘下来。
+
+    实测（2026-11-27）：两个回归场景的弹窗都不需要等待真实时间——
+      1. `SchedulePanel.add_row` 在点击调用内**同步**创建 Toplevel，1 次 update 即 mapped；
+      2. `_announce_rebuilt` 用 `root.after(0, ...)` 投递通知，下一轮 update 即 mapped。
+    所以旧写法 `time.time() + 0.3` 只是给慢机器留余量，却把「跑得快」写成了
+    「必须 300ms 内」——在 2 核 CI runner 上（Tk 初始化实测 810ms）就是 flake 源。
+    """
+    for _ in range(rounds):
+        root.update()
 
 
 class TempConfigCase(unittest.TestCase):
@@ -553,7 +565,7 @@ class TaskTest(TempConfigCase):
 
 
 class AddButtonRegression(TempConfigCase):
-    """点击「＋ 添加时间段」→ 300ms 内出现可见弹窗 → 在弹窗里完成一次添加。
+    """点击「＋ 添加时间段」→ 立即创建弹窗、跑事件循环即可见 → 在弹窗里完成一次添加。
 
     用隐藏的 Tk 构建真实的 SchedulePanel 和真实 SlotEditor，全程不显示窗口、
     不碰显示器。v1.9.0 的教训：只断言列表 +1 不够，必须断言弹窗真的可见。
@@ -620,20 +632,11 @@ class AddButtonRegression(TempConfigCase):
 
         self.assertEqual(len(panel.slots), 1)
         panel.add_btn._command()              # 等价于一次完整点击的最终出口
+        pump_ui(self.root)                    # 同步创建的弹窗：跑事件循环即可见
 
-        dialog = None
-        deadline = time.time() + 0.3
-        while time.time() < deadline:
-            self.root.update()
-            for w in self.root.winfo_children():
-                if isinstance(w, tk.Toplevel) and w.winfo_exists():
-                    dialog = w
-                    if w.winfo_ismapped() and w.winfo_width() > 0:
-                        break
-            if dialog is not None and dialog.winfo_ismapped():
-                break
-            time.sleep(0.02)
-        self.assertIsNotNone(dialog, "点击后 300ms 内没有创建 Toplevel 弹窗")
+        dialog = next((w for w in self.root.winfo_children()
+                       if isinstance(w, tk.Toplevel) and w.winfo_exists()), None)
+        self.assertIsNotNone(dialog, "点击后没有创建 Toplevel 弹窗")
         self.assertTrue(dialog.winfo_ismapped(), "弹窗存在但不可见")
         self.assertGreater(dialog.winfo_width(), 0, "弹窗宽度为 0")
         self.assertGreater(dialog.winfo_height(), 0, "弹窗高度为 0")
@@ -655,7 +658,7 @@ class AddButtonRegression(TempConfigCase):
 
 
 class RebuildNoticeRegression(TempConfigCase):
-    """v1.9.2：重建成功 → 300ms 内出现可见「确认」窗 → 点确认销毁。
+    """v1.9.2：重建成功 → after(0) 投递的「确认」窗在事件循环里可见 → 点确认销毁。
 
     失败路径不得弹成功窗（只走 showerror）；启动自动重建也不弹（状态/事件反馈）。
     """
@@ -751,18 +754,11 @@ class RebuildNoticeRegression(TempConfigCase):
         out = "TaskInfo=NEVER|0|2026-11-04 21:00|Ready\nCatchUpTask=Ready\nREGISTER_OK"
 
         mb.App._finish_register(fake, (True, out), part, self._stale_xml())
+        pump_ui(self.root)                    # after(0) 投递的确认窗：下一轮事件可见
 
-        dialog = None
-        deadline = time.time() + 0.3
-        while time.time() < deadline:
-            self.root.update()
-            tops = self._top_levels()
-            if tops:
-                dialog = tops[-1]
-                if dialog.winfo_ismapped() and dialog.winfo_width() > 0:
-                    break
-            time.sleep(0.01)
-        self.assertIsNotNone(dialog, "重建成功后 300ms 内没有创建确认 Toplevel")
+        tops = self._top_levels()
+        self.assertTrue(tops, "重建成功后没有创建确认 Toplevel")
+        dialog = tops[-1]
         self.assertTrue(dialog.winfo_ismapped(), "确认窗存在但不可见")
         self.assertGreater(dialog.winfo_width(), 0, "确认窗宽度为 0")
 

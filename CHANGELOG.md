@@ -24,6 +24,10 @@
   `schema/taxonomy.json` 的 version 同步，否则 fleet 审计报 skew）
 - **CI**：新增 `tests` job（windows-latest）跑 35 项回归 + Tk 探针 + `skipped` 假绿拦截；
   不设 `continue-on-error`（它会让失败的 job 仍报绿，观察期等于盲区）
+- **测试去墙钟化**：两个 GUI 回归用例原本用 `time.time() + 0.3` 轮询弹窗（Fowler 的非确定性
+  清单里「时间」和「异步」两坑）。实测弹窗要么在点击调用内同步创建、要么经 `after(0)`
+  投递，**1 次 Tk 事件循环就 mapped**，完全不用等真实时间。改成固定轮数 `pump_ui()`：
+  CI runner 上 Tk 初始化实测 810ms，旧的 300ms 时限是潜在的 flake 源。本地连跑 10 次全绿
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
