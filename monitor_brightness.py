@@ -1643,6 +1643,36 @@ def topology_off(indices):
     return done or list(normalize_indices(indices)), []
 
 
+def topology_inactive_rows(rows=None):
+    """给 GUI 用：拓扑里「设备还连着但 ACTIVE=0」的物理屏（断开的屏）。
+
+    VDD 永不显示（D4：不作目标）；ACTIVE 的屏由 enumerate_targets 那一行负责，
+    这里只返回多出来的、界面上原本看不到的行。纯函数，便于单测。
+    """
+    rows = rows if rows is not None else ccd_probe_topology()
+    out = []
+    for r in rows:
+        if r.get("vdd") or r.get("active") or not r.get("anchor"):
+            continue
+        out.append({"anchor": r["anchor"],
+                    "friendly": r.get("friendly") or "",
+                    "gdi": r.get("gdi") or ""})
+    return out
+
+
+def topology_enable_anchor(cfg, anchor):
+    """GUI「启用」按钮：确认快照确实覆盖这块屏，再走完整接回 + 写亮度。"""
+    try:
+        snap = _ccd_load_snapshot()
+    except FileNotFoundError:
+        return [], [(-1, "没有拓扑快照，请用「点亮屏幕」接回")]
+    except Exception as e:
+        return [], [(-1, "拓扑快照读取失败：%s" % e)]
+    if anchor not in (snap.get("targetAnchors") or []):
+        return [], [(-1, "快照里没有这块屏，不能单独启用")]
+    return screen_on_cfg(cfg, [])
+
+
 def topology_indices_for_anchors(anchors):
     """把恢复出来的锚点映射回**当前**显示器下标（只认 ACTIVE source 的 GDI）。
 
@@ -4127,6 +4157,23 @@ class MonitorPanel:
                         info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
                 Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
                 self.mon_rows[i] = row
+            # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置），
+            # 灰显 + 右侧「启用」按钮。VDD 永不显示；默认 ddc/system 路径没有这些行。
+            for extra in (getattr(self.app, "topo_inactive", None) or []):
+                row = tk.Frame(self.inner, bg=UI["card"])
+                row.pack(fill="x")
+                tk.Frame(row, bg=UI["fill_off"], width=3).pack(
+                    side="left", fill="y", padx=(6, 0), pady=7)
+                txt = tk.Frame(row, bg=UI["card"])
+                txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
+                Label(txt, extra.get("friendly") or "断开的显示器",
+                      size=9, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
+                Label(txt, "已断开 · 设备仍连接（点「启用」接回）",
+                      size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
+                Button(row, "启用",
+                       lambda a=extra["anchor"]: self.app.topology_enable(a),
+                       kind="link", height=18, pad_bg=UI["card"],
+                       font_size=8).pack(side="right", padx=(0, 8))
         finally:
             self._suspend = False
 
@@ -4690,6 +4737,7 @@ class App:
         self._config_error = CONFIG_LOAD_ERROR
         self.monitors = []
         self.mon_info = []
+        self.topo_inactive = []           # 拓扑模式下断开的物理屏（GUI 灰显行）
         self.mon_models = {int(k): v for k, v in self.cfg.get("models", {}).items()}
         self._read_queue = queue.Queue()
         self._bg_tasks = 0
@@ -4915,6 +4963,14 @@ class App:
         finally:
             release_targets(targets)
         self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
+        # 拓扑模式额外列出「断开但设备还在」的屏；ddc/system 一律清空。
+        if self.cfg.get("screen_off_method") == "topology":
+            try:
+                self.topo_inactive = topology_inactive_rows()
+            except Exception:
+                self.topo_inactive = []
+        else:
+            self.topo_inactive = []
         self.mon_panel.rebuild(self._restore_selection(prev))
         if not self.monitors:
             self.status_var.set(
@@ -5245,6 +5301,37 @@ class App:
             self._relight_pending = True
             threading.Timer(mins * 60,
                             lambda: self._read_queue.put(("hotkey", "on", None))).start()
+        if self.cfg.get("screen_off_method") == "topology":
+            # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
+            self.refresh_monitors(silent=True)
+        self.probe_screens()
+
+    def topology_enable(self, anchor):
+        """GUI「启用」按钮：后台接回指定锚点的屏（不碰 Tk）。"""
+        if self._busy:
+            self._queue_screen_action("on")
+            return
+        self._busy_action = "on"
+        self.status_var.set("正在启用显示器…")
+
+        def job():
+            return topology_enable_anchor(self.cfg, anchor)
+
+        self.run_bg(job, self._finish_topology_enable, busy=True)
+
+    def _finish_topology_enable(self, result):
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            mark_screen_state(self.cfg, "on")
+            save_config(self.cfg)
+            self.status_var.set("显示器已启用")
+            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
+            self.refresh_monitors(silent=True)
+        for i, e in errs:
+            self.status_var.set("启用失败：" + (e if i < 0 else "显示器 %d: %s" % (i, e)))
+        if errs:
+            self.msg.showwarning("启用失败", "\n".join(
+                (e if i < 0 else "显示器 %d: %s" % (i, e)) for i, e in errs))
         self.probe_screens()
 
     def screen_on(self):
@@ -5278,6 +5365,9 @@ class App:
                    "或改用「系统级」再试一次。"
                    if self.cfg.get("screen_off_method") == "ddc" else "")
             self.msg.showwarning("点亮失败", detail + tip)
+        if self.cfg.get("screen_off_method") == "topology":
+            # 接回后副屏重新出现，刷新列表把灰显行去掉
+            self.refresh_monitors(silent=True)
         self.probe_screens()
 
     def _auto_relight_minutes(self):

@@ -28,6 +28,14 @@
   恢复快照后若照旧下标写亮度，刚接回的副屏拿不到亮度。改为按快照锚点**恢复后重新映射**
   下标（`topology_indices_for_anchors`，只认 ACTIVE source 的 gdi，不碰 aliases 串味），
   与旧下标取并集再写。新增 2 项回归单测 → **56 tests OK**。
+- **GUI 显示断开屏**（用户点名要求，对齐 Windows 设置）：拓扑模式下列表额外列出
+  `ACTIVE=0 但 targetAvailable=1` 的物理屏，灰显并带「启用」按钮；VDD 永不显示。
+  断开/接回完成后自动重刷列表；`topology_enable_anchor()` 先校验快照覆盖该锚点，
+  再走完整接回 + 写亮度。默认 `ddc` / `system` 的界面与列表一行未动。
+  新增 4 项 GUI 单测（含隐藏 Tk 渲染断言「启用」按钮）→ **60 tests OK**。
+- **计划任务清空**（用户要求）：`MonitorBrightness_Schedule` / `CatchUp` 已注销；
+  复查 `Get-ScheduledTask` 已无 `MonitorBrightness*` 任务（其余系统任务未动）。
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、60 tests OK。
 
 ### 2026-11-27 · 按单项目规范 2.1.5 整理文档维护
 

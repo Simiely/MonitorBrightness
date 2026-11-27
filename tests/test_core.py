@@ -899,6 +899,85 @@ class MonitorIdentityTest(unittest.TestCase):
             self.assertEqual(mb.selection_anchors([]), [])
 
 
+class TopologyGuiTest(TempConfigCase):
+    """拓扑模式 GUI：断开的屏要列出来且可「启用」；VDD 永不显示。"""
+
+    def test_inactive_rows_exclude_vdd_and_active(self):
+        rows = [
+            {"anchor": "A1", "active": True, "vdd": False, "friendly": "P1", "gdi": "DISPLAY1"},
+            {"anchor": "A2", "active": False, "vdd": False, "friendly": "P2", "gdi": "DISPLAY2"},
+            {"anchor": "V1", "active": False, "vdd": True, "friendly": "VDD", "gdi": "DISPLAY9"},
+            {"anchor": "", "active": False, "vdd": False, "friendly": "?", "gdi": ""},
+        ]
+        got = mb.topology_inactive_rows(rows)
+        self.assertEqual([r["anchor"] for r in got], ["A2"])
+
+    def test_enable_uses_snapshot_and_writes_brightness(self):
+        cfg = mb.default_config()
+        cfg["screen_off_method"] = "topology"
+        snap = {"targetAnchors": ["A2"], "pathCount": 3, "modeCount": 3,
+                "pathsHex": "", "modesHex": ""}
+        with unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
+                unittest.mock.patch.object(mb, "screen_on_cfg",
+                                           return_value=([1], [])) as on:
+            ok, errs = mb.topology_enable_anchor(cfg, "A2")
+        self.assertEqual((ok, errs), ([1], []))
+        on.assert_called_once_with(cfg, [])
+
+    def test_enable_rejects_anchor_not_in_snapshot(self):
+        cfg = mb.default_config()
+        cfg["screen_off_method"] = "topology"
+        snap = {"targetAnchors": ["A2"]}
+        with unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
+                unittest.mock.patch.object(mb, "screen_on_cfg") as on:
+            ok, errs = mb.topology_enable_anchor(cfg, "OTHER")
+        self.assertEqual(ok, [])
+        self.assertIn("快照里没有", errs[0][1])
+        on.assert_not_called()
+
+    def test_panel_renders_disconnected_row_with_enable_button(self):
+        try:
+            import tkinter as tk
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有 tkinter：%s" % e)
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            fake = types.SimpleNamespace(
+                body=tk.Frame(root), cfg=mb.default_config(),
+                monitors=[{"index": 0, "dev": "DISPLAY1"}],
+                mon_info=[("DISPLAY1", 2560, 1440, True)], mon_models={},
+                topo_inactive=[{"anchor": "A2", "friendly": "R27qe Gen2", "gdi": "DISPLAY2"}],
+                refresh_monitors=lambda silent=False: None,
+                read_current=lambda: None,
+                on_monitor_toggle=lambda: None,
+                select_none=lambda: None, select_all=lambda: None,
+                topology_enable=lambda anchor: None)
+            panel = mb.MonitorPanel(fake)
+            fake.mon_panel = panel
+            panel.rebuild([])
+            texts = []
+            for row in panel.inner.winfo_children():
+                for w in row.winfo_children():
+                    for sub in w.winfo_children():
+                        if hasattr(sub, "cget"):
+                            try:
+                                texts.append(str(sub.cget("text")))
+                            except Exception:
+                                pass
+            self.assertTrue(any("已断开" in t for t in texts), texts)
+            self.assertTrue(any("R27qe Gen2" in t for t in texts), texts)
+            buttons = [w for row in panel.inner.winfo_children()
+                       for w in row.winfo_children()
+                       if getattr(w, "_text", None) == "启用"]
+            self.assertEqual(len(buttons), 1)
+        finally:
+            root.destroy()
+
+
 class TopologyActionTest(TempConfigCase):
     """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
 
