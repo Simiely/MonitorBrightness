@@ -10,6 +10,7 @@ v2.03.0 U1：从 monitor_brightness.py 逐字搬出（行为零变化）。
 （历史坑：曾有第二句模块级 `from PIL import ...` 击穿了这层守卫。）
 """
 import ctypes
+import sys
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -322,4 +323,22 @@ def _aa_circle(dia, fill):
     _AA_CACHE[key] = ph
     _AA_REFS.append(ph)
     return ph
+
+
+
+def apply_dark_titlebar(root):
+    """把 Windows 标题栏切成深色（DWM 沉浸式深色模式）。非致命，失败就跳过。"""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        value = ctypes.c_int(1)
+        for attr in (20, 19):   # 20：Win10 20H1+ / Win11；19：更早的 Win10
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                break
+    except Exception:
+        pass
 
