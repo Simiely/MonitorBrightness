@@ -1277,12 +1277,11 @@ class DiagExportTest(TempConfigCase):
         self.assertEqual(mb._pick_log_dir(), mb.APP_DIR)
 
     def test_log_dir_falls_back_to_config_dir_when_readonly(self):
-        old = mb._dir_writable
-        mb._dir_writable = lambda p: False
-        try:
-            self.assertEqual(mb._pick_log_dir(), mb.CONFIG_DIR)
-        finally:
-            mb._dir_writable = old
+        """v2.03.0 U5：_pick_log_dir 搬到 core/paths.py 后，它在本模块内查找
+        _dir_writable，所以要 patch 那里 —— patch 主文件的名字不再生效。"""
+        from core import paths as _paths
+        with unittest.mock.patch.object(_paths, "_dir_writable", return_value=False):
+            self.assertEqual(mb._pick_log_dir(), _paths.CONFIG_DIR)
 
     def test_export_zip_contains_logs_and_env(self):
         import zipfile

@@ -83,6 +83,13 @@ from domain.timeutil import (                        # noqa: E402
     normalize_days, normalize_time_input, parse_hhmm, shift_time,
     slot_matches_weekday, slots_for_weekday,
 )
+# v2.03.0 U5 前置：路径常量搬到 core/paths.py（零依赖层）。
+# 用 from ... import 把名字绑到本模块，因此主文件内所有引用、以及测试里
+# `mb.CONFIG_FILE = ...` 的覆盖写法都照旧有效（Python 在本模块命名空间查找）。
+from core.paths import (                             # noqa: E402
+    APP_DIR, CONFIG_DIR, CONFIG_FILE, ERROR_FILE, EVENTS_FILE, LOG_DIR,
+    _LEGACY_CONFIG_DIR, _app_dir, _dir_writable, _pick_log_dir,
+)
 
 # Pillow 只有 GUI 需要（抗锯齿圆角贴图）。**必须有守卫**：
 # 缺 Pillow 时 CLI（--set / --apply-schedule / --diag / --selftest）照常工作，
@@ -132,59 +139,14 @@ APP_TITLE = "显示器亮度定时调节"
 APP_VERSION = "2.03.1"     # 滚轮改进程级路由（修 unbind_all 清空全局绑定的回归）
 
 
-def _app_dir():
-    """程序所在目录：打包态 = exe 所在目录；源码运行 = 脚本所在目录。"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
 
 
-def _dir_writable(path):
-    """真的试着写一下再删。
-
-    `os.access(W_OK)` 在 Windows 上对 Program Files 之类的目录会返回 True，
-    实际写的时候才报错，所以必须真写。
-    """
-    probe = os.path.join(path, ".mb-write-probe")
-    try:
-        os.makedirs(path, exist_ok=True)
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(probe)
-        return True
-    except Exception:
-        try:
-            os.remove(probe)
-        except Exception:
-            pass
-        return False
 
 
-# v2.01.17：配置也便携化到**程序所在目录**（用户要求）。
-# 便携化是软件常见做法（SO #4897525）：配置文件放程序根目录，整个目录拷走
-# 设置就跟着走。只有程序目录不可写（Program Files / 只读介质）才回退 APPDATA。
-_LEGACY_CONFIG_DIR = os.path.join(
-    os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
-APP_DIR = _app_dir()
-CONFIG_DIR = APP_DIR if _dir_writable(APP_DIR) else _LEGACY_CONFIG_DIR
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 
-def _pick_log_dir():
-    """日志放**程序同目录**（便携、出问题整个目录发给开发者就行）。
-
-    只有程序目录不可写才回退到 APPDATA —— 装在 Program Files、只读介质、
-    网络盘上时会走到这条回退路径。配置现在也在这里（v2.01.17）。
-    """
-    app_dir = _app_dir()
-    return app_dir if _dir_writable(app_dir) else CONFIG_DIR
 
 
-# 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
-# ⚠️ 本程序启动时不会主动熄屏：启动自检只校验计划任务定义，绝不补执行任何档位。
-LOG_DIR = _pick_log_dir()
-EVENTS_FILE = os.path.join(LOG_DIR, "events.log")
-ERROR_FILE = os.path.join(LOG_DIR, "error.log")
 
 
 def _migrate_old_logs():
@@ -4906,7 +4868,1141 @@ def tray_tooltip_text(cfg, last_verdict, title):
 
 
 
-class App:
+class _ScreenActions:
+    """屏幕动作：亮度下发、逐台亮灭、探测与状态刷新。
+
+    v2.03.0 U5-2：从 App 里按职责切出。方法体一字未改（`self.xxx`
+    仍指向最终的 App 实例），因此零行为变化。将来的物理分离只需
+    把这些类搬到独立文件再 import —— 那时才算真正的模块化。
+    """
+
+    def apply_presets_from_settings(self):
+        """预设数值：从设置弹层里的三个输入框读回来（失焦时触发）。"""
+        sheet = None
+        for w in self.root.winfo_children():
+            if isinstance(w, SettingsSheet):
+                sheet = w
+        if sheet is None:
+            return
+        vals = [_safe_int(sp.get(), 50) for sp in sheet.preset_spins]
+        self.apply_setting("presets", vals)
+
+    # ---------- 显示器勾选 ----------
+    def select_all(self):
+        self.mon_panel.set_all(True)
+        self.read_current()
+
+    def select_none(self):
+        self.mon_panel.set_all(False)
+        self.read_current()
+
+    def on_monitor_toggle(self):
+        if not self.mon_panel._suspend:
+            self.read_current()
+
+    def refresh_monitors(self, silent=False):
+        prev = self.selected_indices()
+        targets = enumerate_targets()
+        try:
+            self.monitors = [{k: v for k, v in t.items() if k != "handle"}
+                             for t in targets]
+        finally:
+            release_targets(targets)
+        self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
+        # v2.01.21：CCD 探测（QDC_ALL_PATHS，实测 0.1ms）在**任何模式**都做：
+        #   1) 填 `_ccd_names` —— DDC 读型号要 6.2 秒，期间先用真实友好名显示，
+        #      别让用户看"显示器 0"（截图实证）；
+        #   2) 填 `topo_inactive` —— 虚拟显示器始终列出来。以前只有 topology
+        #      模式才列，默认 ddc 模式下串流在跑也看不见 VDD（用户报"没刷新出
+        #      虚拟显示器"）。物理断开屏仍只在 topology 模式列（只有它能接回）。
+        try:
+            rows = ccd_probe_topology()
+            self._vdd_devs = {_short_dev(r.get("gdi"))
+                              for r in rows if r.get("vdd")}
+            self._ccd_names = {_short_dev(r.get("gdi")): r.get("friendly")
+                               for r in rows
+                               if r.get("gdi") and r.get("friendly")}
+            inactive = topology_inactive_rows(rows)
+            if self.cfg.get("screen_off_method") == "topology":
+                self.topo_inactive = inactive
+            else:
+                # 非拓扑模式：只留 VDD（灰显、无操作按钮），它代表串流在跑
+                self.topo_inactive = [r for r in inactive if r.get("vdd")]
+        except Exception:
+            self._vdd_devs = set()
+            self._ccd_names = {}
+            self.topo_inactive = []
+        self.mon_panel.rebuild(self._restore_selection(prev))
+
+    def _set_actions_enabled(self, enabled):
+        self.status_card.set_actions_enabled(enabled)
+        self.bri_panel.set_actions_enabled(enabled)
+        self.sch_panel.set_actions_enabled(enabled)
+
+    # ---------- 亮度 / 探测 ----------
+    def read_current(self):
+        """轻量刷新：只读亮度（1 次 DDC 读/屏）。
+
+        ⚠️ 实测（2026-11-03）：合并"探测+读亮度"后这里变成 3 读/屏（371ms），
+        而本方法在每次应用亮度/切换勾选后都会自动执行，是"响应变慢"的主因。
+        自动刷新回归轻量路径；全量探测（probe_screens，371ms）只留给
+        「检测」按钮、启动和熄灭/点亮状态切换点。
+        """
+        self.refresh_brightness()
+        self._fetch_models()
+
+    def refresh_brightness(self):
+        """只读各屏亮度并更新提示行（不重判亮灭）。
+
+        用独立的 _brighting 标志：启动时 refresh_monitors 的轻量刷新如果
+        占着全量探测的 _probing，紧接着的 probe_screens() 会被守卫静默跳过，
+        状态卡就停在控件默认值上（实测踩过）。
+        """
+        if not self.monitors or self._brighting:
+            return
+        self._brighting = True
+        targets = self.selected_indices() or list(range(len(self.monitors)))
+
+        def job():
+            try:
+                return {}, get_brightness_many(targets)[0]
+            except Exception:
+                return {}, {}
+
+        self.run_bg(job, self._render_states)
+
+    def apply_now(self):
+        if self._busy:
+            return
+        targets = self.selected_indices()
+        level = clamp_level(self.bri_panel.level())
+        self.status_var.set("正在下发亮度 %d%% …" % level)
+        self.run_bg(lambda: set_brightness_many(targets, level),
+                    lambda r: self._finish_apply_level(r, level), busy=True)
+
+    def _finish_apply_level(self, result, level):
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            self.status_var.set("已把 %s 的亮度设为 %d%%"
+                                % ("、".join("显示器 %d" % i for i in ok), level))
+        if errs:
+            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
+            self.status_var.set("部分失败：" + detail.replace("\n", " "))
+            self.msg.showwarning("部分显示器失败", detail)
+        self.read_current()
+
+    # ---------- 快捷预设 ----------
+    def apply_preset(self, i):
+        if self._busy:
+            return
+        presets = self.cfg.get("presets") or []
+        if not (0 <= i < len(presets)):
+            return
+        level = clamp_level(presets[i])
+        self.bri_panel.set_level(level)
+        self.status_var.set("正在把全部显示器设为 %d%% …" % level)
+        self.run_bg(lambda: set_brightness_many([], level),
+                    lambda r: self._finish_preset(r, level), busy=True)
+
+    def _finish_preset(self, result, level):
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            self.status_var.set("全部显示器已设为 %d%%（%d 台）" % (level, len(ok)))
+        if errs:
+            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
+            self.status_var.set("部分失败：" + detail.replace("\n", " "))
+            self.msg.showwarning("部分显示器失败", detail)
+        self.read_current()
+
+    # ---------- 亮灭检测 ----------
+    def probe_screens(self):
+        """「检测」：一次后台任务里同时读亮灭结论与当前亮度。"""
+        if not self.monitors or self._probing:
+            return
+        self._probing = True
+        targets = self.selected_indices() or list(range(len(self.monitors)))
+
+        def job():
+            states = probe_states()
+            try:
+                bright = get_brightness_many(targets)[0]
+            except Exception:
+                bright = {}
+            return states, bright
+
+        self.run_bg(job, self._render_states)
+
+    def _update_hint_brightness(self, bright):
+        vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
+        if not vals:
+            return
+        if len(set(vals)) == 1:
+            b = "当前 %d%%" % vals[0]
+        else:
+            b = "当前 %s%%" % "/".join(str(x) for x in vals)
+        if self._last_verdict.get("state") == "off":
+            return  # 熄灭状态提示行不显示亮度
+        self.status_card.set_hint_default("%s · %d 台显示器" % (b, len(self.monitors)))
+
+    def _status_payload(self, state, hint):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return status_payload(self.cfg, state, hint)
+
+    # ---------- 熄屏 / 点亮 ----------
+    def _row_action_blocker(self):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return row_action_blocker(self.cfg, self._busy)
+
+    def monitor_off(self, index):
+        """行内「熄灭」：只熄灭这一块，不动别的。"""
+        dlog("app.action", what="monitor_off", index=index)
+        why = self._row_action_blocker()
+        if why:
+            self.status_var.set(why)
+            return
+        if self.cfg.get("screen_off_method") == "topology":
+            anchors = selection_anchors([index])
+            if not anchors:
+                self.status_var.set("拿不到这块屏的锚点，无法单独断开")
+                return
+            is_primary = (index < len(self.mon_info) and self.mon_info[index][3])
+            if is_primary:
+                # 主屏不能直接从拓扑里摘掉（Windows 实测 rc=87），但可以先把
+                # 主屏角色交给别人再摘 —— 全程纯拓扑操作，不碰面板电源。
+                self._ask_heir(index, anchors)
+                return
+        self._busy_action = "off"
+        self._row_action = True
+        self.status_var.set("正在熄灭显示器 %d…" % index)
+        self.run_bg(lambda: screen_off_cfg(self.cfg, [index]),
+                    self._finish_screen_off, busy=True)
+
+    def monitor_on(self, index):
+        """行内「显示」：只点亮这一块。"""
+        dlog("app.action", what="monitor_on", index=index)
+        why = self._row_action_blocker()
+        if why:
+            self.status_var.set(why)
+            return
+        self._busy_action = "on"
+        self._row_action = True
+        self.status_var.set("正在点亮显示器 %d…" % index)
+        self.run_bg(lambda: screen_on_row(self.cfg, index),
+                    self._finish_screen_on, busy=True)
+
+    def _queue_screen_action(self, action):
+        """忙时点击：给可见反馈，并记下最后一次请求，结束后补执行一次。
+
+        v1.9.5：之前 `_busy` 窗口内直接静默 return，用户看到的是
+        「点了没反应」。这里只做排队记账，**不启动任何屏幕动作**，因此不改变
+        熄灭/点亮调用链，也不改变 `_busy` 窗口长度。
+        """
+        self._pending_screen = action
+        label = "点亮" if action == "on" else "熄灭"
+        if self._busy_action == "on":
+            head = "正在唤醒中…"
+        elif self._busy_action == "off":
+            head = "正在熄灭中…"
+        else:
+            head = "正在处理其他操作…"
+        self.status_var.set("%s%s请求已排队，完成后自动执行" % (head, label))
+        _write_event_log("忙时%s请求已排队（当前动作：%s）"
+                         % (label, {"on": "点亮", "off": "熄灭"}.get(
+                             self._busy_action, "其它")))
+
+    def _dispatch_pending_screen(self):
+        """当前忙任务结束后补执行排队的那一次屏幕请求。返回是否补执行。"""
+        if self._busy or not self._pending_screen:
+            return False
+        action, self._pending_screen = self._pending_screen, None
+        _write_event_log("补执行忙时排队的%s请求" % ("点亮" if action == "on" else "熄灭"))
+        if action == "on":
+            self.screen_on()
+        else:
+            self.screen_off()
+        return True
+
+    def screen_off(self):
+        targets = self.selected_indices()
+        dlog("app.action", what="screen_off", targets=targets)
+        if not targets:
+            self.status_var.set("请先勾选要操作的显示器")
+            return
+        if self._busy:
+            self._queue_screen_action("off")
+            return
+        self._busy_action = "off"
+        self.status_var.set("正在熄灭显示器…")
+        self.run_bg(lambda: screen_off_cfg(self.cfg, targets),
+                    self._finish_screen_off, busy=True)
+
+    def _finish_screen_off(self, result):
+        row_action, self._row_action = getattr(self, "_row_action", False), False
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            # 行内逐台操作不碰"勾选"：用户点的是这一行，不是改选择
+            if not row_action:
+                self._remember_selection()
+            save_config(self.cfg)          # 拓扑断开时顺手记下了原位置
+            self.status_var.set("已熄灭显示器")
+            self.status_card.render(self._status_payload(
+                "off", "键鼠输入不会点亮它；点「点亮屏幕」恢复"))
+        if errs:
+            self.msg.showwarning("熄灭失败", "\n".join(
+                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
+        mins = self._auto_relight_minutes()
+        if ok and mins > 0:
+            self._relight_pending = True
+            # 走查 E1-05：必须持有 timer 句柄，手动点亮/再次熄灭时取消旧的，
+            # 否则残留 timer 会在用户已手动点亮后触发一次"无缘无故的点亮"。
+            self._cancel_relight_timer()
+            self._relight_timer = threading.Timer(
+                mins * 60, lambda: self._read_queue.put(("screen_action", "on", None)))
+            self._relight_timer.start()
+        if self.cfg.get("screen_off_method") == "topology":
+            # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
+            self.refresh_monitors(silent=True)
+        self.probe_screens()
+
+    def screen_on(self):
+        targets = self.selected_indices()
+        dlog("app.action", what="screen_on", targets=targets)
+        if not targets:
+            self.status_var.set("请先勾选要操作的显示器")
+            return
+        if self._busy:
+            self._queue_screen_action("on")
+            return
+        self._busy_action = "on"
+        self.status_var.set("正在点亮显示器…")
+        self.run_bg(lambda: screen_wake_entry(self.cfg, targets),
+                    self._finish_screen_on, busy=True)
+
+    def _cancel_relight_timer(self):
+        """走查 E1-05：取消尚未触发的自动复亮 timer，并同步轮询标志。"""
+        timer = getattr(self, "_relight_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._relight_timer = None
+        self._relight_pending = False
+
+    def _finish_screen_on(self, result):
+        row_action, self._row_action = getattr(self, "_row_action", False), False
+        ok, errs = _as_ok_errs(result)
+        info = take_wake_info()
+        self._cancel_relight_timer()
+        if ok:
+            if not row_action:
+                self._remember_selection()
+            save_config(self.cfg)
+            self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
+            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
+        if errs:
+            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e
+                               for i, e in errs)
+            self.status_var.set("点亮失败：" + detail.replace("\n", " "))
+            tip = ("\n\n若这台屏是 DP+HDMI 同时接线，把「点亮时允许切信号源」关掉"
+                   "或改用「系统级」再试一次。"
+                   if self.cfg.get("screen_off_method") == "ddc" else "")
+            self.msg.showwarning("点亮失败", detail + tip)
+        if self.cfg.get("screen_off_method") == "topology":
+            # 接回后副屏重新出现，刷新列表把灰显行去掉
+            self.refresh_monitors(silent=True)
+        self.probe_screens()
+
+    def _auto_relight_minutes(self):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return auto_relight_minutes(self.cfg)
+
+    def _finish_apply(self, result, part, before_xml):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            # 走查 P-04：与其余入口统一回滚策略
+            self._rollback_schedule(False, "重建任务计划失败", out)
+            return
+        self.refresh_task_status()
+        self.status_var.set("任务计划已重建")
+        self._announce_rebuilt(part, out, before_xml, "任务计划已重建")
+
+
+class _ScheduleActions:
+    """定时：档位保存、任务重建、启动自检。
+
+    v2.03.0 U5-2：从 App 里按职责切出。方法体一字未改（`self.xxx`
+    仍指向最终的 App 实例），因此零行为变化。将来的物理分离只需
+    把这些类搬到独立文件再 import —— 那时才算真正的模块化。
+    """
+
+    def _tray_toggle_schedule(self):
+        if self.sch_panel.schedule_enabled():
+            self.cancel_schedule()
+        else:
+            if not self._set_schedule_enabled(True, persist=True):
+                return
+            self.status_var.set("正在写入任务计划…")
+            self.run_bg(lambda: register_tasks(self.cfg),
+                        self._finish_tray_register, busy=True)
+
+    def _refresh_events(self):
+        try:
+            self.sch_panel.set_events(read_session_events(3))
+        except Exception:
+            pass
+
+    def _start_auto_checks(self):
+        """窗口出来之后才跑：只校验计划任务是否已正确配置（全后台）。
+
+        ⚠️ 本程序启动时不会主动熄屏：这里只读任务 XML / 必要时原地重建任务，
+        绝不按「今天错过了哪一档」补执行，也不会改亮度或屏幕状态。
+        """
+        if self._auto_checked:
+            return
+        self._auto_checked = True
+        if not self.cfg.get("enabled"):
+            self._refresh_events()
+            return
+
+        def job():
+            try:
+                return {"task": ensure_task_registration(self.cfg)}
+            except Exception as e:
+                return {"task": (False, "任务自检失败：%s: %s" % (type(e).__name__, e))}
+
+        self.run_bg(job, self._finish_auto_checks)
+
+    def _finish_auto_checks(self, result):
+        if isinstance(result, Exception):
+            self.status_var.set("启动自检失败：%s" % result)
+            self._refresh_events()
+            return
+        _task_ok, task_msg = result.get("task", (True, ""))
+        # 启动自愈成功时不弹「确认」窗：每次启动都可能发生（换 exe 路径后尤其），
+        # 开机即弹会糊脸；反馈走状态卡 + 事件日志（task_msg 已含档位数/下次运行）。
+        if task_msg:
+            self.status_var.set(task_msg)
+        else:
+            # 配置正确：只报「已就绪 + 下次运行」，不做任何业务动作
+            _slots_now = self.cfg.get("slots") or []
+            nxt = _next_run_text([parse_hhmm(s.get("time"), (0, 0))
+                                  for s in _slots_now],
+                                 days_by_min=_days_by_min_from_fp(
+                                     _slot_trigger_fingerprint(_slots_now)))
+            self.status_var.set(("定时任务已就绪，下次运行 %s" % nxt) if nxt
+                                else "定时任务已就绪")
+        self._refresh_events()
+        if task_msg:
+            self.refresh_task_status()
+
+    # ---------- 定时 ----------
+    def on_slots_changed(self, slots):
+        """面板里增删改时间段后的统一出口：立即落盘；已启用则重写任务。"""
+        self.cfg["slots"] = [dict(s) for s in slots]
+        ok, msg = save_config(self.cfg)
+        if not ok:
+            self.msg.showerror("保存时间段失败", msg)
+            return
+        if not self.cfg.get("enabled"):
+            self.status_var.set("时间段已保存（开启每日定时后生效）")
+            return
+        self.status_var.set("时间段已保存，正在重写任务计划…")
+        if self._schedule_reg_timer:
+            try:
+                self.root.after_cancel(self._schedule_reg_timer)
+            except Exception:
+                pass
+        # 500ms 防抖：连续改几档只重建一次任务（每次 PowerShell 约 2~3 秒）
+        self._schedule_reg_timer = self.root.after(500, self._register_after_edit)
+
+    def _register_after_edit(self):
+        self._schedule_reg_timer = None
+        self.run_bg(lambda: register_tasks(self.cfg),
+                    self._finish_edit_register, busy=True)
+
+    def _finish_edit_register(self, result):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            # 走查 P-04：与面板/托盘失败统一回滚策略（原来只提示不回滚）
+            self._rollback_schedule(False, "重写任务计划失败", out)
+            return
+        _write_event_log("时间段已更新，任务计划已重写")
+        self.refresh_task_status()
+        self.status_var.set("定时已更新")
+        self._refresh_events()
+
+    def save_schedule(self):
+        try:
+            self._save_schedule_inner()
+        except Exception as e:
+            self.msg.showerror("保存定时出错", "%s: %s" % (type(e).__name__, e))
+            self.status_var.set("保存定时出错")
+
+    def _save_schedule_inner(self):
+        if not self.sch_panel.schedule_enabled():
+            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
+            return
+        slots = self.sch_panel.read_slots()
+        if slots is None:
+            return
+        idx, ids = selection_payload(self.selected_indices())
+        part = {"monitors": idx, "monitor_ids": ids,
+                "monitor_anchors": selection_anchors(idx),
+                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True)),
+                "slots": slots}
+        self.cfg.update(part)
+        if not self._set_schedule_enabled(True, persist=True):
+            return
+        self.status_var.set("正在写入任务计划…")
+        before_xml = _read_task_xml()          # 留一份重建前定义，用于比对变化
+        self.run_bg(lambda: register_tasks(self.cfg),
+                    lambda r: self._finish_register(r, part, before_xml), busy=True)
+
+    def rebuild_schedule_tasks(self):
+        """「应用」按钮：按当前面板内容强制重建任务计划（成功弹确认窗）。
+
+        走查 P-05：原名 apply_schedule 与模块级同名函数（按当前时间套档位）
+        混淆——按钮点的是"重建任务"，CLI --apply-schedule 跑的是"套档位"。
+        """
+        if not self.sch_panel.schedule_enabled():
+            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
+            return
+        slots = self.sch_panel.read_slots()
+        if slots is None:
+            return
+        part = {"slots": slots, "enabled": True,
+                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True))}
+        self.cfg["slots"] = [dict(s) for s in slots]
+        ok, msg = save_config(self.cfg)
+        if not ok:
+            self.msg.showerror("保存失败", msg)
+            return
+        self.status_var.set("正在重建任务计划…")
+        before_xml = _read_task_xml()
+        self.run_bg(lambda: register_tasks(self.cfg),
+                    lambda r: self._finish_apply(r, part, before_xml), busy=True)
+
+    def _announce_rebuilt(self, part, out, before_xml, title):
+        """重建成功后的「确认」弹窗（失败路径绝不调用这里）。
+
+        run_bg 的完成回调本来就由 _poll_read_queue 在 Tk 线程执行；再 after(0)
+        一次是为了让弹窗与回调栈彻底分开，也满足"后台线程结果必须回 Tk 线程"。
+        """
+        message = _rebuild_report(part, out, before_xml)
+        self.root.after(0, lambda: self.msg.shownotice(title, message))
+
+    def _finish_register(self, result, part, before_xml=""):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            # 开关是"切换即注册"：注册失败统一回滚（改状态 + 落盘 + 界面）
+            self._rollback_schedule(False, "注册任务失败", out)
+            return
+        self.refresh_task_status()
+        self.status_var.set("定时已启用")
+        self._announce_rebuilt(part, out, before_xml, "定时已保存")
+
+    def _set_schedule_enabled(self, enabled, persist=True):
+        """定时开关状态的**唯一**写入者：改内存 + 落盘 + 同步界面开关。
+
+        走查 P-01/P-02/P-04：以前 6 个入口各自写 cfg["enabled"]，
+        有的落盘有的不落盘，失败回滚策略四种不同。所有入口统一走这里。
+        返回 (是否成功)。落盘失败时回滚内存，不让界面说谎。
+        """
+        want = bool(enabled)
+        old = bool(self.cfg.get("enabled"))
+        self.cfg["enabled"] = want
+        if persist:
+            ok, msg = save_config(self.cfg)
+            if not ok:
+                self.cfg["enabled"] = old
+                self.msg.showerror("保存失败", msg)
+                return False
+        self.sch_panel.set_enabled_flag(want)
+        return True
+
+    def _rollback_schedule(self, to_enabled, title, out):
+        """任务写入失败时的**唯一**回滚者：改状态 + 落盘 + 提示。"""
+        self._set_schedule_enabled(to_enabled, persist=True)
+        self.msg.showerror(title, out or "未知错误")
+        self.status_var.set("%s（已恢复开关）" % title)
+
+    def cancel_schedule(self):
+        self._set_schedule_enabled(False, persist=True)
+        self.status_var.set("正在取消定时任务…")
+        self.run_bg(unregister_tasks, self._finish_unregister, busy=True)
+
+    def schedule_toggled(self, on):
+        """面板上的「启用每日定时」开关：开 = 注册，关 = 注销。"""
+        if on:
+            self.save_schedule()
+        else:
+            self.cancel_schedule()
+
+    def _finish_unregister(self, result):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            # 走查 P-02：注销失败必须把开关恢复为 True 并落盘，
+            # 否则磁盘说"已关闭"但任务残留、继续熄屏（cli_apply_schedule
+            # 现在也会因 enabled=false 拒绝执行，双保险）。
+            self._rollback_schedule(True, "取消定时任务失败", out)
+            self.refresh_task_status()
+            return
+        self.refresh_task_status()
+        self.status_var.set("已取消定时任务")
+
+    def refresh_task_status(self):
+        if self._task_querying:
+            return
+        self._task_querying = True
+        self.sch_panel.set_task_status({"state": "loading", "title": "任务计划：读取中…"})
+
+        def job():
+            try:
+                return (query_task_status(), query_task_runtime())
+            except Exception:
+                return ("", "")
+
+        def done(result):
+            self._task_querying = False
+            if isinstance(result, Exception):
+                result = ("", "")
+            text, runtime = result
+            self._apply_task_status(text, runtime)
+
+        self.run_bg(job, done)
+
+    def _apply_task_status(self, text, runtime=""):
+        info = task_summary(text, self.cfg.get("slots", []), runtime)
+        self.sch_panel.set_task_status(info)
+        self.scroll.refresh()
+        self._tray_update_tooltip()
+
+
+    # 兼容旧名（托盘/tray 里调用）
+    _refresh_task_status = refresh_task_status
+
+
+class _LayoutActions:
+    """布局：拓扑断开/接回、主屏交接、位置记忆、显示器数据。
+
+    v2.03.0 U5-2：从 App 里按职责切出。方法体一字未改（`self.xxx`
+    仍指向最终的 App 实例），因此零行为变化。将来的物理分离只需
+    把这些类搬到独立文件再 import —— 那时才算真正的模块化。
+    """
+
+    def remember_layout(self):
+        """把现在的显示器摆法记成"用户的布局"，断开/接回都按这份来。"""
+        layout, err = remember_layout_snapshot(self.cfg)
+        if err:
+            self.status_var.set("记不住布局：%s" % err)
+            self.msg.showerror("记住布局失败", err)
+            return
+        dlog("app.action", what="remember_layout", count=len(layout))
+        # v2.01.12：位置与完整 CCD 快照一起记，供「恢复双屏」整份写回
+        desc, snap_err = save_default_layout()
+        if snap_err:
+            self.status_var.set("位置已记住，但默认布局快照没存上：%s" % snap_err)
+            self._flash_remember_btn("快照失败", err=True)
+            return
+        self.status_var.set("已记住 %d 块屏的位置和布局（%s）" % (len(layout), desc))
+        self._flash_remember_btn("已记住 ✓")
+
+    def _flash_remember_btn(self, text, err=False):
+        """在「记住」按钮上短暂显示结果（v2.01.25）。
+
+        设置弹层是模态的，会挡住主窗口状态卡；不给就地回执，用户就以为没反应。
+        2 秒后复原；弹层先被关掉时 widget 已销毁，静默跳过。
+        """
+        btn = getattr(self, "_remember_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.set_text(text)
+            if err:
+                btn.after(2600, lambda: self._restore_remember_btn(btn))
+            else:
+                btn.after(1800, lambda: self._restore_remember_btn(btn))
+        except Exception:
+            pass
+
+    def _restore_remember_btn(self, btn):
+        try:
+            if btn.winfo_exists():
+                btn.set_text("记住")
+        except Exception:
+            pass
+
+    # ---- 恢复双屏（倒计时） ------------------------------------------------
+    def ask_restore_default(self):
+        """点「恢复双屏」：先校验默认布局还在且与硬件匹配，再启动倒计时。"""
+        if getattr(self, "_restore_after", None) is not None:
+            return
+        err = restore_default_layout(validate_only=True)
+        if err:
+            dlog("app.action", what="restore_default", stage="precheck", err=err)
+            self.status_var.set(err)
+            self.msg.showwarning("恢复双屏不可用", err)
+            return
+        secs = max(0, min(120, int(self.cfg.get("restore_delay", 10))))
+        dlog("app.action", what="restore_default", stage="countdown", seconds=secs)
+        self._restore_deadline = time.monotonic() + secs
+        self._tick_restore()
+
+    def _tick_restore(self):
+        """每秒刷一次剩余秒数；到点执行恢复。"""
+        left = int(self._restore_deadline - time.monotonic() + 0.999)
+        if left > 0:
+            self.status_card.set_restore_countdown(left)
+            self._restore_after = self.root.after(200, self._tick_restore)
+        else:
+            self._restore_after = None
+            self.status_card.set_restore_countdown(None)
+            self._do_restore_default()
+
+    def cancel_restore_default(self):
+        if getattr(self, "_restore_after", None) is not None:
+            self.root.after_cancel(self._restore_after)
+            self._restore_after = None
+        self.status_card.set_restore_countdown(None)
+        dlog("app.action", what="restore_default", stage="cancel")
+        self.status_var.set("已取消恢复双屏")
+
+    def _do_restore_default(self):
+        """倒计时到点：整份写回默认双屏布局（后台线程，不卡 UI）。"""
+        # v2.01.20（走查 P-22）：到点时如果正有屏幕动作在跑（用户刚点了
+        # 熄灭/点亮），两边都改拓扑会互相覆盖，_busy 的归属也会错乱
+        # （先完成的那个把按钮启用了，另一个还在跑）。直接取消并说明。
+        if self._busy:
+            self.status_var.set("有屏幕操作正在进行，恢复双屏已取消，请稍后重试")
+            dlog("app.action", what="restore_default", stage="cancel_busy",
+                 busy_action=self._busy_action)
+            return
+
+        def job():
+            return restore_default_layout()
+
+        def done(err):
+            if err:
+                self.status_var.set(err)
+                self.msg.showerror("恢复双屏失败", err)
+            else:
+                dlog("app.action", what="restore_default", stage="done")
+                self.status_var.set("已恢复默认双屏布局")
+                self.refresh_monitors(silent=True)
+        self.run_bg(job, done, busy=True)
+
+    def _restore_selection(self, prev):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return restore_selection(prev, len(self.monitors))
+
+    def _first_run_detect(self):
+        """首次启动补一次全量检测，并补写显示器锚点（v2.01.17，v2.01.19 修）。
+
+        v2.01.19 修：原实现无条件 `list(range(len(self.monitors)))`，把老配置
+        里"用户只勾了一块屏"的选择**静默改成全选**。现在按配置解析：
+        `resolve_monitors()` 返回 [] 才表示"配置里确实没有选择信息"= 全选；
+        有选择就按原选择补锚点，不动物理勾选语义。
+        """
+        if not self.monitors:
+            return
+        # 全量检测一次（启动链路里已有一次 probe_screens，这里再补一次是
+        # 为了 after_idle 时窗口已可见、显示器句柄都稳定了，读数更可靠）
+        self.probe_screens()
+        idx = resolve_monitors(self.cfg) or list(range(len(self.monitors)))
+        anchors = selection_anchors(idx)
+        if not anchors:
+            dlog("app.first_run_detect", err="拿不到锚点", idx=idx)
+            return
+        # v2.01.24（走查 R-02 转正）：只写 anchors，**不动 monitors/monitor_ids**。
+        # 用户配的 `monitors: []` 是"全部"语义；写成 [0,1] 会把"全部"固化成
+        # "这两块"，以后插新屏不会自动纳入。anchors 只用来让定时任务认得住屏，
+        # 不承担"范围"语义。
+        self.cfg["monitor_anchors"] = anchors
+        ok, err = save_config(self.cfg)
+        dlog("app.first_run_detect", idx=idx, anchors=anchors, saved=ok, err=err)
+        if ok:
+            self.status_var.set("已自动识别 %d 块显示器" % len(idx))
+
+    def is_vdd(self, index):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return is_vdd_index(index, self.monitors,
+                            getattr(self, "_vdd_devs", ()))
+
+    def ccd_friendly(self, index):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return ccd_friendly_name(index, self.monitors,
+                                 getattr(self, "_ccd_names", {}))
+        if not self.monitors:
+            self.status_var.set(
+                "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
+            return
+        if not silent:
+            self.status_var.set("已刷新：检测到 %d 台显示器" % len(self.monitors))
+        self.read_current()
+
+    def _apply_models(self, models):
+        """把读到的型号刷到界面上（判断由 plan_model_updates 负责）。"""
+        changed = False
+        for i, name in plan_model_updates(models, self.mon_models,
+                                          len(self.monitors)):
+            self.mon_models[i] = name
+            self.mon_panel.set_row_text(i, name)
+            changed = True
+        if changed:
+            self.cfg["models"] = {str(k): v for k, v in self.mon_models.items() if v}
+            save_config(self.cfg)
+
+    def _fetch_models(self):
+        """显示器型号缓存没有的补一次（写入行标题与配置）。"""
+        targets = self.selected_indices() or list(range(len(self.monitors)))
+        # VDD 不读型号：它没有真实 EDID，按 index 缓存下来的名字会串到
+        # 物理屏行（或反过来，VDD 当主屏时套用物理屏名）—— v2.01.12 修
+        missing = [i for i in targets
+                   if i not in self.mon_models and 0 <= i < len(self.monitors)
+                   and not self.is_vdd(i)]
+        if not missing:
+            return
+
+        def job_models():
+            out = {}
+            targets_now = enumerate_targets()
+            lib = _dxva2()
+            used = [t for t in targets_now if t["index"] in missing]
+
+            def one(t):
+                try:
+                    out[t["index"]] = monitor_model(t["handle"], _display_key(t))
+                finally:
+                    # 同 screen_wake_many：句柄由线程自己销毁，避免 join 超时后 UAF
+                    try:
+                        lib.DestroyPhysicalMonitor(t["handle"])
+                    except Exception:
+                        pass
+
+            threads = [threading.Thread(target=one, args=(t,), daemon=True) for t in used]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(20)
+            release_targets([t for t in targets_now if all(t is not u for u in used)])
+            return {i: v for i, v in out.items() if v}
+
+        self.run_bg(job_models, self._apply_models)
+
+    def _render_states(self, result):
+        self._probing = False
+        self._brighting = False
+        if isinstance(result, Exception):
+            self.status_var.set("检测失败：%s" % result)
+            return
+        states, bright = result
+        self._screen_states = {s["index"]: s["state"] for s in states
+                               if isinstance(s, dict) and "index" in s and "state" in s}
+        # 启动早期可能还没建面板；建了才让它按最新亮灭重画行内按钮
+        panel = getattr(self, "mon_panel", None)
+        if panel is not None:
+            panel.refresh_buttons()
+        if not states:
+            # 轻量刷新（只读亮度）：不动亮灭结论，只更新提示行
+            if bright and self._last_verdict:
+                self._update_hint_brightness(bright)
+            return
+        v = screen_verdict(self.cfg, states)
+        # v2.01.0：这里以前会在"被键鼠唤醒"时把状态回写落盘。程序不再记账，
+        # 结论就是当次探测的结果，不需要也不应该往配置里写运行态。
+        if v["state"] != "off":
+            vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
+            if vals and len(set(vals)) == 1:
+                hint = "当前 %d%% · %d 台显示器" % (vals[0], len(states))
+            elif vals:
+                hint = "当前 %s%% · %d 台显示器" % (
+                    "/".join(str(x) for x in vals), len(states))
+            else:
+                hint = "%d 台显示器 · 亮度可调" % len(states)
+        else:
+            hint = "键鼠输入不会点亮它；点「点亮屏幕」恢复"
+        # 状态未知时，把"为什么不知道"直接摆在提示行——否则用户点一次「检测」
+        # 只看到一片空白，不知道程序到底读了什么。
+        if v["state"] == "unknown" and v.get("evidence"):
+            hint = hint + " · " + v["evidence"]
+        self.status_card.render(self._status_payload(v["state"], hint))
+        self._last_verdict = v
+        self._fit_window()
+
+    def _remember_selection(self):
+        idx, ids = selection_payload(self.selected_indices())
+        self.cfg["monitors"] = idx
+        self.cfg["monitor_ids"] = ids
+        self.cfg["monitor_anchors"] = selection_anchors(idx)
+
+    def _ask_heir(self, index, off_anchors):
+        """弹窗让用户挑一块屏接任主显示器。"""
+        cands = topology_heir_candidates(off_anchors)
+        # 诊断（v2.01.13）：候选数用户报过"该有 2 个却只显示 1 个"。
+        # 这里把候选来源与每块屏的状态落日志，下次出现时一眼能看出
+        # 是 targetAvailable=0 还是查询失败——只记录，不改任何行为。
+        dlog("app.heir_prompt", off=list(off_anchors), count=len(cands),
+             candidates=[{"anchor": c["anchor"], "vdd": c["vdd"],
+                          "active": c["active"]} for c in cands])
+        if not cands:
+            self.msg.showwarning(
+                "没有屏可以接任主显示器",
+                "断开 %d 之后桌面上一块屏都不剩，Windows 不允许这样做（会黑屏）。\n\n"
+                "先把另一块显示器的线接上，或让虚拟显示器（串流）先用起来，再试。"
+                % index)
+            return
+        name = "显示器 %d" % index
+        if index < len(self.mon_models) and self.mon_models.get(index):
+            name = self.mon_models[index]
+
+        def picked(anchor):
+            self._busy_action = "off"
+            self._row_action = True
+            self.status_var.set("正在把主显示器交给另一块，然后断开 %s…" % name)
+            self.run_bg(lambda: topology_off([index], self.cfg, heir=anchor),
+                        self._finish_screen_off, busy=True)
+
+        try:
+            self._sheet = HeirSheet(self, cands, name, picked)
+        except Exception as e:
+            self.msg.showerror("打开选择框失败", "%s: %s" % (type(e).__name__, e))
+
+    def topology_enable(self, anchor):
+        """GUI「显示」按钮（断开的屏那一行）：后台接回指定锚点的屏（不碰 Tk）。"""
+        dlog("app.action", what="topology_enable", anchor=anchor)
+        if self._busy:
+            self._queue_screen_action("on")
+            return
+        self._busy_action = "on"
+        self.status_var.set("正在启用显示器…")
+
+        def job():
+            return topology_enable_anchor(self.cfg, anchor)
+
+        self.run_bg(job, self._finish_topology_enable, busy=True)
+
+    def _finish_topology_enable(self, result):
+        ok, errs = _as_ok_errs(result)
+        if ok:
+            save_config(self.cfg)
+            self.status_var.set("显示器已启用")
+            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
+            self.refresh_monitors(silent=True)
+        for i, e in errs:
+            self.status_var.set("启用失败：" + (e if i < 0 else "显示器 %d: %s" % (i, e)))
+        if errs:
+            self.msg.showwarning("启用失败", "\n".join(
+                (e if i < 0 else "显示器 %d: %s" % (i, e)) for i, e in errs))
+        self.probe_screens()
+
+
+class _SettingsActions:
+    """设置与托盘：设置项写回、开机自启、托盘菜单。
+
+    v2.03.0 U5-2：从 App 里按职责切出。方法体一字未改（`self.xxx`
+    仍指向最终的 App 实例），因此零行为变化。将来的物理分离只需
+    把这些类搬到独立文件再 import —— 那时才算真正的模块化。
+    """
+
+    # ---------- 设置项写回 ----------
+    def apply_setting(self, key, value):
+        """设置弹层里每个开关/输入框的统一出口：落配置并立即生效。"""
+        try:
+            if key == "tray_enabled":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                if value:
+                    self._create_tray()
+                    self.status_var.set("托盘图标已启用（点 × 进托盘）")
+                else:
+                    self._stop_tray()
+                    self.status_var.set("托盘图标已关闭（点 × 直接退出）")
+            elif key == "screen_auto_relight_min":
+                self.cfg[key] = max(0, min(120, int(value)))
+                save_config(self.cfg)
+            elif key == "wake_switch_input":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+            elif key == "diag_log":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                # 先写一条再改开关：否则"已关闭"这一条自己就记不下来了
+                dlog("app.setting", key=key, value=bool(value))
+                diag_set_enabled(self.cfg[key])
+                self.status_var.set("诊断日志已" + ("开启" if value else "关闭"))
+            elif key == "window_follow":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                self.status_var.set("改显示器时" + ("会" if value else "不会")
+                                    + "把窗口搬回原屏")
+            elif key == "presets":
+                self.cfg[key] = coerce_setting("presets", value)
+                save_config(self.cfg)
+                self.bri_panel.set_presets(self.cfg[key])
+        except Exception as e:
+            self.msg.showerror("保存设置失败", "%s: %s" % (type(e).__name__, e))
+
+    def apply_autostart(self, enable):
+        exe, prefix = task_target()
+        cmd = ('"%s" %s--minimized' % (exe, prefix)).strip()
+        try:
+            set_autostart(bool(enable), cmd)
+            self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
+        except Exception as e:
+            self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
+
+    def apply_off_method(self, value):
+        if value == "ddc" and not self.cfg.get("ddc_allow_undeclared"):
+            if not self.msg.askyesno(
+                    "单屏待机：有风险",
+                    "这条路的「熄灭」用面板待机命令（0xD6=2），但：\n"
+                    "• 你的面板能力串只声明 01/04/05，没声明 02；\n"
+                    "• 微软文档警告盲写未实现的 MCCS 值会导致未定义行为；\n"
+                    "• 万一唤不回，只能按显示器电源键。\n\n"
+                    "点亮时会依次尝试：电源模式 → 写亮度 → 输出重驱动 → 切信号源。"):
+                return
+            self.cfg["ddc_allow_undeclared"] = True
+        if value == "topology" and not self.msg.askyesno(
+                "拓扑断开：先确认",
+                "这条路会把「选中的副屏」从 Windows 桌面拓扑里移除，供串流隐藏物理屏用：\n"
+                "• 主屏不会被断（Windows 实测 rc=87），虚拟屏 VDD 永不作目标；\n"
+                "• 每次只断一块；恢复时先回读 ACTIVE 再写亮度（≤2 秒）；\n"
+                "• 窗口位置不保证完全还原，首次使用请做一次串流回归。\n\n"
+                "默认仍是「单屏待机」，选它才会切到本方式。"):
+            return
+        self.cfg["screen_off_method"] = value
+        # v2.01.0：`ddc_allow_undeclared` 是"这一次明知有风险"的授权，不是永久状态。
+        # 离开 ddc 就收回——否则用户在旧屏上点过一次「同意」，换屏后盲写
+        # 未声明的待机值这件事会被悄悄继承下来（走查 E2-05 的单向阀门）。
+        if value != "ddc":
+            self.cfg["ddc_allow_undeclared"] = False
+        save_config(self.cfg)
+        if value == "ddc":
+            self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
+        elif value == "topology":
+            self.status_var.set("熄灭方式：拓扑断开（副屏移除，主屏不动）")
+        else:
+            self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
+        # v2.01.22（走查 P-29）：切模式必须重建列表 ——
+        # topology 才列"断开的物理屏"，ddc/system 只留 VDD。
+        # 原来只 probe_screens，用户切到 topology 后看不到能接回的屏。
+        self.refresh_monitors(silent=True)
+        # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
+        self.probe_screens()
+
+    def _stop_tray(self):
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
+
+    # ---------- 托盘 ----------
+    def _tray_image(self):
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=(30, 30, 30, 255),
+                  outline=(74, 158, 255, 255), width=3)
+        d.rounded_rectangle((14, 28, 50, 36), radius=4, fill=(74, 158, 255, 255))
+        d.ellipse((36, 23, 52, 41), fill=(255, 255, 255, 255))
+        return img
+
+    def _tray_tooltip_text(self):
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return tray_tooltip_text(self.cfg, self._last_verdict, APP_TITLE)
+
+    def _tray_update_tooltip(self):
+        if self.tray is not None:
+            try:
+                self.tray.tooltip = self._tray_tooltip_text()
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def _create_tray(self):
+        if not TRAY_OK or self.tray is not None or not self.root.winfo_exists():
+            return
+        menu = _TrayMenu(
+            _TrayItem("打开主窗口", lambda *_: self.root.after(0, self._tray_show_main),
+                      default=True),
+            _TrayItem("熄灭显示器", lambda *_: self.root.after(0, self.screen_off)),
+            _TrayItem("点亮显示器", lambda *_: self.root.after(0, self.screen_on)),
+            _TrayItem("启用定时", lambda *_: self.root.after(0, self._tray_toggle_schedule),
+                      checked=lambda _item: bool(self.cfg.get("enabled"))),
+            _TrayItem("退出", lambda *_: self.root.after(0, self._tray_quit)),
+        )
+        self.tray = _TrayIcon("MonitorBrightness", self._tray_image(),
+                              self._tray_tooltip_text(), menu)
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _tray_show_main(self):
+        self.root.deiconify()
+        self.root.lift()
+        # v2.01.22（走查 P-30）：窗口在托盘里期间可能拔插过屏、开关过串流，
+        # 打开时必须重读，否则列表还是最小化前那一份（用户报"打开没有
+        # 刷新出虚拟显示器"的另一条路径）。
+        self.refresh_monitors(silent=True)
+        self.probe_screens()
+        self.status_var.set("就绪")
+
+    def _finish_tray_register(self, result):
+        if isinstance(result, Exception):
+            result = (False, str(result))
+        ok, out = result
+        if not ok:
+            self._rollback_schedule(False, "注册任务失败", out)
+            return
+        self.refresh_task_status()
+        self.status_var.set("定时已启用")
+
+    def _tray_quit(self):
+        self._stop_tray()
+        self.root.destroy()
+
+
+class _DiagActions:
+    """诊断：打开日志目录、导出诊断包。
+
+    v2.03.0 U5-2：从 App 里按职责切出。方法体一字未改（`self.xxx`
+    仍指向最终的 App 实例），因此零行为变化。将来的物理分离只需
+    把这些类搬到独立文件再 import —— 那时才算真正的模块化。
+    """
+
+    def open_log_dir(self):
+        """打开日志目录（和程序同目录；不可写时才在 APPDATA）。"""
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            os.startfile(LOG_DIR)             # noqa: S606 — 只打开自家目录
+        except Exception as e:
+            self.status_var.set("打开日志目录失败：%s" % e)
+
+    def export_diag(self):
+        """导出诊断包，并直接在资源管理器里选中它。"""
+        path, err = diag_export()
+        if err:
+            self.status_var.set("导出失败：%s" % err)
+            self.msg.showerror("导出诊断包失败", err)
+            return
+        self.status_var.set("诊断包已导出：%s" % path)
+        try:
+            subprocess.Popen(["explorer", "/select,%s" % path])
+        except Exception:
+            pass
+
+
+class App(_ScreenActions, _ScheduleActions, _LayoutActions,
+          _SettingsActions, _DiagActions):
     """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
     def __init__(self, root, start_minimized=False):
@@ -5077,335 +6173,30 @@ class App:
         except Exception as e:
             self.msg.showerror("打开说明失败", "%s: %s" % (type(e).__name__, e))
 
-    def open_log_dir(self):
-        """打开日志目录（和程序同目录；不可写时才在 APPDATA）。"""
-        try:
-            os.makedirs(LOG_DIR, exist_ok=True)
-            os.startfile(LOG_DIR)             # noqa: S606 — 只打开自家目录
-        except Exception as e:
-            self.status_var.set("打开日志目录失败：%s" % e)
 
-    def remember_layout(self):
-        """把现在的显示器摆法记成"用户的布局"，断开/接回都按这份来。"""
-        layout, err = remember_layout_snapshot(self.cfg)
-        if err:
-            self.status_var.set("记不住布局：%s" % err)
-            self.msg.showerror("记住布局失败", err)
-            return
-        dlog("app.action", what="remember_layout", count=len(layout))
-        # v2.01.12：位置与完整 CCD 快照一起记，供「恢复双屏」整份写回
-        desc, snap_err = save_default_layout()
-        if snap_err:
-            self.status_var.set("位置已记住，但默认布局快照没存上：%s" % snap_err)
-            self._flash_remember_btn("快照失败", err=True)
-            return
-        self.status_var.set("已记住 %d 块屏的位置和布局（%s）" % (len(layout), desc))
-        self._flash_remember_btn("已记住 ✓")
 
-    def _flash_remember_btn(self, text, err=False):
-        """在「记住」按钮上短暂显示结果（v2.01.25）。
 
-        设置弹层是模态的，会挡住主窗口状态卡；不给就地回执，用户就以为没反应。
-        2 秒后复原；弹层先被关掉时 widget 已销毁，静默跳过。
-        """
-        btn = getattr(self, "_remember_btn", None)
-        if btn is None:
-            return
-        try:
-            btn.set_text(text)
-            if err:
-                btn.after(2600, lambda: self._restore_remember_btn(btn))
-            else:
-                btn.after(1800, lambda: self._restore_remember_btn(btn))
-        except Exception:
-            pass
 
-    def _restore_remember_btn(self, btn):
-        try:
-            if btn.winfo_exists():
-                btn.set_text("记住")
-        except Exception:
-            pass
 
-    # ---- 恢复双屏（倒计时） ------------------------------------------------
-    def ask_restore_default(self):
-        """点「恢复双屏」：先校验默认布局还在且与硬件匹配，再启动倒计时。"""
-        if getattr(self, "_restore_after", None) is not None:
-            return
-        err = restore_default_layout(validate_only=True)
-        if err:
-            dlog("app.action", what="restore_default", stage="precheck", err=err)
-            self.status_var.set(err)
-            self.msg.showwarning("恢复双屏不可用", err)
-            return
-        secs = max(0, min(120, int(self.cfg.get("restore_delay", 10))))
-        dlog("app.action", what="restore_default", stage="countdown", seconds=secs)
-        self._restore_deadline = time.monotonic() + secs
-        self._tick_restore()
 
-    def _tick_restore(self):
-        """每秒刷一次剩余秒数；到点执行恢复。"""
-        left = int(self._restore_deadline - time.monotonic() + 0.999)
-        if left > 0:
-            self.status_card.set_restore_countdown(left)
-            self._restore_after = self.root.after(200, self._tick_restore)
-        else:
-            self._restore_after = None
-            self.status_card.set_restore_countdown(None)
-            self._do_restore_default()
 
-    def cancel_restore_default(self):
-        if getattr(self, "_restore_after", None) is not None:
-            self.root.after_cancel(self._restore_after)
-            self._restore_after = None
-        self.status_card.set_restore_countdown(None)
-        dlog("app.action", what="restore_default", stage="cancel")
-        self.status_var.set("已取消恢复双屏")
 
-    def _do_restore_default(self):
-        """倒计时到点：整份写回默认双屏布局（后台线程，不卡 UI）。"""
-        # v2.01.20（走查 P-22）：到点时如果正有屏幕动作在跑（用户刚点了
-        # 熄灭/点亮），两边都改拓扑会互相覆盖，_busy 的归属也会错乱
-        # （先完成的那个把按钮启用了，另一个还在跑）。直接取消并说明。
-        if self._busy:
-            self.status_var.set("有屏幕操作正在进行，恢复双屏已取消，请稍后重试")
-            dlog("app.action", what="restore_default", stage="cancel_busy",
-                 busy_action=self._busy_action)
-            return
 
-        def job():
-            return restore_default_layout()
 
-        def done(err):
-            if err:
-                self.status_var.set(err)
-                self.msg.showerror("恢复双屏失败", err)
-            else:
-                dlog("app.action", what="restore_default", stage="done")
-                self.status_var.set("已恢复默认双屏布局")
-                self.refresh_monitors(silent=True)
-        self.run_bg(job, done, busy=True)
 
-    def export_diag(self):
-        """导出诊断包，并直接在资源管理器里选中它。"""
-        path, err = diag_export()
-        if err:
-            self.status_var.set("导出失败：%s" % err)
-            self.msg.showerror("导出诊断包失败", err)
-            return
-        self.status_var.set("诊断包已导出：%s" % path)
-        try:
-            subprocess.Popen(["explorer", "/select,%s" % path])
-        except Exception:
-            pass
 
-    # ---------- 设置项写回 ----------
-    def apply_setting(self, key, value):
-        """设置弹层里每个开关/输入框的统一出口：落配置并立即生效。"""
-        try:
-            if key == "tray_enabled":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
-                if value:
-                    self._create_tray()
-                    self.status_var.set("托盘图标已启用（点 × 进托盘）")
-                else:
-                    self._stop_tray()
-                    self.status_var.set("托盘图标已关闭（点 × 直接退出）")
-            elif key == "screen_auto_relight_min":
-                self.cfg[key] = max(0, min(120, int(value)))
-                save_config(self.cfg)
-            elif key == "wake_switch_input":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
-            elif key == "diag_log":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
-                # 先写一条再改开关：否则"已关闭"这一条自己就记不下来了
-                dlog("app.setting", key=key, value=bool(value))
-                diag_set_enabled(self.cfg[key])
-                self.status_var.set("诊断日志已" + ("开启" if value else "关闭"))
-            elif key == "window_follow":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
-                self.status_var.set("改显示器时" + ("会" if value else "不会")
-                                    + "把窗口搬回原屏")
-            elif key == "presets":
-                self.cfg[key] = coerce_setting("presets", value)
-                save_config(self.cfg)
-                self.bri_panel.set_presets(self.cfg[key])
-        except Exception as e:
-            self.msg.showerror("保存设置失败", "%s: %s" % (type(e).__name__, e))
 
-    def apply_presets_from_settings(self):
-        """预设数值：从设置弹层里的三个输入框读回来（失焦时触发）。"""
-        sheet = None
-        for w in self.root.winfo_children():
-            if isinstance(w, SettingsSheet):
-                sheet = w
-        if sheet is None:
-            return
-        vals = [_safe_int(sp.get(), 50) for sp in sheet.preset_spins]
-        self.apply_setting("presets", vals)
 
-    def apply_autostart(self, enable):
-        exe, prefix = task_target()
-        cmd = ('"%s" %s--minimized' % (exe, prefix)).strip()
-        try:
-            set_autostart(bool(enable), cmd)
-            self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
-        except Exception as e:
-            self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
-
-    def apply_off_method(self, value):
-        if value == "ddc" and not self.cfg.get("ddc_allow_undeclared"):
-            if not self.msg.askyesno(
-                    "单屏待机：有风险",
-                    "这条路的「熄灭」用面板待机命令（0xD6=2），但：\n"
-                    "• 你的面板能力串只声明 01/04/05，没声明 02；\n"
-                    "• 微软文档警告盲写未实现的 MCCS 值会导致未定义行为；\n"
-                    "• 万一唤不回，只能按显示器电源键。\n\n"
-                    "点亮时会依次尝试：电源模式 → 写亮度 → 输出重驱动 → 切信号源。"):
-                return
-            self.cfg["ddc_allow_undeclared"] = True
-        if value == "topology" and not self.msg.askyesno(
-                "拓扑断开：先确认",
-                "这条路会把「选中的副屏」从 Windows 桌面拓扑里移除，供串流隐藏物理屏用：\n"
-                "• 主屏不会被断（Windows 实测 rc=87），虚拟屏 VDD 永不作目标；\n"
-                "• 每次只断一块；恢复时先回读 ACTIVE 再写亮度（≤2 秒）；\n"
-                "• 窗口位置不保证完全还原，首次使用请做一次串流回归。\n\n"
-                "默认仍是「单屏待机」，选它才会切到本方式。"):
-            return
-        self.cfg["screen_off_method"] = value
-        # v2.01.0：`ddc_allow_undeclared` 是"这一次明知有风险"的授权，不是永久状态。
-        # 离开 ddc 就收回——否则用户在旧屏上点过一次「同意」，换屏后盲写
-        # 未声明的待机值这件事会被悄悄继承下来（走查 E2-05 的单向阀门）。
-        if value != "ddc":
-            self.cfg["ddc_allow_undeclared"] = False
-        save_config(self.cfg)
-        if value == "ddc":
-            self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
-        elif value == "topology":
-            self.status_var.set("熄灭方式：拓扑断开（副屏移除，主屏不动）")
-        else:
-            self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
-        # v2.01.22（走查 P-29）：切模式必须重建列表 ——
-        # topology 才列"断开的物理屏"，ddc/system 只留 VDD。
-        # 原来只 probe_screens，用户切到 topology 后看不到能接回的屏。
-        self.refresh_monitors(silent=True)
-        # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
-        self.probe_screens()
-
-    # ---------- 显示器勾选 ----------
-    def select_all(self):
-        self.mon_panel.set_all(True)
-        self.read_current()
-
-    def select_none(self):
-        self.mon_panel.set_all(False)
-        self.read_current()
 
     def selected_indices(self):
         return self.mon_panel.selected()
 
-    def on_monitor_toggle(self):
-        if not self.mon_panel._suspend:
-            self.read_current()
 
-    def _restore_selection(self, prev):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return restore_selection(prev, len(self.monitors))
 
-    def refresh_monitors(self, silent=False):
-        prev = self.selected_indices()
-        targets = enumerate_targets()
-        try:
-            self.monitors = [{k: v for k, v in t.items() if k != "handle"}
-                             for t in targets]
-        finally:
-            release_targets(targets)
-        self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
-        # v2.01.21：CCD 探测（QDC_ALL_PATHS，实测 0.1ms）在**任何模式**都做：
-        #   1) 填 `_ccd_names` —— DDC 读型号要 6.2 秒，期间先用真实友好名显示，
-        #      别让用户看"显示器 0"（截图实证）；
-        #   2) 填 `topo_inactive` —— 虚拟显示器始终列出来。以前只有 topology
-        #      模式才列，默认 ddc 模式下串流在跑也看不见 VDD（用户报"没刷新出
-        #      虚拟显示器"）。物理断开屏仍只在 topology 模式列（只有它能接回）。
-        try:
-            rows = ccd_probe_topology()
-            self._vdd_devs = {_short_dev(r.get("gdi"))
-                              for r in rows if r.get("vdd")}
-            self._ccd_names = {_short_dev(r.get("gdi")): r.get("friendly")
-                               for r in rows
-                               if r.get("gdi") and r.get("friendly")}
-            inactive = topology_inactive_rows(rows)
-            if self.cfg.get("screen_off_method") == "topology":
-                self.topo_inactive = inactive
-            else:
-                # 非拓扑模式：只留 VDD（灰显、无操作按钮），它代表串流在跑
-                self.topo_inactive = [r for r in inactive if r.get("vdd")]
-        except Exception:
-            self._vdd_devs = set()
-            self._ccd_names = {}
-            self.topo_inactive = []
-        self.mon_panel.rebuild(self._restore_selection(prev))
 
-    def _first_run_detect(self):
-        """首次启动补一次全量检测，并补写显示器锚点（v2.01.17，v2.01.19 修）。
 
-        v2.01.19 修：原实现无条件 `list(range(len(self.monitors)))`，把老配置
-        里"用户只勾了一块屏"的选择**静默改成全选**。现在按配置解析：
-        `resolve_monitors()` 返回 [] 才表示"配置里确实没有选择信息"= 全选；
-        有选择就按原选择补锚点，不动物理勾选语义。
-        """
-        if not self.monitors:
-            return
-        # 全量检测一次（启动链路里已有一次 probe_screens，这里再补一次是
-        # 为了 after_idle 时窗口已可见、显示器句柄都稳定了，读数更可靠）
-        self.probe_screens()
-        idx = resolve_monitors(self.cfg) or list(range(len(self.monitors)))
-        anchors = selection_anchors(idx)
-        if not anchors:
-            dlog("app.first_run_detect", err="拿不到锚点", idx=idx)
-            return
-        # v2.01.24（走查 R-02 转正）：只写 anchors，**不动 monitors/monitor_ids**。
-        # 用户配的 `monitors: []` 是"全部"语义；写成 [0,1] 会把"全部"固化成
-        # "这两块"，以后插新屏不会自动纳入。anchors 只用来让定时任务认得住屏，
-        # 不承担"范围"语义。
-        self.cfg["monitor_anchors"] = anchors
-        ok, err = save_config(self.cfg)
-        dlog("app.first_run_detect", idx=idx, anchors=anchors, saved=ok, err=err)
-        if ok:
-            self.status_var.set("已自动识别 %d 块显示器" % len(idx))
 
-    def is_vdd(self, index):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return is_vdd_index(index, self.monitors,
-                            getattr(self, "_vdd_devs", ()))
 
-    def ccd_friendly(self, index):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return ccd_friendly_name(index, self.monitors,
-                                 getattr(self, "_ccd_names", {}))
-        if not self.monitors:
-            self.status_var.set(
-                "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
-            return
-        if not silent:
-            self.status_var.set("已刷新：检测到 %d 台显示器" % len(self.monitors))
-        self.read_current()
-
-    def _apply_models(self, models):
-        """把读到的型号刷到界面上（判断由 plan_model_updates 负责）。"""
-        changed = False
-        for i, name in plan_model_updates(models, self.mon_models,
-                                          len(self.monitors)):
-            self.mon_models[i] = name
-            self.mon_panel.set_row_text(i, name)
-            changed = True
-        if changed:
-            self.cfg["models"] = {str(k): v for k, v in self.mon_models.items() if v}
-            save_config(self.cfg)
 
     # ---------- 统一异步入口 ----------
     def run_bg(self, job, on_done=None, busy=False):
@@ -5463,512 +6254,41 @@ class App:
         if self._bg_tasks > 0 or self._relight_pending:
             self.root.after(150, self._poll_read_queue)
 
-    def _set_actions_enabled(self, enabled):
-        self.status_card.set_actions_enabled(enabled)
-        self.bri_panel.set_actions_enabled(enabled)
-        self.sch_panel.set_actions_enabled(enabled)
 
-    # ---------- 亮度 / 探测 ----------
-    def read_current(self):
-        """轻量刷新：只读亮度（1 次 DDC 读/屏）。
 
-        ⚠️ 实测（2026-11-03）：合并"探测+读亮度"后这里变成 3 读/屏（371ms），
-        而本方法在每次应用亮度/切换勾选后都会自动执行，是"响应变慢"的主因。
-        自动刷新回归轻量路径；全量探测（probe_screens，371ms）只留给
-        「检测」按钮、启动和熄灭/点亮状态切换点。
-        """
-        self.refresh_brightness()
-        self._fetch_models()
 
-    def refresh_brightness(self):
-        """只读各屏亮度并更新提示行（不重判亮灭）。
 
-        用独立的 _brighting 标志：启动时 refresh_monitors 的轻量刷新如果
-        占着全量探测的 _probing，紧接着的 probe_screens() 会被守卫静默跳过，
-        状态卡就停在控件默认值上（实测踩过）。
-        """
-        if not self.monitors or self._brighting:
-            return
-        self._brighting = True
-        targets = self.selected_indices() or list(range(len(self.monitors)))
 
-        def job():
-            try:
-                return {}, get_brightness_many(targets)[0]
-            except Exception:
-                return {}, {}
 
-        self.run_bg(job, self._render_states)
 
-    def _fetch_models(self):
-        """显示器型号缓存没有的补一次（写入行标题与配置）。"""
-        targets = self.selected_indices() or list(range(len(self.monitors)))
-        # VDD 不读型号：它没有真实 EDID，按 index 缓存下来的名字会串到
-        # 物理屏行（或反过来，VDD 当主屏时套用物理屏名）—— v2.01.12 修
-        missing = [i for i in targets
-                   if i not in self.mon_models and 0 <= i < len(self.monitors)
-                   and not self.is_vdd(i)]
-        if not missing:
-            return
 
-        def job_models():
-            out = {}
-            targets_now = enumerate_targets()
-            lib = _dxva2()
-            used = [t for t in targets_now if t["index"] in missing]
 
-            def one(t):
-                try:
-                    out[t["index"]] = monitor_model(t["handle"], _display_key(t))
-                finally:
-                    # 同 screen_wake_many：句柄由线程自己销毁，避免 join 超时后 UAF
-                    try:
-                        lib.DestroyPhysicalMonitor(t["handle"])
-                    except Exception:
-                        pass
 
-            threads = [threading.Thread(target=one, args=(t,), daemon=True) for t in used]
-            for th in threads:
-                th.start()
-            for th in threads:
-                th.join(20)
-            release_targets([t for t in targets_now if all(t is not u for u in used)])
-            return {i: v for i, v in out.items() if v}
 
-        self.run_bg(job_models, self._apply_models)
 
-    def apply_now(self):
-        if self._busy:
-            return
-        targets = self.selected_indices()
-        level = clamp_level(self.bri_panel.level())
-        self.status_var.set("正在下发亮度 %d%% …" % level)
-        self.run_bg(lambda: set_brightness_many(targets, level),
-                    lambda r: self._finish_apply_level(r, level), busy=True)
 
-    def _finish_apply_level(self, result, level):
-        ok, errs = _as_ok_errs(result)
-        if ok:
-            self.status_var.set("已把 %s 的亮度设为 %d%%"
-                                % ("、".join("显示器 %d" % i for i in ok), level))
-        if errs:
-            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
-            self.status_var.set("部分失败：" + detail.replace("\n", " "))
-            self.msg.showwarning("部分显示器失败", detail)
-        self.read_current()
 
-    # ---------- 快捷预设 ----------
-    def apply_preset(self, i):
-        if self._busy:
-            return
-        presets = self.cfg.get("presets") or []
-        if not (0 <= i < len(presets)):
-            return
-        level = clamp_level(presets[i])
-        self.bri_panel.set_level(level)
-        self.status_var.set("正在把全部显示器设为 %d%% …" % level)
-        self.run_bg(lambda: set_brightness_many([], level),
-                    lambda r: self._finish_preset(r, level), busy=True)
 
-    def _finish_preset(self, result, level):
-        ok, errs = _as_ok_errs(result)
-        if ok:
-            self.status_var.set("全部显示器已设为 %d%%（%d 台）" % (level, len(ok)))
-        if errs:
-            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs)
-            self.status_var.set("部分失败：" + detail.replace("\n", " "))
-            self.msg.showwarning("部分显示器失败", detail)
-        self.read_current()
 
-    # ---------- 亮灭检测 ----------
-    def probe_screens(self):
-        """「检测」：一次后台任务里同时读亮灭结论与当前亮度。"""
-        if not self.monitors or self._probing:
-            return
-        self._probing = True
-        targets = self.selected_indices() or list(range(len(self.monitors)))
 
-        def job():
-            states = probe_states()
-            try:
-                bright = get_brightness_many(targets)[0]
-            except Exception:
-                bright = {}
-            return states, bright
 
-        self.run_bg(job, self._render_states)
 
-    def _render_states(self, result):
-        self._probing = False
-        self._brighting = False
-        if isinstance(result, Exception):
-            self.status_var.set("检测失败：%s" % result)
-            return
-        states, bright = result
-        self._screen_states = {s["index"]: s["state"] for s in states
-                               if isinstance(s, dict) and "index" in s and "state" in s}
-        # 启动早期可能还没建面板；建了才让它按最新亮灭重画行内按钮
-        panel = getattr(self, "mon_panel", None)
-        if panel is not None:
-            panel.refresh_buttons()
-        if not states:
-            # 轻量刷新（只读亮度）：不动亮灭结论，只更新提示行
-            if bright and self._last_verdict:
-                self._update_hint_brightness(bright)
-            return
-        v = screen_verdict(self.cfg, states)
-        # v2.01.0：这里以前会在"被键鼠唤醒"时把状态回写落盘。程序不再记账，
-        # 结论就是当次探测的结果，不需要也不应该往配置里写运行态。
-        if v["state"] != "off":
-            vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
-            if vals and len(set(vals)) == 1:
-                hint = "当前 %d%% · %d 台显示器" % (vals[0], len(states))
-            elif vals:
-                hint = "当前 %s%% · %d 台显示器" % (
-                    "/".join(str(x) for x in vals), len(states))
-            else:
-                hint = "%d 台显示器 · 亮度可调" % len(states)
-        else:
-            hint = "键鼠输入不会点亮它；点「点亮屏幕」恢复"
-        # 状态未知时，把"为什么不知道"直接摆在提示行——否则用户点一次「检测」
-        # 只看到一片空白，不知道程序到底读了什么。
-        if v["state"] == "unknown" and v.get("evidence"):
-            hint = hint + " · " + v["evidence"]
-        self.status_card.render(self._status_payload(v["state"], hint))
-        self._last_verdict = v
-        self._fit_window()
 
-    def _update_hint_brightness(self, bright):
-        vals = [bright[i] for i in sorted(bright) if bright.get(i) is not None]
-        if not vals:
-            return
-        if len(set(vals)) == 1:
-            b = "当前 %d%%" % vals[0]
-        else:
-            b = "当前 %s%%" % "/".join(str(x) for x in vals)
-        if self._last_verdict.get("state") == "off":
-            return  # 熄灭状态提示行不显示亮度
-        self.status_card.set_hint_default("%s · %d 台显示器" % (b, len(self.monitors)))
 
-    def _status_payload(self, state, hint):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return status_payload(self.cfg, state, hint)
 
-    def _remember_selection(self):
-        idx, ids = selection_payload(self.selected_indices())
-        self.cfg["monitors"] = idx
-        self.cfg["monitor_ids"] = ids
-        self.cfg["monitor_anchors"] = selection_anchors(idx)
 
-    # ---------- 熄屏 / 点亮 ----------
-    def _row_action_blocker(self):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return row_action_blocker(self.cfg, self._busy)
 
-    def monitor_off(self, index):
-        """行内「熄灭」：只熄灭这一块，不动别的。"""
-        dlog("app.action", what="monitor_off", index=index)
-        why = self._row_action_blocker()
-        if why:
-            self.status_var.set(why)
-            return
-        if self.cfg.get("screen_off_method") == "topology":
-            anchors = selection_anchors([index])
-            if not anchors:
-                self.status_var.set("拿不到这块屏的锚点，无法单独断开")
-                return
-            is_primary = (index < len(self.mon_info) and self.mon_info[index][3])
-            if is_primary:
-                # 主屏不能直接从拓扑里摘掉（Windows 实测 rc=87），但可以先把
-                # 主屏角色交给别人再摘 —— 全程纯拓扑操作，不碰面板电源。
-                self._ask_heir(index, anchors)
-                return
-        self._busy_action = "off"
-        self._row_action = True
-        self.status_var.set("正在熄灭显示器 %d…" % index)
-        self.run_bg(lambda: screen_off_cfg(self.cfg, [index]),
-                    self._finish_screen_off, busy=True)
 
-    def _ask_heir(self, index, off_anchors):
-        """弹窗让用户挑一块屏接任主显示器。"""
-        cands = topology_heir_candidates(off_anchors)
-        # 诊断（v2.01.13）：候选数用户报过"该有 2 个却只显示 1 个"。
-        # 这里把候选来源与每块屏的状态落日志，下次出现时一眼能看出
-        # 是 targetAvailable=0 还是查询失败——只记录，不改任何行为。
-        dlog("app.heir_prompt", off=list(off_anchors), count=len(cands),
-             candidates=[{"anchor": c["anchor"], "vdd": c["vdd"],
-                          "active": c["active"]} for c in cands])
-        if not cands:
-            self.msg.showwarning(
-                "没有屏可以接任主显示器",
-                "断开 %d 之后桌面上一块屏都不剩，Windows 不允许这样做（会黑屏）。\n\n"
-                "先把另一块显示器的线接上，或让虚拟显示器（串流）先用起来，再试。"
-                % index)
-            return
-        name = "显示器 %d" % index
-        if index < len(self.mon_models) and self.mon_models.get(index):
-            name = self.mon_models[index]
 
-        def picked(anchor):
-            self._busy_action = "off"
-            self._row_action = True
-            self.status_var.set("正在把主显示器交给另一块，然后断开 %s…" % name)
-            self.run_bg(lambda: topology_off([index], self.cfg, heir=anchor),
-                        self._finish_screen_off, busy=True)
 
-        try:
-            self._sheet = HeirSheet(self, cands, name, picked)
-        except Exception as e:
-            self.msg.showerror("打开选择框失败", "%s: %s" % (type(e).__name__, e))
 
-    def monitor_on(self, index):
-        """行内「显示」：只点亮这一块。"""
-        dlog("app.action", what="monitor_on", index=index)
-        why = self._row_action_blocker()
-        if why:
-            self.status_var.set(why)
-            return
-        self._busy_action = "on"
-        self._row_action = True
-        self.status_var.set("正在点亮显示器 %d…" % index)
-        self.run_bg(lambda: screen_on_row(self.cfg, index),
-                    self._finish_screen_on, busy=True)
 
-    def _queue_screen_action(self, action):
-        """忙时点击：给可见反馈，并记下最后一次请求，结束后补执行一次。
 
-        v1.9.5：之前 `_busy` 窗口内直接静默 return，用户看到的是
-        「点了没反应」。这里只做排队记账，**不启动任何屏幕动作**，因此不改变
-        熄灭/点亮调用链，也不改变 `_busy` 窗口长度。
-        """
-        self._pending_screen = action
-        label = "点亮" if action == "on" else "熄灭"
-        if self._busy_action == "on":
-            head = "正在唤醒中…"
-        elif self._busy_action == "off":
-            head = "正在熄灭中…"
-        else:
-            head = "正在处理其他操作…"
-        self.status_var.set("%s%s请求已排队，完成后自动执行" % (head, label))
-        _write_event_log("忙时%s请求已排队（当前动作：%s）"
-                         % (label, {"on": "点亮", "off": "熄灭"}.get(
-                             self._busy_action, "其它")))
 
-    def _dispatch_pending_screen(self):
-        """当前忙任务结束后补执行排队的那一次屏幕请求。返回是否补执行。"""
-        if self._busy or not self._pending_screen:
-            return False
-        action, self._pending_screen = self._pending_screen, None
-        _write_event_log("补执行忙时排队的%s请求" % ("点亮" if action == "on" else "熄灭"))
-        if action == "on":
-            self.screen_on()
-        else:
-            self.screen_off()
-        return True
 
-    def screen_off(self):
-        targets = self.selected_indices()
-        dlog("app.action", what="screen_off", targets=targets)
-        if not targets:
-            self.status_var.set("请先勾选要操作的显示器")
-            return
-        if self._busy:
-            self._queue_screen_action("off")
-            return
-        self._busy_action = "off"
-        self.status_var.set("正在熄灭显示器…")
-        self.run_bg(lambda: screen_off_cfg(self.cfg, targets),
-                    self._finish_screen_off, busy=True)
 
-    def _finish_screen_off(self, result):
-        row_action, self._row_action = getattr(self, "_row_action", False), False
-        ok, errs = _as_ok_errs(result)
-        if ok:
-            # 行内逐台操作不碰"勾选"：用户点的是这一行，不是改选择
-            if not row_action:
-                self._remember_selection()
-            save_config(self.cfg)          # 拓扑断开时顺手记下了原位置
-            self.status_var.set("已熄灭显示器")
-            self.status_card.render(self._status_payload(
-                "off", "键鼠输入不会点亮它；点「点亮屏幕」恢复"))
-        if errs:
-            self.msg.showwarning("熄灭失败", "\n".join(
-                ("显示器 %d：%s" % (i, e)) if i >= 0 else e for i, e in errs))
-        mins = self._auto_relight_minutes()
-        if ok and mins > 0:
-            self._relight_pending = True
-            # 走查 E1-05：必须持有 timer 句柄，手动点亮/再次熄灭时取消旧的，
-            # 否则残留 timer 会在用户已手动点亮后触发一次"无缘无故的点亮"。
-            self._cancel_relight_timer()
-            self._relight_timer = threading.Timer(
-                mins * 60, lambda: self._read_queue.put(("screen_action", "on", None)))
-            self._relight_timer.start()
-        if self.cfg.get("screen_off_method") == "topology":
-            # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
-            self.refresh_monitors(silent=True)
-        self.probe_screens()
 
-    def topology_enable(self, anchor):
-        """GUI「显示」按钮（断开的屏那一行）：后台接回指定锚点的屏（不碰 Tk）。"""
-        dlog("app.action", what="topology_enable", anchor=anchor)
-        if self._busy:
-            self._queue_screen_action("on")
-            return
-        self._busy_action = "on"
-        self.status_var.set("正在启用显示器…")
 
-        def job():
-            return topology_enable_anchor(self.cfg, anchor)
-
-        self.run_bg(job, self._finish_topology_enable, busy=True)
-
-    def _finish_topology_enable(self, result):
-        ok, errs = _as_ok_errs(result)
-        if ok:
-            save_config(self.cfg)
-            self.status_var.set("显示器已启用")
-            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
-            self.refresh_monitors(silent=True)
-        for i, e in errs:
-            self.status_var.set("启用失败：" + (e if i < 0 else "显示器 %d: %s" % (i, e)))
-        if errs:
-            self.msg.showwarning("启用失败", "\n".join(
-                (e if i < 0 else "显示器 %d: %s" % (i, e)) for i, e in errs))
-        self.probe_screens()
-
-    def screen_on(self):
-        targets = self.selected_indices()
-        dlog("app.action", what="screen_on", targets=targets)
-        if not targets:
-            self.status_var.set("请先勾选要操作的显示器")
-            return
-        if self._busy:
-            self._queue_screen_action("on")
-            return
-        self._busy_action = "on"
-        self.status_var.set("正在点亮显示器…")
-        self.run_bg(lambda: screen_wake_entry(self.cfg, targets),
-                    self._finish_screen_on, busy=True)
-
-    def _cancel_relight_timer(self):
-        """走查 E1-05：取消尚未触发的自动复亮 timer，并同步轮询标志。"""
-        timer = getattr(self, "_relight_timer", None)
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
-        self._relight_timer = None
-        self._relight_pending = False
-
-    def _finish_screen_on(self, result):
-        row_action, self._row_action = getattr(self, "_row_action", False), False
-        ok, errs = _as_ok_errs(result)
-        info = take_wake_info()
-        self._cancel_relight_timer()
-        if ok:
-            if not row_action:
-                self._remember_selection()
-            save_config(self.cfg)
-            self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
-            self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
-        if errs:
-            detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e
-                               for i, e in errs)
-            self.status_var.set("点亮失败：" + detail.replace("\n", " "))
-            tip = ("\n\n若这台屏是 DP+HDMI 同时接线，把「点亮时允许切信号源」关掉"
-                   "或改用「系统级」再试一次。"
-                   if self.cfg.get("screen_off_method") == "ddc" else "")
-            self.msg.showwarning("点亮失败", detail + tip)
-        if self.cfg.get("screen_off_method") == "topology":
-            # 接回后副屏重新出现，刷新列表把灰显行去掉
-            self.refresh_monitors(silent=True)
-        self.probe_screens()
-
-    def _auto_relight_minutes(self):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return auto_relight_minutes(self.cfg)
-
-    def _stop_tray(self):
-        if self.tray is not None:
-            try:
-                self.tray.stop()
-            except Exception:
-                pass
-            self.tray = None
-
-    # ---------- 托盘 ----------
-    def _tray_image(self):
-        from PIL import Image, ImageDraw
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((4, 4, 60, 60), fill=(30, 30, 30, 255),
-                  outline=(74, 158, 255, 255), width=3)
-        d.rounded_rectangle((14, 28, 50, 36), radius=4, fill=(74, 158, 255, 255))
-        d.ellipse((36, 23, 52, 41), fill=(255, 255, 255, 255))
-        return img
-
-    def _tray_tooltip_text(self):
-        """转发到模块级纯函数（v2.03.0 P2）。"""
-        return tray_tooltip_text(self.cfg, self._last_verdict, APP_TITLE)
-
-    def _tray_update_tooltip(self):
-        if self.tray is not None:
-            try:
-                self.tray.tooltip = self._tray_tooltip_text()
-                self.tray.update_menu()
-            except Exception:
-                pass
-
-    def _create_tray(self):
-        if not TRAY_OK or self.tray is not None or not self.root.winfo_exists():
-            return
-        menu = _TrayMenu(
-            _TrayItem("打开主窗口", lambda *_: self.root.after(0, self._tray_show_main),
-                      default=True),
-            _TrayItem("熄灭显示器", lambda *_: self.root.after(0, self.screen_off)),
-            _TrayItem("点亮显示器", lambda *_: self.root.after(0, self.screen_on)),
-            _TrayItem("启用定时", lambda *_: self.root.after(0, self._tray_toggle_schedule),
-                      checked=lambda _item: bool(self.cfg.get("enabled"))),
-            _TrayItem("退出", lambda *_: self.root.after(0, self._tray_quit)),
-        )
-        self.tray = _TrayIcon("MonitorBrightness", self._tray_image(),
-                              self._tray_tooltip_text(), menu)
-        threading.Thread(target=self.tray.run, daemon=True).start()
-
-    def _tray_show_main(self):
-        self.root.deiconify()
-        self.root.lift()
-        # v2.01.22（走查 P-30）：窗口在托盘里期间可能拔插过屏、开关过串流，
-        # 打开时必须重读，否则列表还是最小化前那一份（用户报"打开没有
-        # 刷新出虚拟显示器"的另一条路径）。
-        self.refresh_monitors(silent=True)
-        self.probe_screens()
-        self.status_var.set("就绪")
-
-    def _tray_toggle_schedule(self):
-        if self.sch_panel.schedule_enabled():
-            self.cancel_schedule()
-        else:
-            if not self._set_schedule_enabled(True, persist=True):
-                return
-            self.status_var.set("正在写入任务计划…")
-            self.run_bg(lambda: register_tasks(self.cfg),
-                        self._finish_tray_register, busy=True)
-
-    def _finish_tray_register(self, result):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            self._rollback_schedule(False, "注册任务失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("定时已启用")
-
-    def _tray_quit(self):
-        self._stop_tray()
-        self.root.destroy()
 
     def _on_close(self):
         if self.tray is not None:
@@ -6005,258 +6325,25 @@ class App:
             self.status_var.set("配置文件读取失败，已使用默认值")
             self.msg.showwarning("配置文件有问题", self._config_error)
 
-    def _refresh_events(self):
-        try:
-            self.sch_panel.set_events(read_session_events(3))
-        except Exception:
-            pass
 
-    def _start_auto_checks(self):
-        """窗口出来之后才跑：只校验计划任务是否已正确配置（全后台）。
 
-        ⚠️ 本程序启动时不会主动熄屏：这里只读任务 XML / 必要时原地重建任务，
-        绝不按「今天错过了哪一档」补执行，也不会改亮度或屏幕状态。
-        """
-        if self._auto_checked:
-            return
-        self._auto_checked = True
-        if not self.cfg.get("enabled"):
-            self._refresh_events()
-            return
 
-        def job():
-            try:
-                return {"task": ensure_task_registration(self.cfg)}
-            except Exception as e:
-                return {"task": (False, "任务自检失败：%s: %s" % (type(e).__name__, e))}
 
-        self.run_bg(job, self._finish_auto_checks)
 
-    def _finish_auto_checks(self, result):
-        if isinstance(result, Exception):
-            self.status_var.set("启动自检失败：%s" % result)
-            self._refresh_events()
-            return
-        _task_ok, task_msg = result.get("task", (True, ""))
-        # 启动自愈成功时不弹「确认」窗：每次启动都可能发生（换 exe 路径后尤其），
-        # 开机即弹会糊脸；反馈走状态卡 + 事件日志（task_msg 已含档位数/下次运行）。
-        if task_msg:
-            self.status_var.set(task_msg)
-        else:
-            # 配置正确：只报「已就绪 + 下次运行」，不做任何业务动作
-            _slots_now = self.cfg.get("slots") or []
-            nxt = _next_run_text([parse_hhmm(s.get("time"), (0, 0))
-                                  for s in _slots_now],
-                                 days_by_min=_days_by_min_from_fp(
-                                     _slot_trigger_fingerprint(_slots_now)))
-            self.status_var.set(("定时任务已就绪，下次运行 %s" % nxt) if nxt
-                                else "定时任务已就绪")
-        self._refresh_events()
-        if task_msg:
-            self.refresh_task_status()
 
-    # ---------- 定时 ----------
-    def on_slots_changed(self, slots):
-        """面板里增删改时间段后的统一出口：立即落盘；已启用则重写任务。"""
-        self.cfg["slots"] = [dict(s) for s in slots]
-        ok, msg = save_config(self.cfg)
-        if not ok:
-            self.msg.showerror("保存时间段失败", msg)
-            return
-        if not self.cfg.get("enabled"):
-            self.status_var.set("时间段已保存（开启每日定时后生效）")
-            return
-        self.status_var.set("时间段已保存，正在重写任务计划…")
-        if self._schedule_reg_timer:
-            try:
-                self.root.after_cancel(self._schedule_reg_timer)
-            except Exception:
-                pass
-        # 500ms 防抖：连续改几档只重建一次任务（每次 PowerShell 约 2~3 秒）
-        self._schedule_reg_timer = self.root.after(500, self._register_after_edit)
 
-    def _register_after_edit(self):
-        self._schedule_reg_timer = None
-        self.run_bg(lambda: register_tasks(self.cfg),
-                    self._finish_edit_register, busy=True)
 
-    def _finish_edit_register(self, result):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 走查 P-04：与面板/托盘失败统一回滚策略（原来只提示不回滚）
-            self._rollback_schedule(False, "重写任务计划失败", out)
-            return
-        _write_event_log("时间段已更新，任务计划已重写")
-        self.refresh_task_status()
-        self.status_var.set("定时已更新")
-        self._refresh_events()
 
-    def save_schedule(self):
-        try:
-            self._save_schedule_inner()
-        except Exception as e:
-            self.msg.showerror("保存定时出错", "%s: %s" % (type(e).__name__, e))
-            self.status_var.set("保存定时出错")
 
-    def _save_schedule_inner(self):
-        if not self.sch_panel.schedule_enabled():
-            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
-            return
-        slots = self.sch_panel.read_slots()
-        if slots is None:
-            return
-        idx, ids = selection_payload(self.selected_indices())
-        part = {"monitors": idx, "monitor_ids": ids,
-                "monitor_anchors": selection_anchors(idx),
-                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True)),
-                "slots": slots}
-        self.cfg.update(part)
-        if not self._set_schedule_enabled(True, persist=True):
-            return
-        self.status_var.set("正在写入任务计划…")
-        before_xml = _read_task_xml()          # 留一份重建前定义，用于比对变化
-        self.run_bg(lambda: register_tasks(self.cfg),
-                    lambda r: self._finish_register(r, part, before_xml), busy=True)
 
-    def rebuild_schedule_tasks(self):
-        """「应用」按钮：按当前面板内容强制重建任务计划（成功弹确认窗）。
 
-        走查 P-05：原名 apply_schedule 与模块级同名函数（按当前时间套档位）
-        混淆——按钮点的是"重建任务"，CLI --apply-schedule 跑的是"套档位"。
-        """
-        if not self.sch_panel.schedule_enabled():
-            self.msg.showinfo("提示", "请先勾选「启用每日定时」")
-            return
-        slots = self.sch_panel.read_slots()
-        if slots is None:
-            return
-        part = {"slots": slots, "enabled": True,
-                "catch_up_on_logon": bool(self.cfg.get("catch_up_on_logon", True))}
-        self.cfg["slots"] = [dict(s) for s in slots]
-        ok, msg = save_config(self.cfg)
-        if not ok:
-            self.msg.showerror("保存失败", msg)
-            return
-        self.status_var.set("正在重建任务计划…")
-        before_xml = _read_task_xml()
-        self.run_bg(lambda: register_tasks(self.cfg),
-                    lambda r: self._finish_apply(r, part, before_xml), busy=True)
 
-    def _announce_rebuilt(self, part, out, before_xml, title):
-        """重建成功后的「确认」弹窗（失败路径绝不调用这里）。
 
-        run_bg 的完成回调本来就由 _poll_read_queue 在 Tk 线程执行；再 after(0)
-        一次是为了让弹窗与回调栈彻底分开，也满足"后台线程结果必须回 Tk 线程"。
-        """
-        message = _rebuild_report(part, out, before_xml)
-        self.root.after(0, lambda: self.msg.shownotice(title, message))
 
-    def _finish_apply(self, result, part, before_xml):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 走查 P-04：与其余入口统一回滚策略
-            self._rollback_schedule(False, "重建任务计划失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("任务计划已重建")
-        self._announce_rebuilt(part, out, before_xml, "任务计划已重建")
 
-    def _finish_register(self, result, part, before_xml=""):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 开关是"切换即注册"：注册失败统一回滚（改状态 + 落盘 + 界面）
-            self._rollback_schedule(False, "注册任务失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("定时已启用")
-        self._announce_rebuilt(part, out, before_xml, "定时已保存")
 
-    def _set_schedule_enabled(self, enabled, persist=True):
-        """定时开关状态的**唯一**写入者：改内存 + 落盘 + 同步界面开关。
 
-        走查 P-01/P-02/P-04：以前 6 个入口各自写 cfg["enabled"]，
-        有的落盘有的不落盘，失败回滚策略四种不同。所有入口统一走这里。
-        返回 (是否成功)。落盘失败时回滚内存，不让界面说谎。
-        """
-        want = bool(enabled)
-        old = bool(self.cfg.get("enabled"))
-        self.cfg["enabled"] = want
-        if persist:
-            ok, msg = save_config(self.cfg)
-            if not ok:
-                self.cfg["enabled"] = old
-                self.msg.showerror("保存失败", msg)
-                return False
-        self.sch_panel.set_enabled_flag(want)
-        return True
 
-    def _rollback_schedule(self, to_enabled, title, out):
-        """任务写入失败时的**唯一**回滚者：改状态 + 落盘 + 提示。"""
-        self._set_schedule_enabled(to_enabled, persist=True)
-        self.msg.showerror(title, out or "未知错误")
-        self.status_var.set("%s（已恢复开关）" % title)
-
-    def cancel_schedule(self):
-        self._set_schedule_enabled(False, persist=True)
-        self.status_var.set("正在取消定时任务…")
-        self.run_bg(unregister_tasks, self._finish_unregister, busy=True)
-
-    def schedule_toggled(self, on):
-        """面板上的「启用每日定时」开关：开 = 注册，关 = 注销。"""
-        if on:
-            self.save_schedule()
-        else:
-            self.cancel_schedule()
-
-    def _finish_unregister(self, result):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 走查 P-02：注销失败必须把开关恢复为 True 并落盘，
-            # 否则磁盘说"已关闭"但任务残留、继续熄屏（cli_apply_schedule
-            # 现在也会因 enabled=false 拒绝执行，双保险）。
-            self._rollback_schedule(True, "取消定时任务失败", out)
-            self.refresh_task_status()
-            return
-        self.refresh_task_status()
-        self.status_var.set("已取消定时任务")
-
-    def refresh_task_status(self):
-        if self._task_querying:
-            return
-        self._task_querying = True
-        self.sch_panel.set_task_status({"state": "loading", "title": "任务计划：读取中…"})
-
-        def job():
-            try:
-                return (query_task_status(), query_task_runtime())
-            except Exception:
-                return ("", "")
-
-        def done(result):
-            self._task_querying = False
-            if isinstance(result, Exception):
-                result = ("", "")
-            text, runtime = result
-            self._apply_task_status(text, runtime)
-
-        self.run_bg(job, done)
-
-    # 兼容旧名（托盘/tray 里调用）
-    _refresh_task_status = refresh_task_status
-
-    def _apply_task_status(self, text, runtime=""):
-        info = task_summary(text, self.cfg.get("slots", []), runtime)
-        self.sch_panel.set_task_status(info)
-        self.scroll.refresh()
-        self._tray_update_tooltip()
 
 
 def _safe_int(text, fallback=0):
