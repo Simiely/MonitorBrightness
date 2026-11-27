@@ -68,3 +68,41 @@ def plan_model_updates(models, current, count):
             continue
         out.append((idx, name))
     return sorted(out)
+
+
+# ---- v2.03.0 U4：显示名判定（MonitorPanel 要用）----
+_GENERIC_DESC = "generic pnp monitor"
+
+
+def is_vdd_row(row):
+    """这一行是不是虚拟显示器 —— 名称显示与逐台按钮都按它判定。
+
+    单独抽成纯函数是为了单测：VDD 当主屏时它是 index 0，绝不能套用
+    mon_models[0] 那块物理屏的型号名（v2.01.12 修）。
+    """
+    return bool(row and row.get("vdd"))
+
+
+def display_name_for_row(index, row, mon_models):
+    """界面行的显示名：VDD 用 friendly，其余才用按 index 缓存的型号名。
+
+    v2.01.21：DDC 读型号走 EDID，真机实测两块屏要 6.2 秒。缓存还没到位时
+    先用 CCD 的 friendly（"R27qe Gen2"，0.1ms 就能拿到）顶上，
+    别让用户盯着"显示器 0"等 6 秒。
+
+    v2.01.22（走查 P-28）：DDC 的 `desc` 恒为 "Generic PnP Monitor"，
+    它是驱动占位名、不是名字，别拿它当兜底显示。
+    """
+    if is_vdd_row(row):
+        name = (row.get("friendly") or "").strip()
+        if name.lower() == _GENERIC_DESC:
+            name = ""
+        return (name or "虚拟显示器"), True
+    model = mon_models.get(index)
+    if model:
+        return model, False
+    name = (row.get("friendly") or "").strip()
+    if name.lower() == _GENERIC_DESC:
+        name = ""
+    return (name or "显示器 %d" % index), False
+
