@@ -1605,6 +1605,32 @@ class UiDecisionTest(unittest.TestCase):
         self.assertIn("未检测", mb.tray_tooltip_text(cfg, None, "MB"))
 
 
+    def test_is_vdd_index(self):
+        mons = [{"dev": "\\\\.\\DISPLAY1"}, {"dev": "\\\\.\\DISPLAY92"}]
+        self.assertTrue(mb.is_vdd_index(1, mons, {"display92"}))
+        self.assertFalse(mb.is_vdd_index(0, mons, {"display92"}))
+        self.assertFalse(mb.is_vdd_index(5, mons, {"display92"}))   # 越界
+        self.assertFalse(mb.is_vdd_index(0, mons, ()))              # 无集合
+
+    def test_ccd_friendly_name(self):
+        mons = [{"dev": "\\\\.\\DISPLAY1"}]
+        self.assertEqual(mb.ccd_friendly_name(0, mons, {"display1": "R27qe Gen2"}),
+                         "R27qe Gen2")
+        self.assertEqual(mb.ccd_friendly_name(0, mons, {}), "")
+        self.assertEqual(mb.ccd_friendly_name(3, mons, {"display1": "x"}), "")
+
+    def test_plan_model_updates(self):
+        # 正常：只回需要改的，且按下标排序
+        got = mb.plan_model_updates({1: "P2", 0: "P1", 2: "P3"},
+                                    {0: "P1"}, 3)
+        self.assertEqual(got, [(1, "P2"), (2, "P3")])
+        # 越界 / 空名 / 已相同 / 非 dict 全部跳过
+        self.assertEqual(mb.plan_model_updates({5: "X", 0: "", 1: "same"},
+                                               {1: "same"}, 2), [])
+        self.assertEqual(mb.plan_model_updates(OSError("boom"), {}, 2), [])
+        self.assertEqual(mb.plan_model_updates({"a": "X"}, {}, 2), [])
+
+
 class RegisterScriptTest(unittest.TestCase):
     """v2.03.0 P0：build_register_script 原为零覆盖。
 

@@ -6723,6 +6723,47 @@ def tray_tooltip_text(cfg, last_verdict, title):
     return ("%s\n定时: %s\n下次 %s\n屏幕: %s" % (title, brief, nxt, st))[:120]
 
 
+def is_vdd_index(index, monitors, vdd_devs):
+    """这一行是不是虚拟显示器（归串流软件管，不给逐台按钮）。"""
+    if index < 0 or index >= len(monitors or []):
+        return False
+    dev = _short_dev(monitors[index].get("dev"))
+    return bool(vdd_devs and dev in vdd_devs)
+
+
+def ccd_friendly_name(index, monitors, ccd_names):
+    """这块屏在 CCD 里的友好名，查不到返回空串。
+
+    DDC 枚举出来的 `desc` 恒为 "Generic PnP Monitor"（真机实测），拿它当名字
+    会让 VDD 显示成物理屏的通用名。CCD 的 `monitorFriendlyDeviceName` 才是
+    用户看到的 "VDD by MTT" / "R27qe Gen2"。
+    """
+    if index < 0 or index >= len(monitors or []):
+        return ""
+    dev = _short_dev(monitors[index].get("dev"))
+    return (ccd_names or {}).get(dev) or ""
+
+
+def plan_model_updates(models, current, count):
+    """型号缓存里**需要刷到界面上**的行：[(index, name)]。
+
+    跳过：读型号抛出的异常、空名、与现有相同、下标越界。
+    v2.03.0 P2：原逻辑混在 `_apply_models` 里，UI 刷新和判断缠在一起。
+    """
+    if not isinstance(models, dict):
+        return []
+    out = []
+    for i, name in models.items():
+        try:
+            idx = int(i)
+        except Exception:
+            continue
+        if not name or idx < 0 or idx >= count or current.get(idx) == name:
+            continue
+        out.append((idx, name))
+    return sorted(out)
+
+
 class App:
     """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
@@ -7178,23 +7219,14 @@ class App:
             self.status_var.set("已自动识别 %d 块显示器" % len(idx))
 
     def is_vdd(self, index):
-        """这一行是不是虚拟显示器 —— 归串流软件管，不给逐台按钮。"""
-        if index >= len(self.monitors):
-            return False
-        dev = _short_dev(self.monitors[index].get("dev"))
-        return bool(getattr(self, "_vdd_devs", ()) and dev in self._vdd_devs)
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return is_vdd_index(index, self.monitors,
+                            getattr(self, "_vdd_devs", ()))
 
     def ccd_friendly(self, index):
-        """这块屏在 CCD 里的友好名（v2.01.19）。
-
-        DDC 枚举出来的 `desc` 恒为 "Generic PnP Monitor"（真机实测），
-        拿它当名字会让 VDD 显示成物理屏的通用名。CCD 的
-        `monitorFriendlyDeviceName` 才是用户看到的 "VDD by MTT" / "R27qe Gen2"。
-        """
-        if index >= len(self.monitors):
-            return ""
-        dev = _short_dev(self.monitors[index].get("dev"))
-        return (getattr(self, "_ccd_names", {}) or {}).get(dev) or ""
+        """转发到模块级纯函数（v2.03.0 P2）。"""
+        return ccd_friendly_name(index, self.monitors,
+                                 getattr(self, "_ccd_names", {}))
         if not self.monitors:
             self.status_var.set(
                 "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
@@ -7204,12 +7236,10 @@ class App:
         self.read_current()
 
     def _apply_models(self, models):
-        if isinstance(models, Exception):
-            return
+        """把读到的型号刷到界面上（判断由 plan_model_updates 负责）。"""
         changed = False
-        for i, name in models.items():
-            if not name or self.mon_models.get(i) == name or i >= len(self.monitors):
-                continue
+        for i, name in plan_model_updates(models, self.mon_models,
+                                          len(self.monitors)):
             self.mon_models[i] = name
             self.mon_panel.set_row_text(i, name)
             changed = True
