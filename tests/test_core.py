@@ -1859,6 +1859,29 @@ class WalkthroughRound2Test(TempConfigCase):
         self.assertEqual(ok, [0])                # 亮度成功仍保留在返回值里
         self.assertTrue(errs)                    # 屏幕动作错误必须上报
 
+    def test_save_failure_is_logged(self):
+        """v2.03.0 P1：18 处调用里 7 处丢弃返回值，失败必须自己留痕。"""
+        logged = []
+        with unittest.mock.patch.object(mb, "_atomic_write_text",
+                                        side_effect=OSError("磁盘只读")), \
+                unittest.mock.patch.object(mb, "_write_event_log",
+                                           side_effect=lambda m: logged.append(m)):
+            ok, err = mb.save_config(mb.default_config())
+        self.assertFalse(ok)
+        self.assertIn("磁盘只读", err)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("配置保存失败", logged[0])
+
+    def test_save_failure_never_raises_when_log_also_fails(self):
+        """"保存失败"不能升级成"程序崩溃"——日志再失败也要吞掉。"""
+        with unittest.mock.patch.object(mb, "_atomic_write_text",
+                                        side_effect=OSError("磁盘只读")), \
+                unittest.mock.patch.object(mb, "_write_event_log",
+                                           side_effect=OSError("日志也写不了")):
+            ok, err = mb.save_config(mb.default_config())
+        self.assertFalse(ok)
+        self.assertIn("磁盘只读", err)
+
     def test_save_config_does_not_touch_legacy_dir(self):
         """v2.01.20（用户决策）：不迁移、不镜像，旧 APPDATA 目录一个字节不动。"""
         cfg = mb.default_config()

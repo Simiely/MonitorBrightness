@@ -804,6 +804,11 @@ def save_config(cfg):
 
     v2.01.20：**不迁移、不镜像**（用户决策）。配置就是程序目录那一份；
     老版本留在 APPDATA 的文件不自动搬，跨机器/跨版本各用各的。
+
+    v2.03.0（重构 P1）：**写入失败必须留痕**。全文 18 处调用里，至少 7 处是
+    `save_config(self.cfg)` 裸调用、直接丢弃返回值——磁盘只读、目录被占、
+    杀软锁定都表现为"设置改了但下次启动又变回去"，且没有任何线索。
+    这里统一写一条事件日志，不管调用方看不看返回值。
     """
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -814,6 +819,12 @@ def save_config(cfg):
         _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
     except Exception as e:
+        # 双层保护：日志本身再失败（比如整个目录只读）也不能把异常抛回调用方，
+        # 否则"保存失败"会变成"程序崩溃"，那是更糟的结果。
+        try:
+            _write_event_log("配置保存失败：%s" % e)
+        except Exception:
+            pass
         return False, str(e)
 
 
