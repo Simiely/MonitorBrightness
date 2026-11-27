@@ -1714,6 +1714,20 @@ class UiSmokeTest(unittest.TestCase):
         self.assertEqual(picker.get(), [], "选满 7 天归一成每天")
 
 
+    def test_app_init_window_runs(self):
+        """回归锁：v2.03.0 U5 拆 __init__ 时，_init_window 里多留了一行
+        `self.root = root`（该方法没有 root 参数）→ 打包版启动即崩
+        "Unhandled exception in script"，而 216 个测试全绿。
+
+        根因是**没有任何测试构造过 App**（构造会真去枚举显示器）。
+        这里用假 self 跑窗口初始化这一段，成本低且能抓住这类 NameError。
+        """
+        fake = types.SimpleNamespace(root=self.root, tray=None)
+        mb.App._init_window(fake)
+        self.assertIs(fake.root, self.root)
+        self.assertEqual(fake.root.title(), "%s v%s" % (mb.APP_TITLE, mb.APP_VERSION))
+
+
 class WheelRouterTest(unittest.TestCase):
     """v2.03.1：滚轮改成进程级路由。
 

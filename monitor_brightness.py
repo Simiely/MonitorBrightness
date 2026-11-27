@@ -4910,12 +4910,24 @@ class App:
     """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
     def __init__(self, root, start_minimized=False):
+        """装配窗口。四段拆开是为了让每段能单独看懂（v2.03.0 U5）：
+        窗口设置 → 状态初始化 → UI 装配 → 启动序列，顺序不能变。"""
         self.root = root
         self.tray = None
-        root.title("%s v%s" % (APP_TITLE, APP_VERSION))
-        root.resizable(False, False)
-        apply_dark_theme(root)
+        self._init_window()
+        self._init_state()
+        self._build_ui()
+        self._start(start_minimized)
 
+    def _init_window(self):
+        """窗口标题 / 尺寸策略 / 深色标题栏。"""
+        self.root.title("%s v%s" % (APP_TITLE, APP_VERSION))
+        self.root.resizable(False, False)
+        apply_dark_theme(self.root)
+
+
+    def _init_state(self):
+        """配置、显示器数据、各种运行标志、状态变量。"""
         self.cfg = load_config()
         self._config_error = CONFIG_LOAD_ERROR
         self.monitors = []
@@ -4959,7 +4971,10 @@ class App:
         self._restore_deadline = 0.0
         self._auto_checked = False
 
-        self.scroll = ScrollArea(root, UI["bg"], on_fit=self._fit_window)
+
+    def _build_ui(self):
+        """滚动区、顶部入口、三个面板、状态回显与关窗钩子。"""
+        self.scroll = ScrollArea(self.root, UI["bg"], on_fit=self._fit_window)
         self.scroll.pack(side="top", fill="both", expand=True)
         self.body = self.scroll.body
 
@@ -4986,8 +5001,11 @@ class App:
         self.status_var.trace_add(
             "write", lambda *_: self.status_card.flash(self.status_var.get()))
 
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+
+    def _start(self, start_minimized):
+        """启动序列：枚举 → 任务状态 → 探测 → 托盘 → 延迟自检。"""
         self.refresh_monitors(silent=True)
         self.refresh_task_status()
         self.probe_screens()
