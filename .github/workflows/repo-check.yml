@@ -4,8 +4,11 @@ on:
   pull_request:
     paths:
       - 'docs/**'
+      - 'rules/**'
       - 'schema/**'
       - 'tools/**'
+      - 'tests/**'
+      - '*.py'
       - 'README.md'
       - 'AGENTS.md'
       - 'DEVELOPMENT.md'
@@ -34,3 +37,50 @@ jobs:
         run: python tools/repo-kit/check_repo.py --root .
       - name: Kit lock
         run: pwsh tools/update-repo-kit.ps1 -Check
+
+  # 回归测试必须跑在 Windows：monitor_brightness.py 顶层就 import tkinter 与
+  # ctypes.wintypes，ubuntu 上连 import 都过不去。
+  #
+  # 观察期：先 continue-on-error（红了不拦合并），连续 3 次绿后改成 false。
+  tests:
+    name: tests / windows
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装界面依赖
+        # pillow 是 GUI 自绘圆角贴图的硬依赖；pystray 可选（缺了自动不启用托盘）。
+        run: python -m pip install --upgrade pip pillow
+
+      - name: Tk 探针（这台 runner 能不能建窗口）
+        shell: pwsh
+        run: |
+          $probe = python -c "import tkinter as tk, time; t0=time.perf_counter(); r=tk.Tk(); r.withdraw(); d=tk.Toplevel(r); d.deiconify(); r.update(); print('tk=%s mapped=%s open_ms=%.0f' % (tk.TkVersion, bool(d.winfo_ismapped()), (time.perf_counter()-t0)*1000)); d.destroy(); r.destroy()" 2>&1 | Out-String
+          Write-Host $probe
+          if ($probe -match 'mapped=True') {
+            "TK_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            "TK_OK=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "::warning::Tk 探针未拿到 mapped=True —— 4 个 GUI 用例会走 skipTest，本次不校验 skipped"
+          }
+          exit 0
+
+      - name: 回归测试（35 项，不碰硬件）
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v *> unittest.log
+          $code = $LASTEXITCODE
+          Get-Content unittest.log
+          if ($code -ne 0) { exit $code }
+          # 4 个 GUI 用例自带 skipTest 兜底：真跑不起来会变成 "OK (skipped=4)"，
+          # 表面全绿。探针确认 Tk 可用时，这里必须拦住这种假绿。
+          if ($env:TK_OK -eq '1' -and (Select-String -Path unittest.log -Pattern '\(skipped=[1-9]')) {
+            throw "GUI 用例被静默跳过（Tk 可用却仍 skip），见上方日志"
+          }
+          if ($env:TK_OK -ne '1') {
+            Write-Host "::warning::Tk 不可用，已跳过的 GUI 用例不计入本次判定"
+          }
