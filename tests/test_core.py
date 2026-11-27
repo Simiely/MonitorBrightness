@@ -8,6 +8,8 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import app.diag as app_diag_mod
+import app.settings as app_settings_mod
 import cli as cli_mod
 import contextlib
 import ctypes
@@ -45,7 +47,8 @@ import ui.sheets as ui_sheets_mod
 # mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
 _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
-                  schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod)
+                  schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod,
+                  app_settings_mod, app_diag_mod)
 
 
 _UNSET = object()
@@ -1739,6 +1742,12 @@ class UiSmokeTest(unittest.TestCase):
     def test_settings_sheet_reexport(self):
         """R4-1：SettingsSheet 搬进 ui/sheets.py 后，主文件仍要拿到同一个类。"""
         self.assertIs(mb.SettingsSheet, ui_sheets_mod.SettingsSheet)
+
+    def test_app_controller_reexports(self):
+        """R4-2：设置/托盘/诊断控制器迁到 app/ 后，主文件再导出不能断。"""
+        self.assertIs(mb._SettingsActions, app_settings_mod._SettingsActions)
+        self.assertIs(mb._DiagActions, app_diag_mod._DiagActions)
+        self.assertIs(mb.tray_tooltip_text, app_settings_mod.tray_tooltip_text)
 
     def test_widgets_construct(self):
         """每个自绘控件都要能建出来且能正常销毁。"""
