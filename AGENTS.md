@@ -1,6 +1,6 @@
 # AGENTS.md · 项目规则
 
-> 📌 **文档基线**：2026-11-27（commit `17aa4d2`）E3 动作层 + E4 配置/GUI 落地（默认 ddc 不变，54 tests OK）　← 前序：2026-11-27（commit `7ea0b07`）按单项目规范 2.1.5 整理：README / DEVELOPMENT 拆分、13 篇问题记录、repo-kit 2.9.1、CI 接入回归测试　← 更早：2026-11-17（commit `9777404`）接入机器层并压缩 AGENTS
+> 📌 **文档基线**：2026-11-27（commit `0e1e697`）E3 动作层 + E4 配置/GUI 落地 + 接回亮度修复（默认 ddc 不变，56 tests OK）　← 前序：2026-11-27（commit `7ea0b07`）按单项目规范 2.1.5 整理：README / DEVELOPMENT 拆分、13 篇问题记录、repo-kit 2.9.1、CI 接入回归测试　← 更早：2026-11-17（commit `9777404`）接入机器层并压缩 AGENTS
 > **更新文档/代码后，请更新此行**（日期 + 新 commit hash），并在 CHANGELOG 追加版本
 
 ## 最高优先级硬约束（v1.9.3 起，高于其它一切规则）
