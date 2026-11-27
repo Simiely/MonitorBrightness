@@ -201,7 +201,7 @@ from ui.widgets import (            # noqa: E402
 # v2.03.0 U3：弹层搬到 ui/sheets.py。SettingsSheet 暂留主文件（依赖配置表），
 # 它继承的 Sheet 从下面这行来。
 from ui.sheets import (             # noqa: E402
-    DarkBox, HelpSheet, HeirSheet, Sheet, SlotEditor,
+    DarkBox, HelpSheet, HeirSheet, SettingsSheet, Sheet, SlotEditor,
 )
 # v2.03.0 U4：4 个面板搬到 ui/panels.py；显示名判定下沉 domain.decisions
 from ui.panels import (             # noqa: E402
@@ -1056,136 +1056,6 @@ def install_wheel_router(root):
 
 
 
-class SettingsSheet(Sheet):
-    """设置：托盘 / 自启 / 熄灭方式 / 预设 / 关于（都是"不常改"的东西）。"""
-
-    def _build_remember_btn(self, parent, app):
-        """「记住」按钮 + 结果回执（v2.01.25）。
-
-        走查反馈：点完没有任何可见反馈。根因不是没写状态栏——`remember_layout`
-        写了——而是**设置弹层是模态的、盖住主窗口的状态卡**，用户看不见。
-        所以在按钮自己身上给回执：成功变「已记住 ✓」，2 秒后复原。
-        """
-        btn = Button(parent, "记住", app.remember_layout, kind="link",
-                     height=22, font_size=8)
-        btn.pack()
-        app._remember_btn = btn
-        return btn
-
-    def __init__(self, app):
-        super().__init__(app, "设置", "不常用的开关都在这里，主界面只留日常操作", width=480)
-        self.app = app
-        cfg = app.cfg
-
-        win = self.section("窗口")
-        self.row(win, "系统托盘图标",
-                 tip="在右下角常驻，右键可熄/亮屏、切换定时",
-                 builder=lambda p: Switch(p, bool(cfg.get("tray_enabled", True)),
-                                          lambda v: app.apply_setting("tray_enabled", v)).pack())
-        self.row(win, "关闭窗口时最小化到托盘",
-                 tip="关掉则点 × 直接退出程序")
-
-        start = self.section("启动")
-        self.row(start, "开机自动启动", tip="启动后直接进托盘",
-                 builder=lambda p: Switch(p, get_autostart()[0],
-                                          app.apply_autostart).pack())
-
-        off = self.section("熄屏")
-        pbg = off.cget("bg")
-        wrap = tk.Frame(off, bg=pbg)
-        wrap.pack(fill="x", padx=14, pady=(10, 6))
-        mode_lbl = Label(wrap, "熄灭方式", size=9, bg=pbg)
-        mode_lbl.pack(anchor="w")
-        # v2.01.15：说明文字全挪到悬停气泡，标题下不再常驻小字
-        Tooltip(mode_lbl, "系统级：整组熄灭、键鼠会点亮\n"
-                          "单屏待机：键鼠不点亮，个别面板唤不回\n"
-                          "拓扑断开：从桌面移除副屏，串流用；接回摆回原位")
-        mode = Segmented(wrap, [OFF_METHOD_LABEL[m] for m in OFF_METHODS],
-                         # fallback 跟着 SETTINGS 的默认值走，别再硬编码
-                         index=OFF_METHODS.index(
-                             cfg.get("screen_off_method")
-                             or SETTING_BY_KEY["screen_off_method"]["default"]),
-                         command=lambda i: app.apply_off_method(OFF_METHODS[i]))
-        mode.pack(fill="x", pady=(5, 0))
-        tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
-
-        def _relight(p):
-            spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
-            spin.set(cfg.get("screen_auto_relight_min", 0))
-            spin.pack()
-            cb = lambda e: app.apply_setting(
-                "screen_auto_relight_min", _safe_int(spin.get(), 0))
-            spin.bind("<<Increment>>", cb)
-            spin.bind("<<Decrement>>", cb)
-            spin.bind("<FocusOut>", cb)
-
-        self.row(off, "熄灭后自动点亮", tip="0 = 不自动；远程时建议设个值", builder=_relight)
-
-        self.row(off, "点亮时允许切信号源",
-                 tip="最后一招；DP+HDMI 双线时可能切到空口",
-                 builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
-                                          lambda v: app.apply_setting("wake_switch_input", v)).pack())
-        # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
-        self.row(off, "改显示器时窗口跟着屏走",
-                 tip="拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",
-                 builder=lambda p: Switch(p, bool(cfg.get("window_follow", True)),
-                                          lambda v: app.apply_setting("window_follow", v)).pack())
-        # 位置记录不会自动覆盖（交接会把屏挪来挪去，那一刻的位置不是用户摆的），
-        # 所以给一个主动更新的入口 —— 这是"记住布局"的唯一途径
-        self.row(off, "记住当前显示器布局",
-                 tip="断开/接回都按这份位置摆放；自己挪过屏之后点一次",
-                 builder=lambda p: self._build_remember_btn(p, app))
-
-        def _restore_delay(p):
-            spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
-            spin.set(cfg.get("restore_delay", 10))
-            spin.pack()
-
-            def cb(_e=None):
-                app.apply_setting("restore_delay", _safe_int(spin.get(), 10))
-            spin.bind("<<Increment>>", cb)
-            spin.bind("<<Decrement>>", cb)
-            spin.bind("<FocusOut>", cb)
-
-        self.row(off, "恢复双屏倒计时",
-                 tip="点「恢复双屏」后等几秒再执行；0 = 立即恢复",
-                 builder=_restore_delay)
-
-        pre = self.section("亮度预设")
-        pbg = pre.cget("bg")
-        prow = tk.Frame(pre, bg=pbg)
-        prow.pack(fill="x", padx=14, pady=9)
-        lbl = Label(prow, "三个快捷按钮的值", size=9, bg=pbg)
-        lbl.pack(anchor="w")
-        Tooltip(lbl, "主界面亮度卡片下面三个快捷按钮对应的百分比")
-        spins = tk.Frame(prow, bg=pbg)
-        spins.pack(anchor="w", pady=(6, 0))
-        self.preset_spins = []
-        for v in cfg.get("presets", [0, 75, 100]):
-            sp = ttk.Spinbox(spins, from_=0, to=100, width=5, justify="center")
-            sp.set(v)
-            sp.pack(side="left", padx=(0, 8))
-            sp.bind("<FocusOut>", lambda e: app.apply_presets_from_settings())
-            self.preset_spins.append(sp)
-
-        about = self.section("关于")
-        # v2.01.14：5 行压成 3 行 —— 版本/路径并一行，两个诊断动作并排
-        self.row(about, "版本 / 配置位置", "",
-                 right_text="v%s · %%APPDATA%%\\MonitorBrightness" % APP_VERSION)
-
-        def _diag_controls(p):
-            box = tk.Frame(p, bg=p.cget("bg"))
-            Button(box, "导出", app.export_diag, kind="link",
-                   height=22, font_size=8, width=34).pack(side="right")
-            Button(box, "日志", app.open_log_dir, kind="link",
-                   height=22, font_size=8, width=30).pack(side="right", padx=(0, 6))
-            Switch(box, bool(cfg.get("diag_log", True)),
-                   lambda v: app.apply_setting("diag_log", v)).pack(side="right", padx=(0, 8))
-            box.pack()
-
-        self.row(about, "诊断", tip="开关 + 日志/导出；问题收敛后可关掉",
-                 builder=_diag_controls)
-        self.show()
 
 
 
