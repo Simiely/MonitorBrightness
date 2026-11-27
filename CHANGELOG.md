@@ -48,7 +48,16 @@
   5/6 回来 → 不保证完全恢复，文档已写明
 - **待办**：跨机器验证（不同显卡 / 单屏 / Python 3.10~3.12 / 32 位 / 不同 Windows 版本）
   已写进 `DEVELOPMENT.md`，用户指定稍后执行；不阻塞 E1/E2
-- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
+- **E1 只读层接入**（主程序第一次改动，仍不碰开关）：
+  - 主脚本内新增 CCD 只读查询（`ccd_probe_topology`）：按官方 `QueryDisplayConfig` /
+    `DisplayConfigGetDeviceInfo` 字段构造，按锚点折叠同一块屏的多个 source；
+    `edidIdsValid` 按官方 bit 2 判断，`targetAvailable=0` 的瞬态路径直接过滤
+  - `screen_verdict` 仅在 `screen_off_method=topology` 时把拓扑 ACTIVE 当结论；
+    默认 `ddc`/`system` 逻辑与文案**完全不变**（有单测守着）
+  - `SETTINGS` 新增 `monitor_anchors`（kind=anchors，E2 迁移用）
+  - `--diag` 新增"四、显示拓扑"段：每块屏的 ACTIVE / 锚点 / GDI 名 / 同源别名
+  - 实测 `QDC_ALL_PATHS` 约 0.10ms（233 条 path），折叠后 3 块屏；39 tests OK
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、39 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
 

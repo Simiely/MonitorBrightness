@@ -188,6 +188,9 @@ SETTINGS = (
     # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
     # 用户在界面里选择"DDC 单屏待机"并确认风险后才会置 True。
     {"key": "ddc_allow_undeclared", "kind": "flag", "default": False},
+    # 拓扑模式的显示器锚点（显卡 LUID + EDID mfr/prod + connectorInstance）。
+    # E1 只读层先声明；E2 才做旧 monitors/monitor_ids 的迁移。
+    {"key": "monitor_anchors", "kind": "anchors", "default": []},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 6
@@ -227,6 +230,17 @@ def coerce_setting(key, value):
     if kind == "screenstate":
         # ⚠️ 0xD6 硬件回读在本机不可信（寄存器值≠面板事实），状态由软件操作记账
         return value if value in ("on", "off") else spec["default"]
+    if kind == "anchors":
+        if not isinstance(value, (list, tuple)):
+            return []
+        out = []
+        for a in value:
+            text = str(a or "").strip()
+            if text and text not in out:
+                out.append(text)
+            if len(out) >= 32:
+                break
+        return out
     return normalize_indices(value)
 
 
@@ -1049,6 +1063,213 @@ def _screen_woke_by_input(cfg):
     return idle * 1000 + 800 < (now - off_tick)
 
 
+# ---- CCD 只读拓扑（拓扑模式的状态层；只查不写）-------------------------
+# 依据：Windows CCD API（QueryDisplayConfig / DisplayConfigGetDeviceInfo）。
+# 只用于"现在这块屏在不在桌面拓扑里"的判断；真正的断开/接回在阶段 E3 才接入。
+class _CcdLuid(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _CcdRational(ctypes.Structure):
+    _fields_ = [("Numerator", wintypes.DWORD), ("Denominator", wintypes.DWORD)]
+
+
+class _CcdSourceInfo(ctypes.Structure):
+    _fields_ = [("adapterId", _CcdLuid), ("id", wintypes.UINT),
+                ("modeInfoIdx", wintypes.UINT), ("statusFlags", wintypes.UINT)]
+
+
+class _CcdTargetInfo(ctypes.Structure):
+    _fields_ = [("adapterId", _CcdLuid), ("id", wintypes.UINT),
+                ("modeInfoIdx", wintypes.UINT), ("outputTechnology", wintypes.UINT),
+                ("rotation", wintypes.UINT), ("scaling", wintypes.UINT),
+                ("refreshRate", _CcdRational), ("scanLineOrdering", wintypes.UINT),
+                ("targetAvailable", ctypes.c_int), ("statusFlags", wintypes.UINT)]
+
+
+class _CcdPathInfo(ctypes.Structure):
+    _fields_ = [("sourceInfo", _CcdSourceInfo), ("targetInfo", _CcdTargetInfo),
+                ("flags", wintypes.UINT)]
+
+
+class _CcdPoint(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _CcdSourceMode(ctypes.Structure):
+    _fields_ = [("width", wintypes.UINT), ("height", wintypes.UINT),
+                ("pixelFormat", wintypes.UINT), ("position", _CcdPoint),
+                ("reserved", wintypes.UINT)]
+
+
+class _CcdModeInfo(ctypes.Structure):
+    _fields_ = [("infoType", wintypes.UINT), ("id", wintypes.UINT),
+                ("adapterId", _CcdLuid), ("sourceMode", _CcdSourceMode),
+                ("tail", ctypes.c_uint64 * 3)]
+
+
+class _CcdInfoHeader(ctypes.Structure):
+    _fields_ = [("type", wintypes.UINT), ("size", wintypes.UINT),
+                ("adapterId", _CcdLuid), ("id", wintypes.UINT)]
+
+
+class _CcdSourceName(ctypes.Structure):
+    _fields_ = [("header", _CcdInfoHeader),
+                ("viewGdiDeviceName", wintypes.WCHAR * 32)]
+
+
+class _CcdTargetName(ctypes.Structure):
+    _fields_ = [("header", _CcdInfoHeader), ("flags", wintypes.UINT),
+                ("outputTechnology", wintypes.UINT),
+                ("edidManufactureId", wintypes.WORD),
+                ("edidProductCodeId", wintypes.WORD),
+                ("connectorInstance", wintypes.UINT),
+                ("monitorFriendlyDeviceName", wintypes.WCHAR * 64),
+                ("monitorDevicePath", wintypes.WCHAR * 128)]
+
+
+_QDC_ALL_PATHS = 0x1
+_QDC_VIRTUAL_MODE_AWARE = 0x10
+_CCD_PATH_ACTIVE = 0x1
+_CCD_GET_SOURCE_NAME = 1
+_CCD_GET_TARGET_NAME = 2
+_CCD_EDID_IDS_VALID = 0x4          # DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.edidIdsValid
+_CCD_TARGET_IN_USE = 0x1          # DISPLAYCONFIG_TARGET_IN_USE
+
+
+def ccd_probe_topology():
+    """只读返回当前桌面拓扑（含 inactive 但 targetAvailable=1 的屏）。
+
+    每项：anchor / active / connected / inUse / friendly / gdi / vdd / pos / size。
+    失败一律返回 []（只读探测不能拖垮 CLI 或 GUI）。
+    实测开销：QDC_ALL_PATHS 约 0.1ms（233 条 path）。
+    """
+    if os.name != "nt":
+        return []
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetDisplayConfigBufferSizes.argtypes = [wintypes.UINT,
+                                                    ctypes.POINTER(wintypes.UINT),
+                                                    ctypes.POINTER(wintypes.UINT)]
+        u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
+        u32.QueryDisplayConfig.argtypes = [wintypes.UINT, ctypes.POINTER(wintypes.UINT),
+                                           ctypes.c_void_p, ctypes.POINTER(wintypes.UINT),
+                                           ctypes.c_void_p, ctypes.c_void_p]
+        u32.QueryDisplayConfig.restype = wintypes.LONG
+        u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
+        u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
+
+        flags = _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE
+        paths = modes = None
+        for _ in range(4):
+            pc, mc = wintypes.UINT(), wintypes.UINT()
+            if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
+                                               ctypes.byref(mc)) != 0:
+                return []
+            paths = (_CcdPathInfo * pc.value)()
+            modes = (_CcdModeInfo * mc.value)()
+            rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
+                                        ctypes.byref(mc), ctypes.byref(modes), None)
+            if rc == 0:
+                break
+            if rc != 122:                 # ERROR_INSUFFICIENT_BUFFER 才重试
+                return []
+        else:
+            return []
+
+        rows = []
+        for p in list(paths):
+            tgt = p.targetInfo
+            if not tgt.targetAvailable:   # 线不在 / 设备不存在：不参与状态判定
+                continue
+            tname = _CcdTargetName()
+            tname.header.type = _CCD_GET_TARGET_NAME
+            tname.header.size = ctypes.sizeof(tname)
+            tname.header.adapterId = tgt.adapterId
+            tname.header.id = tgt.id
+            if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
+                continue
+            sname = _CcdSourceName()
+            sname.header.type = _CCD_GET_SOURCE_NAME
+            sname.header.size = ctypes.sizeof(sname)
+            sname.header.adapterId = p.sourceInfo.adapterId
+            sname.header.id = p.sourceInfo.id
+            u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header))
+
+            luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
+                                  p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
+            if tname.flags & _CCD_EDID_IDS_VALID:
+                anchor = "%s/%04X/%04X/%d" % (luid, tname.edidManufactureId,
+                                              tname.edidProductCodeId,
+                                              tname.connectorInstance)
+            else:
+                anchor = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
+            pos = size = ""
+            smi = p.sourceInfo.modeInfoIdx >> 16
+            if smi != 0xFFFF and smi < len(modes):
+                sm = modes[smi].sourceMode
+                pos = "(%d,%d)" % (sm.position.x, sm.position.y)
+                size = "%dx%d" % (sm.width, sm.height)
+            rows.append({
+                "anchor": anchor,
+                "active": bool(p.flags & _CCD_PATH_ACTIVE),
+                "connected": True,
+                "inUse": bool(tgt.statusFlags & _CCD_TARGET_IN_USE),
+                "friendly": tname.monitorFriendlyDeviceName,
+                "gdi": sname.viewGdiDeviceName,
+                "vdd": any(k in (tname.monitorFriendlyDeviceName or "").lower()
+                           for k in ("vdd", "virtual", "iddcx")),
+                "pos": pos, "size": size,
+            })
+
+        # QDC_ALL_PATHS 会为同一块屏返回多个 source（实测 233 条 path 只有 3 块屏）。
+        # 按锚点折叠，active 的那条胜出，其余 gdi 存进 aliases。
+        merged = []
+        for r in rows:
+            hit = next((x for x in merged if x["anchor"] == r["anchor"]), None)
+            if hit is None:
+                r["aliases"] = [r["gdi"]] if r["gdi"] else []
+                merged.append(r)
+                continue
+            if r["gdi"] and r["gdi"] not in hit["aliases"]:
+                hit["aliases"].append(r["gdi"])
+            if r["active"] and not hit["active"]:
+                old_aliases = hit["aliases"]
+                hit.update(r)
+                hit["aliases"] = old_aliases
+        return merged
+    except Exception:
+        return []
+
+
+def topology_state_for(cfg, rows=None):
+    """把拓扑行折叠成一句状态；只认 monitor_anchors，没配置就不猜。
+
+    判据（官方定义）：ACTIVE=1 表示 Windows 正在这条 path 上输出；
+    targetAvailable=1 表示设备仍连接（被禁用也仍是 1）。
+    官方文档另外说明拔线瞬间可能出现 ACTIVE=1 但 targetAvailable=0（瞬时），
+    这种路径已被 ccd_probe_topology() 过滤，不会误判成"显示中"。
+    """
+    if rows is None:
+        rows = ccd_probe_topology()
+    anchors = [str(a) for a in (cfg.get("monitor_anchors") or [])]
+    if anchors:
+        rows = [r for r in rows if r["anchor"] in anchors and not r["vdd"]]
+    else:
+        rows = [r for r in rows if not r["vdd"]]
+    if not rows:
+        return {"state": "unknown", "detail": "拓扑里没有匹配的物理屏（未配置锚点？）",
+                "rows": []}
+    active = [r for r in rows if r["active"]]
+    if active:
+        state = "on"
+        detail = "拓扑 ACTIVE=%d/%d" % (len(active), len(rows))
+    else:
+        state = "off"
+        detail = "拓扑 inactive=%d/%d，设备仍连接" % (len(rows), len(rows))
+    return {"state": state, "detail": detail, "rows": rows}
+
+
 def screen_verdict(cfg, probes=None):
     """给出"屏幕现在是亮还是灭"的**一句话结论** + 一行依据。
 
@@ -1058,7 +1279,29 @@ def screen_verdict(cfg, probes=None):
       3) DDC 回读：只作为一行证据展示 —— `0xD6` 会撒谎（实测待机时仍报 1），
          之前把它直接当结论，才会出现"明明黑着却显示亮"。
     返回 {"state": "on"/"off"/"unknown", "text": "...", "detail": "..."}。
+
+    拓扑模式（screen_off_method == "topology"）下优先级反转：
+      拓扑 ACTIVE 是系统事实，直接当结论；记账与 DDC 都不参与。
     """
+    if cfg.get("screen_off_method") == "topology":
+        try:
+            topo = topology_state_for(cfg)
+        except Exception as e:
+            topo = {"state": "unknown", "detail": "拓扑读取失败：%s" % e, "rows": []}
+        state = topo["state"]
+        if state == "on":
+            text = "屏幕：显示中（拓扑）"
+            tail = "物理电源键、Windows 自动熄屏不在拓扑追踪范围内"
+        elif state == "off":
+            text = "屏幕：已断开（拓扑）"
+            tail = "接回时先恢复拓扑再写亮度"
+        else:
+            text = "屏幕：状态未知（拓扑）"
+            tail = topo["detail"]
+        return {"state": state, "text": text,
+                "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else ""),
+                "woke_by_input": False}
+
     at = (cfg.get("screen_state_at") or "").strip()
     woke = _screen_woke_by_input(cfg)
     state = "on" if woke else cfg.get("screen_state", "on")
@@ -2529,7 +2772,21 @@ def cli_diag():
                     {"on": "亮", "off": "灭"}.get(s["state"], "未知"), s["why"]))
 
         _out("")
-        _out("四、定时任务")
+        _out("四、显示拓扑（只读，含被断开的屏）")
+        ccd_rows = ccd_probe_topology()
+        if not ccd_rows:
+            _out("  未取到 CCD 拓扑（非控制台会话 / 驱动不支持？）")
+        for r in ccd_rows:
+            extra = [a for a in r.get("aliases", []) if a != r["gdi"]]
+            _out("  %s %s  %s  锚点=%s  gdi=%s%s" %
+                 ("ACTIVE " if r["active"] else "inactive",
+                  "虚拟屏" if r["vdd"] else "物理屏",
+                  r["friendly"] or "(无友好名)", r["anchor"], r["gdi"] or "-",
+                  "  (同源: %s)" % ",".join(extra) if extra else ""))
+        _out("  折叠状态：%s" % topology_state_for(cfg, ccd_rows)["detail"])
+
+        _out("")
+        _out("五、定时任务")
         for line in (query_task_status() or "").splitlines():
             _out("  " + line)
         for line in (query_task_runtime() or "").splitlines():

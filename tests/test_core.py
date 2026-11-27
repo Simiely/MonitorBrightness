@@ -17,6 +17,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -798,6 +799,50 @@ class RebuildNoticeRegression(TempConfigCase):
         self.root.update()
         self.assertEqual(self._top_levels(), [], "启动自动重建成功不应弹窗")
         self.assertIn("重建", fake.status_var.get())
+
+
+class TopologyVerdictTest(unittest.TestCase):
+    """E1 只读层：拓扑模式用 ACTIVE 当结论，默认 ddc 路径不受影响。"""
+
+    def _cfg(self, method="topology", anchors=None):
+        cfg = mb.default_config()
+        cfg["screen_off_method"] = method
+        cfg["monitor_anchors"] = anchors or []
+        cfg["screen_state"] = "on"      # 记账故意与拓扑相反
+        return cfg
+
+    @staticmethod
+    def _row(anchor, active, vdd=False):
+        return {"anchor": anchor, "active": active, "connected": True,
+                "inUse": active, "vdd": vdd, "friendly": "Fake", "gdi": "\\\\.\\DISPLAY9"}
+
+    def test_topology_active_wins_over_bookkeeping(self):
+        row = self._row("LUID/0001/0002/1", True)
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+            v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
+        self.assertEqual(v["state"], "on")
+        self.assertIn("拓扑", v["text"])
+        self.assertFalse(v["woke_by_input"])
+
+    def test_topology_inactive_wins_over_bookkeeping(self):
+        row = self._row("LUID/0001/0002/1", False)
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+            v = mb.screen_verdict(self._cfg(anchors=[row["anchor"]]), probes=[])
+        self.assertEqual(v["state"], "off")
+        self.assertIn("已断开", v["text"])
+
+    def test_vdd_never_counts_as_selected_display(self):
+        row = self._row("VDD/ANCHOR", True, vdd=True)
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+            v = mb.screen_verdict(self._cfg(), probes=[])
+        self.assertEqual(v["state"], "unknown")
+
+    def test_default_ddc_path_unchanged(self):
+        row = self._row("LUID/0001/0002/1", False)
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=[row]):
+            v = mb.screen_verdict(self._cfg(method="ddc"), probes=[])
+        self.assertEqual(v["state"], "on")
+        self.assertNotIn("拓扑", v["text"])
 
 
 if __name__ == "__main__":
