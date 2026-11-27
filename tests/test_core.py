@@ -978,6 +978,36 @@ class TopologyGuiTest(TempConfigCase):
             root.destroy()
 
 
+class ApplyCallbackTest(unittest.TestCase):
+    """回归：App 曾有两个 _finish_apply，亮度回调被任务回调覆盖 → TypeError。"""
+
+    def test_brightness_and_task_callbacks_have_distinct_names(self):
+        self.assertTrue(callable(mb.App._finish_apply_level))
+        self.assertTrue(callable(mb.App._finish_apply))
+        sig_level = __import__("inspect").signature(mb.App._finish_apply_level)
+        sig_task = __import__("inspect").signature(mb.App._finish_apply)
+        self.assertIn("level", sig_level.parameters)
+        self.assertIn("before_xml", sig_task.parameters)
+        self.assertNotEqual(sig_level, sig_task)
+
+    def test_apply_now_uses_brightness_callback(self):
+        fake = type("F", (), {})()
+        fake._busy = False
+        fake.selected_indices = lambda: [0]
+        fake.bri_panel = types.SimpleNamespace(level=lambda: 80)
+        fake.status_var = BusyQueueTest._Var()
+        seen = {}
+        fake.run_bg = lambda job, cb, busy=False: seen.update(cb=cb, busy=busy)
+        mb.App.apply_now(fake)
+        self.assertTrue(seen.get("busy"))
+        self.assertIn("正在下发亮度", fake.status_var.get())
+        # 回调带 level 能直接调用（旧代码这里会 TypeError 缺 before_xml）
+        fake._finish_apply_level = lambda result, level: seen.update(result=result, level=level)
+        seen["cb"](([0], []))
+        self.assertEqual(seen["level"], 80)
+        self.assertEqual(seen["result"], ([0], []))
+
+
 class TopologyActionTest(TempConfigCase):
     """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
 

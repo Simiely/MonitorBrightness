@@ -5119,9 +5119,9 @@ class App:
         level = clamp_level(self.bri_panel.level())
         self.status_var.set("正在下发亮度 %d%% …" % level)
         self.run_bg(lambda: set_brightness_many(targets, level),
-                    lambda r: self._finish_apply(r, level), busy=True)
+                    lambda r: self._finish_apply_level(r, level), busy=True)
 
-    def _finish_apply(self, result, level):
+    def _finish_apply_level(self, result, level):
         ok, errs = _as_ok_errs(result)
         if ok:
             self.status_var.set("已把 %s 的亮度设为 %d%%"

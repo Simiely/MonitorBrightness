@@ -40,7 +40,12 @@
   新增 4 项 GUI 单测（含隐藏 Tk 渲染断言「启用」按钮）→ **60 tests OK**。
 - **计划任务清空**（用户要求）：`MonitorBrightness_Schedule` / `CatchUp` 已注销；
   复查 `Get-ScheduledTask` 已无 `MonitorBrightness*` 任务（其余系统任务未动）。
-- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、60 tests OK。
+- **修复「应用亮度」界面异常**（用户提供 error.log：11-26 12:07 / 11-27 09:47 / 12:00
+  三次 `TypeError: App._finish_apply() missing 1 required positional argument: 'before_xml'`）：
+  根因是 `App` 里**两个同名 `_finish_apply`**——亮度回调 `(result, level)` 被任务重建回调
+  `(result, part, before_xml)` 覆盖。亮度回调改名 `_finish_apply_level`，调用点同步；
+  扫了全部类确认没有别的同名方法被覆盖。新增 2 项回归单测 → **62 tests OK**。
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、62 tests OK。
 
 ### 2026-11-27 · 按单项目规范 2.1.5 整理文档维护
 
