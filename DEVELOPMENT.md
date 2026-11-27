@@ -91,6 +91,21 @@ E1 只读层接入（`screen_verdict` / `--diag`）→ E2 身份层替换 `DISPL
 E3 动作层（快照 / 回读 / 回滚 / 护栏）→ E4 配置与 GUI → E5 串流回归（用户执行）。
 每步独立可停；单测全部 monkeypatch，不碰真机屏幕。
 
+## 待办：跨机器验证（用户指定，稍后执行）
+
+当前所有实测只在**一台**机器（Win11 26100 / RTX 4070 SUPER + Intel 核显 /
+Python 3.14 64bit / 双 R27qe Gen2 + `VDD by MTT`）上完成。进 E3 之前需在其它机器验证：
+
+| # | 场景 | 要验什么 |
+|---|---|---|
+| 1 | 不同显卡厂商（AMD / Intel-only） | CCD `PATH_INFO` 布局、锚点是否仍唯一、`targetAvailable` 语义 |
+| 2 | 无 VDD / 单屏机器 | 护栏是否正确拒绝；单屏拒绝断开 |
+| 3 | Python 3.10 / 3.12、32 位 | `scripts/topology_probe.py` 开头打印的结构体尺寸是否与本机一致（`PATH_INFO=72` / `MODE_INFO=64` / `TARGET_DEVICE_NAME=420`） |
+| 4 | 不同 Windows 版本 | 主屏 `rc=87`、`QDC_DATABASE_CURRENT` 行为是否一致 |
+
+采集方式：在目标机器跑 `python scripts/topology_probe.py --json`，把 JSON 与结构体尺寸回传对比。
+**这项不阻塞 E1/E2**，但进 E3（动作层）前必须有结论。
+
 ## 变更记录
 
 见 [CHANGELOG.md](CHANGELOG.md)。

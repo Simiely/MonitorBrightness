@@ -42,6 +42,12 @@
 - **阶段 D 设计定稿**：写进 `DEVELOPMENT.md`，6 条决策（稳定锚点 / topology 选项 /
   档位顺序 / VDD+主屏护栏 / 旧配置迁移 / 快照回滚）+ E1–E5 实现顺序；
   新增一坑一篇 `docs/问题记录/topology-primary-rc87.md`
+- **持久化与副作用实测**：新增 `scripts/topology_side_probe.py`（只读）。
+  `QDC_DATABASE_CURRENT` 在断开中变为 `topologyId=1 / active=1/1` → `SDC_SAVE_TO_DATABASE`
+  确实写入数据库。窗口副作用量化：off 时 3 个窗口被移动、6 个消失；接回后 17/19 回原位、
+  5/6 回来 → 不保证完全恢复，文档已写明
+- **待办**：跨机器验证（不同显卡 / 单屏 / Python 3.10~3.12 / 32 位 / 不同 Windows 版本）
+  已写进 `DEVELOPMENT.md`，用户指定稍后执行；不阻塞 E1/E2
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
