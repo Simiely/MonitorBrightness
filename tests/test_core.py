@@ -1351,6 +1351,100 @@ class SelectionAnchorsTest(unittest.TestCase):
             self.assertEqual(mb.selection_anchors([], targets), [])   # 空=全部，不锚死
 
 
+class _FakeU32:
+    """够用的 user32 替身：枚举窗口 + 读/写矩形。"""
+
+    def __init__(self, rects):
+        self._r = dict(rects)          # hwnd -> (x, y, w, h)
+        self.moved = []                # [(hwnd, x, y)]
+        self.pid = 999999              # 别等于本进程，否则会被过滤掉
+
+    def EnumWindows(self, cb, _lp):
+        for h in list(self._r):
+            cb(h, 0)
+        return 1
+
+    def IsWindowVisible(self, h):
+        return True
+
+    def IsIconic(self, h):
+        return False
+
+    def GetWindowTextLengthW(self, h):
+        return 5
+
+    def GetWindowLongW(self, h, _i):
+        return 0
+
+    def GetWindowThreadProcessId(self, h, ref):
+        ref._obj.value = self.pid
+        return 1
+
+    def GetWindowRect(self, h, ref):
+        x, y, w, hh = self._r[h]
+        r = ref._obj
+        r.left, r.top, r.right, r.bottom = x, y, x + w, y + hh
+        return 1
+
+    def IsWindow(self, h):
+        return h in self._r
+
+    def SetWindowPos(self, h, _after, x, y, _cx, _cy, _flags):
+        ox, oy, w, hh = self._r[h]
+        self._r[h] = (x, y, w, hh)
+        self.moved.append((h, x, y))
+        return 1
+
+
+class WindowFollowTest(unittest.TestCase):
+    """v2.01.9：交接主屏会让所有屏平移，窗口必须跟着自己那块屏走。
+
+    不做的话用户看到的是"一改显示器设置，所有窗口挤成一堆" —— Windows 在
+    拓扑变化时会把窗口挪走，而且不会在拓扑恢复后搬回来。
+    """
+
+    LAYOUT = {"A1": (0, 0, 2560, 1440), "A2": (-2560, 0, 2560, 1440)}
+
+    def test_snapshot_maps_window_to_its_screen(self):
+        u32 = _FakeU32({101: (100, 100, 800, 600),      # 中心 (500,400) → A1
+                        202: (-2000, 50, 800, 600)})    # 中心 (-1600,350) → A2
+        snap = mb.win_snapshot(self.LAYOUT, u32)
+        self.assertEqual({s["hwnd"]: s["anchor"] for s in snap},
+                         {101: "A1", 202: "A2"})
+
+    def test_follow_moves_only_windows_on_surviving_screens(self):
+        u32 = _FakeU32({101: (100, 100, 800, 600),
+                        202: (-2000, 50, 800, 600)})
+        snap = mb.win_snapshot(self.LAYOUT, u32)
+        # 主屏 A1 被摘掉、其余屏平移 +2560（A2 挪到桌面原点）
+        moved = mb.win_follow(snap, (2560, 0), {"A1"}, u32)
+        self.assertEqual(moved, 1)
+        self.assertEqual(u32.moved, [(202, 560, 50)])   # -2000+2560
+        self.assertEqual(u32._r[101][0], 100)           # 被摘屏上的窗口不动
+
+    def test_follow_skips_windows_already_in_place(self):
+        """Windows 已经把它放到目标位置了就别再动 —— 否则是我们在制造抖动。"""
+        u32 = _FakeU32({202: (560 + 2560, 50, 800, 600)})
+        snap = [{"hwnd": 202, "rect": (560, 50, 800, 600), "anchor": "A2"}]
+        self.assertEqual(mb.win_follow(snap, (2560, 0), set(), u32), 0)
+        self.assertEqual(u32.moved, [])
+
+    def test_no_shift_means_no_work(self):
+        u32 = _FakeU32({101: (100, 100, 800, 600)})
+        snap = [{"hwnd": 101, "rect": (100, 100, 800, 600), "anchor": "A1"}]
+        self.assertEqual(mb.win_follow(snap, (0, 0), set(), u32), 0)
+        self.assertEqual(u32.moved, [])
+
+    def test_dead_window_is_skipped(self):
+        u32 = _FakeU32({})
+        snap = [{"hwnd": 777, "rect": (0, 0, 10, 10), "anchor": "A2"}]
+        self.assertEqual(mb.win_follow(snap, (10, 0), set(), u32), 0)
+
+    def test_switch_defaults_on_and_is_declared(self):
+        self.assertTrue(mb.default_config()["window_follow"])
+        self.assertEqual(mb.coerce_setting("window_follow", 0), False)
+
+
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 

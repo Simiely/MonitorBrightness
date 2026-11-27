@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.8"     # 断开主屏前先交接主屏角色（纯拓扑，不碰面板电源）
+APP_VERSION = "2.01.9"     # 改显示器时应用窗口跟着自己的屏走
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -264,6 +264,9 @@ SETTINGS = (
     {"key": "monitor_positions", "kind": "positions", "default": {}},
     # 诊断日志开关（临时项，v2.01.4 引入；问题收敛后连同 dlog 一起删掉）。
     {"key": "diag_log", "kind": "flag", "default": True},
+    # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来。
+    # 打开时由本程序在动作后把窗口"跟着它的屏"搬一次（v2.01.9）。
+    {"key": "window_follow", "kind": "flag", "default": True},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
 CONFIG_VERSION = 6
@@ -2003,7 +2006,12 @@ def _ccd_live_size(rows, paths, modes):
 
 def _ccd_layout_rects(rows, paths, modes):
     """当前桌面上每块活动屏的 (x, y, w, h)。"""
-    out = []
+    return list(_ccd_layout_by_anchor(rows, paths, modes).values())
+
+
+def _ccd_layout_by_anchor(rows, paths, modes):
+    """{锚点: (x, y, w, h)} —— 当前桌面上每块活动屏的位置。"""
+    out = {}
     for r in rows or []:
         if not (r.get("active") and r.get("connected")):
             continue
@@ -2015,8 +2023,8 @@ def _ccd_layout_rects(rows, paths, modes):
             continue
         sm = modes[src].sourceMode
         if sm.width and sm.height:
-            out.append((int(sm.position.x), int(sm.position.y),
-                        int(sm.width), int(sm.height)))
+            out[r["anchor"]] = (int(sm.position.x), int(sm.position.y),
+                                int(sm.width), int(sm.height))
     return out
 
 
@@ -2042,6 +2050,124 @@ def _ccd_place(want_xy, w, h, rects):
         if not clash:
             return x, y
     return max([rx + rw for rx, _ry, rw, _rh in rects] or [0]), 0
+
+
+# ============================================================================
+# 窗口跟随（v2.01.9）
+# ----------------------------------------------------------------------------
+# 拓扑一变，Windows 会把各应用的窗口挤到"还能显示"的地方，而且**不会**在
+# 拓扑恢复后搬回来。用户看到的就是"一改显示器设置，窗口全乱了"。
+#
+# 这里只在**一次操作内**做：动作前记下每个窗口属于哪块屏，动作后按这块屏的
+# 平移量把窗口跟着搬。不落盘、不跨操作 —— 跨操作记录会跟用户后来的手动摆放
+# 打架（他挪过的窗口会被我们又搬回去）。
+# ============================================================================
+_SWP_NOSIZE = 0x0001
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_NOACTIVATE = 0x08000000
+
+
+class _WinRect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def _user32():
+    return ctypes.windll.user32 if os.name == "nt" else None
+
+
+def _window_rect(u32, hwnd):
+    r = _WinRect()
+    if not u32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    return (int(r.left), int(r.top),
+            int(r.right - r.left), int(r.bottom - r.top))
+
+
+def iter_app_windows(u32=None):
+    """枚举"用户看得见的应用窗口"。
+
+    排除：不可见、最小化、无标题、工具窗/不激活窗（输入法、悬浮条）、
+    本进程自己的窗口。收起的窗口不碰 —— 动它等于把它还原，那是另一回事。
+    """
+    u32 = u32 or _user32()
+    if u32 is None:
+        return []
+    out = []
+    me = os.getpid()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _lp):
+        try:
+            if not u32.IsWindowVisible(hwnd) or u32.IsIconic(hwnd):
+                return True
+            if u32.GetWindowTextLengthW(hwnd) == 0:
+                return True
+            ex = u32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+            if ex & (_WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE):
+                return True
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == me:
+                return True
+            out.append(int(hwnd))
+        except Exception:
+            pass
+        return True
+
+    u32.EnumWindows(_cb, 0)
+    return out
+
+
+def win_snapshot(layout, u32=None):
+    """记下每个应用窗口现在落在哪块屏上。layout = {锚点: (x, y, w, h)}。"""
+    u32 = u32 or _user32()
+    if u32 is None or not layout:
+        return []
+    snap = []
+    for hwnd in iter_app_windows(u32):
+        rect = _window_rect(u32, hwnd)
+        if not rect:
+            continue
+        cx, cy = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
+        for anchor, (x, y, w, h) in layout.items():
+            if x <= cx < x + w and y <= cy < y + h:
+                snap.append({"hwnd": hwnd, "rect": rect, "anchor": anchor})
+                break
+    return snap
+
+
+def win_follow(snap, shift, dropped, u32=None):
+    """按屏的平移量把窗口搬到新位置；所在屏没了的不动（交给 Windows）。
+
+    只改位置不改大小，并且**只在窗口确实被挪走时才动**：如果它已经在目标
+    位置，说明 Windows 没碰它，我们也不碰。
+    """
+    u32 = u32 or _user32()
+    if u32 is None or not snap or tuple(shift) == (0, 0):
+        return 0
+    dropped = set(dropped or ())
+    moved = 0
+    for it in snap:
+        if it["anchor"] in dropped:
+            continue
+        hwnd = it["hwnd"]
+        try:
+            if not u32.IsWindow(hwnd):
+                continue
+            want = (it["rect"][0] + shift[0], it["rect"][1] + shift[1])
+            cur = _window_rect(u32, hwnd)
+            if cur is None or (cur[0], cur[1]) == want:
+                continue
+            u32.SetWindowPos(hwnd, 0, want[0], want[1], 0, 0,
+                             _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+            moved += 1
+        except Exception:
+            continue
+    return moved
 
 
 def _ccd_append_source_mode(modes, mc, adapter_low, adapter_high, source_id,
@@ -2263,6 +2389,13 @@ def topology_off(indices, cfg=None, heir=None):
 
     cur_modes, cur_mc = modes, mc
 
+    # 动作前记下"每个应用窗口在哪块屏上"：交接会让所有屏平移，Windows 这时
+    # 会把窗口挤到一起且不会搬回来。只在 shift≠0（真会平移）时才记。
+    win_snap = []
+    if shift != (0, 0) and bool((cfg or {}).get("window_follow", True)):
+        win_snap = win_snapshot(_ccd_layout_by_anchor(raw_rows, paths, modes))
+        dlog("topo.off.windows.snap", count=len(win_snap))
+
     # 接班屏当前是断着的（虚拟显示器）→ 先把它接回，并直接放到 (0,0)
     if heir_anchor and not heir_active:
         p_on, e_on, n_on = topology_plan_on(
@@ -2339,6 +2472,11 @@ def topology_off(indices, cfg=None, heir=None):
     done = sorted({i for name, i in dev_to_index.items()
                    if _short_dev(name) in done_devs})
     dlog("topo.off.done", anchors=anchors, indices=done, heir=heir_anchor)
+    # 拓扑已经稳定，再把窗口搬回"跟着它的屏"的位置
+    if win_snap:
+        moved = win_follow(win_snap, shift, set(anchors))
+        dlog("topo.off.windows", moved=moved, total=len(win_snap),
+             shift=list(shift), dropped=len(anchors))
     return done or list(normalize_indices(indices)), []
 
 
@@ -5652,6 +5790,11 @@ class SettingsSheet(Sheet):
         self.row(off, "点亮时允许切信号源", "最后一招；DP+HDMI 双线时可能切到空口",
                  builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
                                           lambda v: app.apply_setting("wake_switch_input", v)).pack())
+        # 交接主屏会让所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
+        self.row(off, "改显示器时窗口跟着屏走",
+                 "拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",
+                 builder=lambda p: Switch(p, bool(cfg.get("window_follow", True)),
+                                          lambda v: app.apply_setting("window_follow", v)).pack())
 
         pre = self.section("亮度预设")
         pbg = pre.cget("bg")
@@ -5923,6 +6066,11 @@ class App:
                 dlog("app.setting", key=key, value=bool(value))
                 diag_set_enabled(self.cfg[key])
                 self.status_var.set("诊断日志已" + ("开启" if value else "关闭"))
+            elif key == "window_follow":
+                self.cfg[key] = bool(value)
+                save_config(self.cfg)
+                self.status_var.set("改显示器时" + ("会" if value else "不会")
+                                    + "把窗口搬回原屏")
             elif key == "presets":
                 self.cfg[key] = coerce_setting("presets", value)
                 save_config(self.cfg)
