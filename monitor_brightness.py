@@ -90,6 +90,11 @@ from core.paths import (                             # noqa: E402
     APP_DIR, CONFIG_DIR, CONFIG_FILE, ERROR_FILE, EVENTS_FILE, LOG_DIR,
     _LEGACY_CONFIG_DIR, _app_dir, _dir_writable, _pick_log_dir,
 )
+# v2.03.0 R1 前置：纯工具函数搬到 core/util.py。重新导出，主文件与测试里的
+# `mb._err` / `mb._short_dt` 等引用照旧有效。
+from core.util import (                              # noqa: E402
+    _err, _out, _safe_int, _short_dt,
+)
 
 # Pillow 只有 GUI 需要（抗锯齿圆角贴图）。**必须有守卫**：
 # 缺 Pillow 时 CLI（--set / --apply-schedule / --diag / --selftest）照常工作，
@@ -4313,25 +4318,6 @@ def _rebuild_report(cfg, out, before_xml):
 # ============================================================
 # 六、命令行模式（供任务计划静默调用）
 # ============================================================
-def _out(msg=""):
-    """打印到 stdout。--windowed 打包后若没有控制台，sys.stdout 可能是 None。"""
-    try:
-        if sys.stdout is not None:
-            sys.stdout.write(str(msg) + "\n")
-            sys.stdout.flush()
-    except Exception:
-        pass
-
-
-def _err(msg):
-    try:
-        if sys.stderr is not None:
-            sys.stderr.write(str(msg) + "\n")
-            sys.stderr.flush()
-    except Exception:
-        pass
-
-
 def parse_level_arg(text):
     """严格解析命令行里的亮度：必须是 0-100 的整数，非法返回 None。
 
@@ -6344,19 +6330,6 @@ class App(_ScreenActions, _ScheduleActions, _LayoutActions,
 
 
 
-
-
-def _safe_int(text, fallback=0):
-    try:
-        return int(float(str(text).strip()))
-    except Exception:
-        return fallback
-
-
-def _short_dt(text):
-    """'2026-11-04 08:30' → '11-04 08:30'；格式不认识就原样返回。"""
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2})$", str(text or "").strip())
-    return "%s-%s %s" % (m.group(2), m.group(3), m.group(4)) if m else str(text or "")
 
 
 def task_summary(text, slots, runtime=""):
