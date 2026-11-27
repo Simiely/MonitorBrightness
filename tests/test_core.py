@@ -1439,6 +1439,174 @@ class WeekdayScheduleTest(unittest.TestCase):
         self.assertEqual(got[1260], frozenset())
 
 
+class AppMethodTest(TempConfigCase):
+    """v2.03.0 P0：重构要搬的 App 方法，先钉住输入输出。
+
+    App 89 个方法里原先只有 24 个被测；这里补的是「抽服务时必然被搬动」的那些。
+    用 SimpleNamespace 假 App + 绑定真方法，不需要 Tk 环境。
+    """
+
+    def _fake(self, **kw):
+        base = dict(
+            cfg=mb.default_config(),
+            mon_panel=types.SimpleNamespace(selected=lambda: [0, 1]),
+            status_var=types.SimpleNamespace(set=lambda t: None),
+            run_bg=lambda job, done, busy=False: None,
+            msg=types.SimpleNamespace(showerror=lambda *a: None,
+                                      showinfo=lambda *a: None,
+                                      askyesno=lambda *a: True),
+            _row_action_blocker=lambda: "",
+            _finish_screen_on=lambda r: None,
+            _finish_screen_off=lambda r: None,
+            _busy=False, _busy_action="", _row_action=False,
+        )
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_selected_indices_delegates(self):
+        fake = self._fake()
+        self.assertEqual(mb.App.selected_indices(fake), [0, 1])
+        fake.mon_panel = types.SimpleNamespace(selected=lambda: [])
+        self.assertEqual(mb.App.selected_indices(fake), [])
+
+    def test_auto_relight_minutes_clamps(self):
+        for raw, want in ((0, 0), (30, 30), (120, 120), (200, 120), (-5, 0),
+                          ("abc", 0), (None, 0)):
+            fake = self._fake()
+            fake.cfg["screen_auto_relight_min"] = raw
+            self.assertEqual(mb.App._auto_relight_minutes(fake), want, repr(raw))
+
+    def test_monitor_on_starts_background_job(self):
+        calls = []
+        fake = self._fake(run_bg=lambda job, done, busy=False:
+                          calls.append((type(job).__name__, busy)))
+        mb.App.monitor_on(fake, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1], "逐台点亮必须占 busy 锁")
+
+    def test_monitor_off_blocked_by_mode_does_nothing(self):
+        """系统级模式下没有「单块熄灭」这回事：只提示，不起任务。"""
+        calls = []
+        fake = self._fake(_row_action_blocker=lambda: "「系统级」熄灭是整组广播",
+                          run_bg=lambda *a, **k: calls.append(1))
+        mb.App.monitor_off(fake, 0)
+        self.assertEqual(calls, [])
+        fake._row_action_blocker = lambda: ""
+        fake.cfg["screen_off_method"] = "topology"
+        with unittest.mock.patch.object(mb, "selection_anchors", return_value=[]):
+            mb.App.monitor_off(fake, 0)
+        self.assertEqual(calls, [], "拿不到锚点也不能动")
+
+    def test_monitor_off_topology_secondary_uses_topology_off(self):
+        """副屏单独熄灭走 topology_off；不应走整组 screen_off。"""
+        started = []
+        fake = self._fake(
+            mon_info=[("DISPLAY1", 2560, 1440, True), ("DISPLAY2", 2560, 1440, False)],
+            run_bg=lambda job, done, busy=False: started.append((job, done, busy)))
+        fake.cfg["screen_off_method"] = "topology"
+        with unittest.mock.patch.object(mb, "selection_anchors", return_value=["A2"]):
+            mb.App.monitor_off(fake, 1)
+        self.assertEqual(len(started), 1)
+        self.assertTrue(started[0][2])
+
+    def test_on_slots_changed_saves_and_defers_rebuild(self):
+        """时间段改了：立刻落盘；已启用时 500ms 防抖后重建任务（不逐次重建）。"""
+        seen = []
+
+        def after(ms, fn):
+            seen.append(("after", ms))
+            return "timer-1"
+
+        fake = self._fake(root=types.SimpleNamespace(
+            after=after, after_cancel=lambda t: seen.append(("cancel", t))))
+        fake._schedule_reg_timer = None
+        fake._register_after_edit = lambda: None
+        fake.cfg["enabled"] = False
+        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+            mb.App.on_slots_changed(fake, [{"time": "07:00", "level": 40,
+                                            "screen": "", "days": []}])
+        self.assertEqual(fake.cfg["slots"][0]["time"], "07:00")
+        self.assertEqual(seen, [], "未启用时不该重建任务")
+
+        fake.cfg["enabled"] = True
+        with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
+            mb.App.on_slots_changed(fake, [{"time": "08:00", "level": 50,
+                                            "screen": "", "days": []}])
+        self.assertEqual(seen, [("after", 500)])
+        self.assertEqual(fake._schedule_reg_timer, "timer-1")
+
+    def test_on_slots_changed_reports_save_failure(self):
+        """落盘失败必须报错并中止，不能"看起来保存成功、其实没写"。"""
+        errors = []
+        fake = self._fake(msg=types.SimpleNamespace(
+            showerror=lambda t, m: errors.append((t, m)),
+            showinfo=lambda *a: None, askyesno=lambda *a: True))
+        fake._schedule_reg_timer = None
+        fake.cfg["enabled"] = True
+        with unittest.mock.patch.object(mb, "save_config",
+                                        return_value=(False, "磁盘只读")):
+            mb.App.on_slots_changed(fake, [{"time": "07:00", "level": 40,
+                                            "screen": "", "days": []}])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("磁盘只读", errors[0][1])
+        self.assertIsNone(fake._schedule_reg_timer, "失败不能排重建")
+
+
+class RegisterScriptTest(unittest.TestCase):
+    """v2.03.0 P0：build_register_script 原为零覆盖。
+
+    这是"定时到点没执行"类故障的唯一源头，重构前必须钉住生成结果。
+    """
+
+    def _cfg(self, **kw):
+        cfg = mb.default_config()
+        cfg["enabled"] = True
+        cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80},
+                                         {"time": "21:00", "level": 0}])
+        cfg.update(kw)
+        return cfg
+
+    def test_one_trigger_per_slot(self):
+        script = mb.build_register_script(self._cfg())
+        for t in ("'08:30'", "'21:00'"):
+            self.assertIn(t, script)
+        # 两档 = 两条 -Daily 触发器（登录校准的 -AtLogOn 是另一类，不计入）
+        self.assertEqual(script.count("New-ScheduledTaskTrigger -Daily"), 2)
+
+    def test_start_when_available_is_set(self):
+        """错过补跑（关机/睡眠）是 v1.0.0 定时漏跑的根本原因，不能丢。"""
+        script = mb.build_register_script(self._cfg())
+        self.assertIn("-StartWhenAvailable", script)
+
+    def test_weekly_trigger_for_weekday_slots(self):
+        cfg = self._cfg()
+        cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80,
+                                          "days": [1, 3, 5]}])
+        script = mb.build_register_script(cfg)
+        self.assertIn("-Weekly", script)
+        self.assertIn("Monday,Wednesday,Friday", script)
+
+    def test_catch_up_task_registered_and_removed(self):
+        on = mb.build_register_script(self._cfg(catch_up_on_logon=True))
+        self.assertIn("-AtLogOn", on)
+        self.assertIn("CATCHUP=OK", on)
+        # 关掉时不是"不管它"，而是**主动清掉**残留的登录校准任务
+        off = mb.build_register_script(self._cfg(catch_up_on_logon=False))
+        self.assertNotIn("-AtLogOn", off)
+        self.assertIn("Unregister-ScheduledTask -TaskName '%s'" % mb.TASK_CATCHUP, off)
+
+    def test_single_quote_in_path_is_escaped(self):
+        """PowerShell 单引号字符串里 ' 要写成 ''，否则路径带引号时脚本语法错误。"""
+        self.assertEqual(mb._ps_quote("C:\\a'b\\x.exe"), "'C:\\a''b\\x.exe'")
+        self.assertIn("--apply-schedule", mb.build_register_script(self._cfg()))
+
+    def test_uses_set_scheduled_task_when_exists(self):
+        """已存在的任务优先原地更新（保留上次运行记录），失败才重建。"""
+        script = mb.build_register_script(self._cfg())
+        self.assertIn("Set-ScheduledTask", script)
+        self.assertIn("REBUILT=FALLBACK", script)
+
+
 class SelectionAnchorsTest(unittest.TestCase):
     """勾选 → 锚点。aliases 是陷阱：每块屏的 aliases 都含 DISPLAY1~4。"""
 
@@ -2084,6 +2252,65 @@ class TopologyActionTest(_TopoFixture):
         self.assertEqual(plan["off"], [])
         self.assertFalse(errs)
         self.assertTrue(noop)
+
+    # ---- v2.03.0 P0：topology_on 原为零覆盖，重构前必须先钉住 ----
+    def _on_patches(self, fake_query, apply_rc=0, verify=True, restored=None):
+        """topology_on 需要的全套 mock（含现造 source mode 与索引回映）。"""
+        return self._base_patches(fake_query, apply_rc=apply_rc, verify=verify) + (
+            unittest.mock.patch.object(
+                mb, "_ccd_fill_missing_source_modes",
+                side_effect=lambda u32, p, m, mc, rows, plan, want=None: (m, mc)),
+            unittest.mock.patch.object(
+                mb, "_ccd_apply_plan_on",
+                return_value=list(restored or ["A2"])),
+            unittest.mock.patch.object(
+                mb, "topology_indices_for_anchors", return_value=[1]),
+        )
+
+    def test_on_restores_inactive_screen(self):
+        """接回断开的屏：提交一次；返回 (下标, 错误, 接回锚点)。"""
+        ps = self._on_patches(lambda u32=None: self._off_raw())
+        with ps[0], ps[1], ps[2] as apply, ps[3], ps[4], ps[5], ps[6], ps[7], ps[8]:
+            ok, errs, restored = mb.topology_on(["A2"], {})
+        self.assertEqual(errs, [])
+        self.assertEqual(restored, ["A2"])
+        self.assertEqual(ok, [1])
+        self.assertEqual(apply.call_count, 1)
+
+    def test_on_skips_already_active(self):
+        """已经亮着的锚点 = noop：不提交拓扑，也不报错（幂等）。"""
+        ps = self._on_patches(lambda u32=None: self._raw()[0])
+        with ps[0], ps[1], ps[2] as apply, ps[3], ps[4], ps[5], ps[6], ps[7], ps[8]:
+            ok, errs, restored = mb.topology_on(["A1"], {})
+        self.assertEqual((ok, errs, restored), ([], [], []))
+        self.assertEqual(apply.call_count, 0, "noop 不该提交")
+
+    def test_on_rejects_unknown_anchor(self):
+        """锚点对不上任何已连接 path（刚被拔线）→ 明确报错，不瞎提交。"""
+        ps = self._on_patches(lambda u32=None: self._off_raw())
+        with ps[0], ps[1], ps[2] as apply, ps[3], ps[4], ps[5], ps[6], ps[7], ps[8]:
+            ok, errs, restored = mb.topology_on(["NOPE"], {})
+        self.assertEqual(ok, [])
+        self.assertTrue(errs)
+        self.assertEqual(apply.call_count, 0)
+
+    def test_on_without_ccd_reports_windows_only(self):
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=None):
+            ok, errs, restored = mb.topology_on(["A1"])
+        self.assertEqual((ok, restored), ([], []))
+        self.assertIn("仅支持 Windows", errs[0][1])
+
+    def test_on_verify_timeout_is_not_success(self):
+        """提交 rc=0 但 2 秒内回读没确认 ACTIVE → 必须报错。
+
+        否则会接着写亮度，而屏其实没接回来（用户看到"点亮了但黑屏"）。
+        """
+        ps = self._on_patches(lambda u32=None: self._off_raw(), verify=False)
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], ps[7], ps[8]:
+            ok, errs, restored = mb.topology_on(["A2"], {})
+        self.assertEqual((ok, restored), ([], []))
+        self.assertTrue(errs)
+        self.assertIn("回读未确认", errs[0][1])
 
     def test_off_snapshots_in_memory_then_applies(self):
         """v2.01.0：断开只把内存快照拍在**动作前**（用于本次失败回滚），不落盘。"""
@@ -3082,6 +3309,49 @@ class TooltipTest(unittest.TestCase):
             sheet.destroy()
         finally:
             root.destroy()
+
+
+class CliSmokeTest(unittest.TestCase):
+    """v2.03.0 P0：把三条只读 CLI 的"能跑通 + 有该有的字段"钉住。
+
+    刻意**不比对具体数值**：`--selftest` 含当前时间点，`--list`/`--diag`
+    含本机显示器与路径。逐字基线跨机器必挂，维护成本高于收益；
+    这里只保证"重构后命令还能跑、输出结构没塌"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.py = sys.executable
+        cls.script = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "monitor_brightness.py")
+
+    def _run(self, *args):
+        import subprocess
+        return subprocess.run([self.py, self.script, *args],
+                              capture_output=True, text=True, timeout=60,
+                              encoding="utf-8", errors="replace")
+
+    def test_selftest_runs(self):
+        r = self._run("--selftest")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("配置：", r.stdout)
+        self.assertIn("当前档：", r.stdout)
+        # 判定表至少有时刻行
+        self.assertRegex(r.stdout, r"\d{2}:\d{2} -> \d+%")
+
+    def test_list_runs(self):
+        r = self._run("--list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # 无显示器的机器允许输出为空，但不能崩
+        if r.stdout.strip():
+            self.assertRegex(r.stdout, r"^\d+: \d+×\d+")
+
+    def test_diag_runs(self):
+        r = self._run("--diag")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("诊断报告", r.stdout)
+        self.assertIn("Python " + ".".join(str(v) for v in sys.version_info[:3])[:4],
+                      r.stdout)
 
 
 if __name__ == "__main__":
