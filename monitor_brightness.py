@@ -1472,6 +1472,112 @@ _CCD_EDID_IDS_VALID = 0x4          # DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.edid
 _CCD_TARGET_IN_USE = 0x1          # DISPLAYCONFIG_TARGET_IN_USE
 
 
+def _ccd_setup_probe_api(u32):
+    """声明只读探测用到的三个 API 签名（不调用）。"""
+    u32.GetDisplayConfigBufferSizes.argtypes = [wintypes.UINT,
+                                                ctypes.POINTER(wintypes.UINT),
+                                                ctypes.POINTER(wintypes.UINT)]
+    u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
+    u32.QueryDisplayConfig.argtypes = [wintypes.UINT, ctypes.POINTER(wintypes.UINT),
+                                       ctypes.c_void_p, ctypes.POINTER(wintypes.UINT),
+                                       ctypes.c_void_p, ctypes.c_void_p]
+    u32.QueryDisplayConfig.restype = wintypes.LONG
+    u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
+    u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
+
+
+def _ccd_query_all_paths(u32, flags):
+    """QDC_ALL_PATHS 查询，缓冲区不足（122）时最多重试 4 次。
+
+    返回 (paths, modes, mc) 或 None。只读，失败一律 None。
+    """
+    paths = modes = None
+    for _ in range(4):
+        pc, mc = wintypes.UINT(), wintypes.UINT()
+        if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
+                                           ctypes.byref(mc)) != 0:
+            return None
+        paths = (_CcdPathInfo * pc.value)()
+        modes = (_CcdModeInfo * mc.value)()
+        rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
+                                    ctypes.byref(mc), ctypes.byref(modes), None)
+        if rc == 0:
+            return paths, modes, mc.value
+        if rc != 122:                 # ERROR_INSUFFICIENT_BUFFER 才重试
+            return None
+    return None
+
+
+def _ccd_rows_from_paths(u32, paths, modes, mc):
+    """把每条 path 翻成一行（同一块屏可能有多条 path，由折叠步骤处理）。"""
+    rows = []
+    for p in list(paths):
+        tgt = p.targetInfo
+        if not tgt.targetAvailable:   # 线不在 / 设备不存在：不参与状态判定
+            continue
+        tname = _CcdTargetName()
+        tname.header.type = _CCD_GET_TARGET_NAME
+        tname.header.size = ctypes.sizeof(tname)
+        tname.header.adapterId = tgt.adapterId
+        tname.header.id = tgt.id
+        if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
+            continue
+        sname = _CcdSourceName()
+        sname.header.type = _CCD_GET_SOURCE_NAME
+        sname.header.size = ctypes.sizeof(sname)
+        sname.header.adapterId = p.sourceInfo.adapterId
+        sname.header.id = p.sourceInfo.id
+        u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header))
+
+        luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
+                              p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
+        if tname.flags & _CCD_EDID_IDS_VALID:
+            anchor = "%s/%04X/%04X/%d" % (luid, tname.edidManufactureId,
+                                          tname.edidProductCodeId,
+                                          tname.connectorInstance)
+        else:
+            anchor = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
+        pos = size = ""
+        smi = p.sourceInfo.modeInfoIdx >> 16
+        if smi != 0xFFFF and smi < len(modes):
+            sm = modes[smi].sourceMode
+            pos = "(%d,%d)" % (sm.position.x, sm.position.y)
+            size = "%dx%d" % (sm.width, sm.height)
+        rows.append({
+            "anchor": anchor,
+            "active": bool(p.flags & _CCD_PATH_ACTIVE),
+            "connected": True,
+            "inUse": bool(tgt.statusFlags & _CCD_TARGET_IN_USE),
+            "friendly": tname.monitorFriendlyDeviceName,
+            "gdi": sname.viewGdiDeviceName,
+            "vdd": any(k in (tname.monitorFriendlyDeviceName or "").lower()
+                       for k in ("vdd", "virtual", "iddcx")),
+            "pos": pos, "size": size,
+        })
+    return rows
+
+
+def _ccd_merge_rows_by_anchor(rows):
+    """按锚点折叠：active 的那条胜出，其余 gdi 存进 aliases。
+
+    QDC_ALL_PATHS 会为同一块屏返回多个 source（实测 233 条 path 只有 3 块屏）。
+    """
+    merged = []
+    for r in rows:
+        hit = next((x for x in merged if x["anchor"] == r["anchor"]), None)
+        if hit is None:
+            r["aliases"] = [r["gdi"]] if r["gdi"] else []
+            merged.append(r)
+            continue
+        if r["gdi"] and r["gdi"] not in hit["aliases"]:
+            hit["aliases"].append(r["gdi"])
+        if r["active"] and not hit["active"]:
+            old_aliases = hit["aliases"]
+            hit.update(r)
+            hit["aliases"] = old_aliases
+    return merged
+
+
 def ccd_probe_topology():
     """只读返回当前桌面拓扑（含 inactive 但 targetAvailable=1 的屏）。
 
@@ -1479,100 +1585,18 @@ def ccd_probe_topology():
     失败一律返回 []（只读探测不能拖垮 CLI 或 GUI）。
     实测开销：QDC_ALL_PATHS 约 0.1ms（233 条 path）。
     """
+
     if os.name != "nt":
         return []
     try:
         u32 = ctypes.windll.user32
-        u32.GetDisplayConfigBufferSizes.argtypes = [wintypes.UINT,
-                                                    ctypes.POINTER(wintypes.UINT),
-                                                    ctypes.POINTER(wintypes.UINT)]
-        u32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
-        u32.QueryDisplayConfig.argtypes = [wintypes.UINT, ctypes.POINTER(wintypes.UINT),
-                                           ctypes.c_void_p, ctypes.POINTER(wintypes.UINT),
-                                           ctypes.c_void_p, ctypes.c_void_p]
-        u32.QueryDisplayConfig.restype = wintypes.LONG
-        u32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
-        u32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
-
-        flags = _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE
-        paths = modes = None
-        for _ in range(4):
-            pc, mc = wintypes.UINT(), wintypes.UINT()
-            if u32.GetDisplayConfigBufferSizes(flags, ctypes.byref(pc),
-                                               ctypes.byref(mc)) != 0:
-                return []
-            paths = (_CcdPathInfo * pc.value)()
-            modes = (_CcdModeInfo * mc.value)()
-            rc = u32.QueryDisplayConfig(flags, ctypes.byref(pc), ctypes.byref(paths),
-                                        ctypes.byref(mc), ctypes.byref(modes), None)
-            if rc == 0:
-                break
-            if rc != 122:                 # ERROR_INSUFFICIENT_BUFFER 才重试
-                return []
-        else:
+        _ccd_setup_probe_api(u32)
+        got = _ccd_query_all_paths(u32, _QDC_ALL_PATHS | _QDC_VIRTUAL_MODE_AWARE)
+        if not got:
             return []
-
-        rows = []
-        for p in list(paths):
-            tgt = p.targetInfo
-            if not tgt.targetAvailable:   # 线不在 / 设备不存在：不参与状态判定
-                continue
-            tname = _CcdTargetName()
-            tname.header.type = _CCD_GET_TARGET_NAME
-            tname.header.size = ctypes.sizeof(tname)
-            tname.header.adapterId = tgt.adapterId
-            tname.header.id = tgt.id
-            if u32.DisplayConfigGetDeviceInfo(ctypes.byref(tname.header)) != 0:
-                continue
-            sname = _CcdSourceName()
-            sname.header.type = _CCD_GET_SOURCE_NAME
-            sname.header.size = ctypes.sizeof(sname)
-            sname.header.adapterId = p.sourceInfo.adapterId
-            sname.header.id = p.sourceInfo.id
-            u32.DisplayConfigGetDeviceInfo(ctypes.byref(sname.header))
-
-            luid = "%08X:%08X" % (p.sourceInfo.adapterId.LowPart & 0xFFFFFFFF,
-                                  p.sourceInfo.adapterId.HighPart & 0xFFFFFFFF)
-            if tname.flags & _CCD_EDID_IDS_VALID:
-                anchor = "%s/%04X/%04X/%d" % (luid, tname.edidManufactureId,
-                                              tname.edidProductCodeId,
-                                              tname.connectorInstance)
-            else:
-                anchor = "%s/name=%s" % (luid, tname.monitorFriendlyDeviceName)
-            pos = size = ""
-            smi = p.sourceInfo.modeInfoIdx >> 16
-            if smi != 0xFFFF and smi < len(modes):
-                sm = modes[smi].sourceMode
-                pos = "(%d,%d)" % (sm.position.x, sm.position.y)
-                size = "%dx%d" % (sm.width, sm.height)
-            rows.append({
-                "anchor": anchor,
-                "active": bool(p.flags & _CCD_PATH_ACTIVE),
-                "connected": True,
-                "inUse": bool(tgt.statusFlags & _CCD_TARGET_IN_USE),
-                "friendly": tname.monitorFriendlyDeviceName,
-                "gdi": sname.viewGdiDeviceName,
-                "vdd": any(k in (tname.monitorFriendlyDeviceName or "").lower()
-                           for k in ("vdd", "virtual", "iddcx")),
-                "pos": pos, "size": size,
-            })
-
-        # QDC_ALL_PATHS 会为同一块屏返回多个 source（实测 233 条 path 只有 3 块屏）。
-        # 按锚点折叠，active 的那条胜出，其余 gdi 存进 aliases。
-        merged = []
-        for r in rows:
-            hit = next((x for x in merged if x["anchor"] == r["anchor"]), None)
-            if hit is None:
-                r["aliases"] = [r["gdi"]] if r["gdi"] else []
-                merged.append(r)
-                continue
-            if r["gdi"] and r["gdi"] not in hit["aliases"]:
-                hit["aliases"].append(r["gdi"])
-            if r["active"] and not hit["active"]:
-                old_aliases = hit["aliases"]
-                hit.update(r)
-                hit["aliases"] = old_aliases
-        return merged
+        paths, modes, mc = got
+        return _ccd_merge_rows_by_anchor(
+            _ccd_rows_from_paths(u32, paths, modes, mc))
     except Exception:
         return []
 
@@ -2423,6 +2447,162 @@ def _ccd_apply_plan_on(paths, plan):
     return done
 
 
+def _topo_off_handover_shift(paths, modes, mc, raw_rows, heir_anchor, heir_active):
+    """算「把接班屏挪到 (0,0)」需要的平移量；不需要交接时返回 (0,0)。
+
+    主屏就是 (0,0) 那块，所以平移接班屏到 (0,0) 就等于把主屏角色交给它；
+    其余屏跟着平移，相对布局完全不变（真机验证见 topology_plan_off 注释）。
+    """
+    shift = (0, 0)
+    if heir_anchor and heir_active:
+        row = next((r for r in raw_rows
+                    if r["anchor"] == heir_anchor and r.get("active")), None)
+        if row is not None:
+            idx = int(paths[row["pathIndex"]].sourceInfo.modeInfoIdx)
+            if idx != _CCD_MODE_IDX_INVALID:
+                s = (idx >> 16) & 0xFFFF
+                if s < mc:
+                    shift = (-int(modes[s].sourceMode.position.x),
+                             -int(modes[s].sourceMode.position.y))
+        dlog("topo.off.handover", heir=heir_anchor, heir_active=True, shift=list(shift))
+    return shift
+
+
+def _topo_off_capture_positions(cfg, shift, anchors, paths, modes, mc, raw_rows):
+    """断开前记下这些屏此刻的位置（平移后的坐标），已有记录不覆盖。
+
+    断开之后 Windows 会把这块屏的 mode 项摘掉，位置就再也读不到了，
+    所以必须趁现在记。记平移后的坐标，接回时正好落在新主屏旁边。
+    """
+    if cfg is None:
+        return
+    pos = _ccd_capture_positions(anchors, paths, modes, mc, raw_rows)
+    if not pos:
+        return
+    pos = {a: [v[0] + shift[0], v[1] + shift[1], v[2], v[3]]
+           for a, v in pos.items()}
+    merged = dict(cfg.get("monitor_positions") or {})
+    # **已有记录不覆盖**（v2.01.11）。交接主屏会把接班屏挪到桌面原点，
+    # 于是"断开那一刻的位置"已经不是用户摆的位置了；照它记下来，
+    # 下次接回就会把副屏丢到右边去（实测：两块屏的记录都被写成 (0,0)）。
+    # 用户真想更新布局，用设置里的「记住当前显示器布局」。
+    for a, v in pos.items():
+        merged.setdefault(a, v)
+    cfg["monitor_positions"] = _coerce_positions(merged)
+    save_config(cfg)
+    dlog("topo.off.positions", captured=pos,
+         kept=list(cfg["monitor_positions"]))
+
+
+def _topo_off_activate_heir(u32, heir_anchor, heir_active, raw_rows, paths,
+                            modes, mc):
+    """接班屏断着就先接回并放到 (0,0)。
+
+    返回 (cur_modes, cur_mc, heir_active, errs)：
+      - 不用交接 / 它其实已亮 → 原样返回；
+      - 接不回来 → errs 非空，调用方直接失败返回。
+    """
+    if not heir_anchor or heir_active:
+        return modes, mc, heir_active, []
+    p_on, e_on, n_on = topology_plan_on(
+        [heir_anchor], raw_rows, _ccd_mode_entries(modes, mc), allow_vdd=True)
+    if e_on:
+        dlog("topo.off.handover", heir=heir_anchor, errs=e_on)
+        return modes, mc, heir_active, [(-1, e) for e in e_on]
+    if n_on:                       # 它其实已经亮着，按"在拓扑里"处理
+        return modes, mc, True, []
+    cur_modes, cur_mc = _ccd_fill_missing_source_modes(
+        u32, paths, modes, mc, raw_rows, p_on, want={})
+    midx = p_on[0]["sourceModeIdx"]
+    cur_modes[midx].sourceMode.position.x = 0
+    cur_modes[midx].sourceMode.position.y = 0
+    _ccd_apply_plan_on(paths, p_on)
+    dlog("topo.off.handover", heir=heir_anchor, heir_active=False,
+         synthMode=midx, size=[int(cur_modes[midx].sourceMode.width),
+                               int(cur_modes[midx].sourceMode.height)])
+    return cur_modes, cur_mc, heir_active, []
+
+
+def _topo_off_shift_other_modes(cur_modes, cur_mc, raw_rows, paths, anchors, shift):
+    """交接主屏后，其余屏跟着平移（按 mode 下标去重，避免同一块屏被移两次）。"""
+    if shift == (0, 0):
+        return
+    moved = set()
+    for r in raw_rows:
+        if not (r.get("active") and r.get("connected")):
+            continue
+        if r["anchor"] in anchors:
+            continue
+        idx = int(paths[r["pathIndex"]].sourceInfo.modeInfoIdx)
+        if idx == _CCD_MODE_IDX_INVALID:
+            continue
+        s = (idx >> 16) & 0xFFFF
+        if s in moved or s >= cur_mc:
+            continue
+        moved.add(s)
+        cur_modes[s].sourceMode.position.x = \
+            int(cur_modes[s].sourceMode.position.x) + shift[0]
+        cur_modes[s].sourceMode.position.y = \
+            int(cur_modes[s].sourceMode.position.y) + shift[1]
+
+
+def _topo_off_detach(paths, raw_rows, anchors):
+    """把目标屏的 ACTIVE path 置为断开。
+
+    与 topology_switch.py 的 C2/C4 实测口径一致：只清 ACTIVE 的那条 path，
+    同一块屏的其它 source 原样保留，快照负责兜底恢复。
+    """
+    for i in range(len(paths)):
+        info = next((x for x in raw_rows if x["pathIndex"] == i), None)
+        if (not info or info["anchor"] not in anchors
+                or not info["connected"] or not info["active"]):
+            continue
+        p = paths[i]
+        p.flags &= ~_CCD_PATH_ACTIVE
+        p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
+        p.sourceInfo.statusFlags = 0
+        p.targetInfo.statusFlags = 0
+
+
+def _topo_off_apply_and_verify(u32, paths, cur_modes, pc, cur_mc, anchors,
+                               heir_anchor, snap):
+    """提交拓扑 → 回读验证；任一项不过就按快照回滚一次。返回 (成功?, errs)。"""
+    rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
+    if rc != 0:
+        dlog("topo.off.fail", stage="apply", rc=rc)
+        return False, [(-1, "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc)]
+    ok_off = _ccd_wait_state(anchors, False)
+    ok_heir = (not heir_anchor) or _ccd_wait_state([heir_anchor], True, allow_vdd=True)
+    if ok_off and ok_heir:
+        return True, []
+    back = _ccd_restore_from_bytes(u32, snap)
+    why = "回读未确认断开，已回滚"
+    if not ok_heir:
+        why = "主屏接班没生效，已回滚"
+    if back != 0:
+        why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
+    dlog("topo.off.fail", stage="verify", rollback=back,
+         ok_off=ok_off, ok_heir=ok_heir)
+    return False, [(-1, why)]
+
+
+def _topo_off_report_and_follow(raw_rows, anchors, dev_to_index, indices,
+                                heir_anchor, win_snap, shift):
+    """算出"真正被断开"的下标、记完成日志，并把窗口搬回跟着它的屏。"""
+    done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
+                 if r["anchor"] in anchors and r["connected"] and r["active"]}
+    done = sorted({i for name, i in dev_to_index.items()
+                   if _short_dev(name) in done_devs})
+    dlog("topo.off.done", anchors=anchors, indices=done, heir=heir_anchor)
+    # 拓扑已经稳定，再把窗口搬回"跟着它的屏"的位置
+    if win_snap:
+        moved = win_follow(win_snap, shift, set(anchors))
+        dlog("topo.off.windows", moved=moved, total=len(win_snap),
+             shift=list(shift), dropped=len(anchors))
+    return done or list(normalize_indices(indices))
+
+
 def topology_off(indices, cfg=None, heir=None):
     """拓扑断开：先快照，再提交，再回读；失败自动回滚一次（D2/D4/D6）。
 
@@ -2473,40 +2653,11 @@ def topology_off(indices, cfg=None, heir=None):
     snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
 
     # 接班屏已在拓扑里 → 算出"把它挪到 (0,0)"需要的平移量。
-    # 主屏就是 (0,0) 那块，所以平移接班屏到 (0,0) 就等于把主屏角色交给它；
-    # 其余屏跟着平移，相对布局完全不变（真机验证见 topology_plan_off 注释）。
-    shift = (0, 0)
-    if heir_anchor and heir_active:
-        row = next((r for r in raw_rows
-                    if r["anchor"] == heir_anchor and r.get("active")), None)
-        if row is not None:
-            idx = int(paths[row["pathIndex"]].sourceInfo.modeInfoIdx)
-            if idx != _CCD_MODE_IDX_INVALID:
-                s = (idx >> 16) & 0xFFFF
-                if s < mc:
-                    shift = (-int(modes[s].sourceMode.position.x),
-                             -int(modes[s].sourceMode.position.y))
-        dlog("topo.off.handover", heir=heir_anchor, heir_active=True, shift=list(shift))
+    shift = _topo_off_handover_shift(paths, modes, mc, raw_rows,
+                                     heir_anchor, heir_active)
 
-    # 断开之后 Windows 会把这块屏的 mode 项摘掉，位置就再也读不到了，
-    # 所以趁现在把"它此刻摆在哪"记下来，接回时才能摆回原位。
-    # 记的是**平移后**的坐标：接回时正好落在新主屏旁边，而不是跑到旧原点去。
-    if cfg is not None:
-        pos = _ccd_capture_positions(anchors, paths, modes, mc, raw_rows)
-        if pos:
-            pos = {a: [v[0] + shift[0], v[1] + shift[1], v[2], v[3]]
-                   for a, v in pos.items()}
-            merged = dict(cfg.get("monitor_positions") or {})
-            # **已有记录不覆盖**（v2.01.11）。交接主屏会把接班屏挪到桌面原点，
-            # 于是"断开那一刻的位置"已经不是用户摆的位置了；照它记下来，
-            # 下次接回就会把副屏丢到右边去（实测：两块屏的记录都被写成 (0,0)）。
-            # 用户真想更新布局，用设置里的「记住当前显示器布局」。
-            for a, v in pos.items():
-                merged.setdefault(a, v)
-            cfg["monitor_positions"] = _coerce_positions(merged)
-            save_config(cfg)
-            dlog("topo.off.positions", captured=pos,
-                 kept=list(cfg["monitor_positions"]))
+    # 趁断开前把位置记下来（上面已说明为什么必须现在记）
+    _topo_off_capture_positions(cfg, shift, anchors, paths, modes, mc, raw_rows)
 
     cur_modes, cur_mc = modes, mc
 
@@ -2518,87 +2669,22 @@ def topology_off(indices, cfg=None, heir=None):
         dlog("topo.off.windows.snap", count=len(win_snap))
 
     # 接班屏当前是断着的（虚拟显示器）→ 先把它接回，并直接放到 (0,0)
-    if heir_anchor and not heir_active:
-        p_on, e_on, n_on = topology_plan_on(
-            [heir_anchor], raw_rows, _ccd_mode_entries(modes, mc), allow_vdd=True)
-        if e_on:
-            dlog("topo.off.handover", heir=heir_anchor, errs=e_on)
-            return [], [(-1, e) for e in e_on]
-        if n_on:                       # 它其实已经亮着，按"在拓扑里"处理
-            heir_active = True
-        else:
-            cur_modes, cur_mc = _ccd_fill_missing_source_modes(
-                u32, paths, cur_modes, cur_mc, raw_rows, p_on, want={})
-            midx = p_on[0]["sourceModeIdx"]
-            cur_modes[midx].sourceMode.position.x = 0
-            cur_modes[midx].sourceMode.position.y = 0
-            _ccd_apply_plan_on(paths, p_on)
-            dlog("topo.off.handover", heir=heir_anchor, heir_active=False,
-                 synthMode=midx, size=[int(cur_modes[midx].sourceMode.width),
-                                       int(cur_modes[midx].sourceMode.height)])
+    cur_modes, cur_mc, heir_active, h_errs = _topo_off_activate_heir(
+        u32, heir_anchor, heir_active, raw_rows, paths, cur_modes, cur_mc)
+    if h_errs:
+        return [], h_errs
 
     # 其余屏跟着平移（按 mode 下标去重：同一块屏的多条 path 共用一条 mode 项）
-    if shift != (0, 0):
-        moved = set()
-        for r in raw_rows:
-            if not (r.get("active") and r.get("connected")):
-                continue
-            if r["anchor"] in anchors:
-                continue
-            idx = int(paths[r["pathIndex"]].sourceInfo.modeInfoIdx)
-            if idx == _CCD_MODE_IDX_INVALID:
-                continue
-            s = (idx >> 16) & 0xFFFF
-            if s in moved or s >= cur_mc:
-                continue
-            moved.add(s)
-            cur_modes[s].sourceMode.position.x = \
-                int(cur_modes[s].sourceMode.position.x) + shift[0]
-            cur_modes[s].sourceMode.position.y = \
-                int(cur_modes[s].sourceMode.position.y) + shift[1]
+    _topo_off_shift_other_modes(cur_modes, cur_mc, raw_rows, paths, anchors, shift)
 
-    for i in range(len(paths)):
-        info = next((x for x in raw_rows if x["pathIndex"] == i), None)
-        # 与 topology_switch.py 的 C2/C4 实测口径一致：只清 ACTIVE 的那条 path，
-        # 同一块屏的其它 source 原样保留，快照负责兜底恢复。
-        if (not info or info["anchor"] not in anchors
-                or not info["connected"] or not info["active"]):
-            continue
-        p = paths[i]
-        p.flags &= ~_CCD_PATH_ACTIVE
-        p.sourceInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
-        p.targetInfo.modeInfoIdx = _CCD_MODE_IDX_INVALID
-        p.sourceInfo.statusFlags = 0
-        p.targetInfo.statusFlags = 0
+    _topo_off_detach(paths, raw_rows, anchors)
 
-    rc = _ccd_apply(u32, paths, cur_modes, pc, cur_mc)
-    if rc != 0:
-        dlog("topo.off.fail", stage="apply", rc=rc)
-        return [], [(-1, "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc)]
-    ok_off = _ccd_wait_state(anchors, False)
-    ok_heir = (not heir_anchor) or _ccd_wait_state([heir_anchor], True, allow_vdd=True)
-    if not (ok_off and ok_heir):
-        back = _ccd_restore_from_bytes(u32, snap)
-        why = "回读未确认断开，已回滚"
-        if not ok_heir:
-            why = "主屏接班没生效，已回滚"
-        if back != 0:
-            why += "；回滚失败 rc=%d（请用 --screen on 重试）" % back
-        dlog("topo.off.fail", stage="verify", rollback=back,
-             ok_off=ok_off, ok_heir=ok_heir)
-        return [], [(-1, why)]
-    # 只报"真正被断开"的下标
-    done_devs = {_short_dev(r.get("gdi")) for r in raw_rows
-                 if r["anchor"] in anchors and r["connected"] and r["active"]}
-    done = sorted({i for name, i in dev_to_index.items()
-                   if _short_dev(name) in done_devs})
-    dlog("topo.off.done", anchors=anchors, indices=done, heir=heir_anchor)
-    # 拓扑已经稳定，再把窗口搬回"跟着它的屏"的位置
-    if win_snap:
-        moved = win_follow(win_snap, shift, set(anchors))
-        dlog("topo.off.windows", moved=moved, total=len(win_snap),
-             shift=list(shift), dropped=len(anchors))
-    return done or list(normalize_indices(indices)), []
+    ok, v_errs = _topo_off_apply_and_verify(
+        u32, paths, cur_modes, pc, cur_mc, anchors, heir_anchor, snap)
+    if not ok:
+        return [], v_errs
+    return _topo_off_report_and_follow(raw_rows, anchors, dev_to_index, indices,
+                                       heir_anchor, win_snap, shift), []
 
 
 def topology_inactive_rows(rows=None):
