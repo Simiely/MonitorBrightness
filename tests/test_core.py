@@ -2618,5 +2618,117 @@ class TopologyPlanOnTest(unittest.TestCase):
         self.assertEqual(got, ["A2"])        # 只取 disconnected 的非 VDD 物理屏
 
 
+class VddNameTest(unittest.TestCase):
+    """v2.01.12：VDD 当主屏时是 index 0，不能套用物理屏的型号名。
+
+    日志实证：18:38:43 `topo.off.handover heir=1589A778.../VDD`，之后 VDD
+    成为主屏（index 0），而 mon_models["0"]="Legion R27qe Gen2"（物理屏型号）
+    —— 界面就把虚拟显示器显示成物理显示器名，这就是用户报的"名称会错误"。
+    """
+
+    def test_vdd_uses_friendly_not_model(self):
+        name, is_vdd = mb.display_name_for_row(
+            0, {"vdd": True, "friendly": "VDD by MTT"},
+            {0: "Legion R27qe Gen2"})
+        self.assertEqual(name, "VDD by MTT")
+        self.assertTrue(is_vdd)
+
+    def test_vdd_without_friendly_has_own_label(self):
+        name, is_vdd = mb.display_name_for_row(
+            0, {"vdd": True, "friendly": ""}, {0: "Legion R27qe Gen2"})
+        self.assertEqual(name, "虚拟显示器")
+        self.assertTrue(is_vdd)
+
+    def test_physical_still_uses_model(self):
+        name, is_vdd = mb.display_name_for_row(
+            0, {"vdd": False, "friendly": "P1"}, {0: "Legion R27qe Gen2"})
+        self.assertEqual(name, "Legion R27qe Gen2")
+        self.assertFalse(is_vdd)
+
+    def test_physical_without_model_falls_back(self):
+        name, is_vdd = mb.display_name_for_row(2, {"vdd": False}, {})
+        self.assertEqual(name, "显示器 2")
+        self.assertFalse(is_vdd)
+
+
+class DefaultLayoutTest(TempConfigCase):
+    """「恢复双屏」的默认布局快照：落盘、读回、校验后才写回。"""
+
+    def setUp(self):
+        super().setUp()
+        self.layout_file = os.path.join(self.tmp, "default_layout.json")
+        self._old_file = mb.DEFAULT_LAYOUT_FILE
+        mb.DEFAULT_LAYOUT_FILE = self.layout_file
+
+    def tearDown(self):
+        mb.DEFAULT_LAYOUT_FILE = self._old_file
+        super().tearDown()
+
+    def _snap(self):
+        paths = (mb._CcdPathInfo * 1)()
+        modes = (mb._CcdModeInfo * 1)()
+        return mb._ccd_make_snapshot(paths, modes, 1, 1, ["A1", "A2"])
+
+    def test_missing_layout_reports_clear_error(self):
+        snap, err = mb.load_default_layout()
+        self.assertIsNone(snap)
+        self.assertIn("还没记住", err)
+
+    def test_save_then_load_roundtrip(self):
+        snap = self._snap()
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(
+                    mb, "_ccd_query_raw",
+                    return_value=tuple(self._topo_raw())):
+            desc, err = mb.save_default_layout()
+        self.assertIsNone(err)
+        self.assertIn("1 块屏", desc)
+        got, err = mb.load_default_layout()
+        self.assertIsNone(err)
+        self.assertEqual(got["pathsHex"], snap["pathsHex"])
+        self.assertEqual(got["targetAnchors"], ["A1"])
+
+    def _topo_raw(self):
+        paths = (mb._CcdPathInfo * 1)()
+        modes = (mb._CcdModeInfo * 1)()
+        rows = [{"anchor": "A1", "active": True, "connected": True,
+                 "friendly": "P1", "vdd": False, "pathIndex": 0}]
+        return paths, modes, 1, 1, rows
+
+    def test_bad_shape_is_rejected_before_apply(self):
+        """快照长度对不上时，一个 SetDisplayConfig 都不该发。"""
+        bad = {"pathCount": 99, "modeCount": 1,
+               "pathsHex": "00", "modesHex": "00", "targetAnchors": []}
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "dlog"), \
+                unittest.mock.patch.object(
+                    mb, "_ccd_apply", side_effect=AssertionError("不该 apply")):
+            err = mb.restore_default_layout(snap=bad)
+        self.assertIn("结构不符", err)
+
+    def test_validate_failure_does_not_apply(self):
+        """SDC_VALIDATE 被拒时只报告，不走正式 APPLY。"""
+        class FakeU32:
+            def __init__(self):
+                self.calls = []
+
+            def SetDisplayConfig(self, pc, paths, mc, modes, flags):
+                self.calls.append(flags)
+                return 87 if flags & mb._SDC_VALIDATE else 0
+
+        fake = FakeU32()
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=fake), \
+                unittest.mock.patch.object(mb, "dlog"):
+            err = mb.restore_default_layout(snap=self._snap())
+        self.assertIn("校验", err)
+        self.assertEqual(len(fake.calls), 1)      # 只有 VALIDATE，没有 APPLY
+
+    def test_restore_delay_config_clamped(self):
+        self.assertEqual(mb.coerce_setting("restore_delay", 10), 10)
+        self.assertEqual(mb.coerce_setting("restore_delay", 999), 120)
+        self.assertEqual(mb.coerce_setting("restore_delay", -5), 0)
+        self.assertEqual(mb.coerce_setting("restore_delay", "abc"), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

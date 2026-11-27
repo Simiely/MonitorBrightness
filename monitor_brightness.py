@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.11"    # 位置记录不再被交接污染；加「记住布局」；虚拟屏不给按钮
+APP_VERSION = "2.01.12"    # 恢复双屏按钮（倒计时可配）；修 VDD 当主屏时名称错位
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -262,6 +262,9 @@ SETTINGS = (
     # 断开之后这个信息就再也读不到了（Windows 会把该屏的 mode 项摘掉），
     # 所以只能在断开前抓一次。
     {"key": "monitor_positions", "kind": "positions", "default": {}},
+    # 「恢复双屏」按钮的倒计时秒数（v2.01.12）：点按钮后等这么多秒再把默认
+    # 双屏布局写回，给用户一个反悔（取消）的窗口。0 = 立即恢复。
+    {"key": "restore_delay", "kind": "int", "default": 10, "min": 0, "max": 120},
     # 诊断日志开关（临时项，v2.01.4 引入；问题收敛后连同 dlog 一起删掉）。
     {"key": "diag_log", "kind": "flag", "default": True},
     # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来。
@@ -296,7 +299,10 @@ def coerce_setting(key, value):
         return value if value in spec.get("values", ()) else spec["default"]
     if kind == "int":
         try:
-            return max(0, int(value))
+            n = int(value)
+            lo = int(spec.get("min", 0))
+            hi = int(spec.get("max", 120))
+            return max(lo, min(hi, n))
         except Exception:
             return spec["default"]
     if kind == "anchors":
@@ -3337,6 +3343,144 @@ def remember_layout_snapshot(cfg):
     return cfg["monitor_positions"], None
 
 
+# ---- 默认双屏布局快照（v2.01.12） ----------------------------------------
+# 「恢复双屏」按钮要回到的是"用户记住的那一版默认布局"。整份 CCD 字节写回
+# 是唯一同时做到「接回物理屏 + 让 VDD 退场 + 摆回原位」的办法（普通 topology_on
+# 在 VDD 占着 (0,0) 时会把物理屏挤到桌面最右，参见 17:40 的 diag.log）。
+# 快照跟 monitor_positions 一起记：**只在用户主动点「记住布局」时写**，
+# 不自动覆盖（交接主屏那一刻的布局不是用户摆的，见 v2.01.11）。
+DEFAULT_LAYOUT_FILE = os.path.join(CONFIG_DIR, "default_layout.json")
+_SDC_VALIDATE = 0x00000040
+# 必须与 _CCD_APPLY_FLAGS 完全同一套旗标，只把 APPLY 换成 VALIDATE，
+# 否则会 rc=87 假失败（真机 18:5x 实测：漏掉 SAVE_TO_DATABASE 就拒）。
+# 口径与 scripts/topology_handover_probe.py / topology_repro87.py 一致。
+_VALIDATE_FLAGS = ((_CCD_APPLY_FLAGS | _SDC_VALIDATE)
+                   & ~(_SDC_APPLY | _SDC_SAVE_TO_DATABASE))
+
+
+def save_default_layout():
+    """把当前完整 CCD 布局存成"默认双屏"快照。
+
+    返回 (简述, 错误文案)。简述里带屏数与友好名，给状态卡显示。
+    快照里的 bytes 已按 count 截断（_ccd_slice_bytes），不会越界。
+    """
+    u32 = _ccd_api()
+    raw = _ccd_query_raw(u32) if u32 is not None else None
+    if raw is None:
+        return None, "读不到当前显示器拓扑"
+    paths, modes, pc, mc, rows = raw
+    visible = [r for r in rows
+               if r.get("active") and r.get("connected") and r.get("anchor")]
+    # 同一块屏在 QDC_ALL_PATHS 下有多条 path，按锚点去重
+    anchors = list(dict.fromkeys(r["anchor"] for r in visible))
+    if not anchors:
+        return None, "当前没有活动的显示器"
+    snap = _ccd_make_snapshot(paths, modes, pc, mc, anchors)
+    snap["note"] = "用户记住的默认双屏布局；「恢复双屏」按这份整份写回"
+    try:
+        _atomic_write_text(DEFAULT_LAYOUT_FILE,
+                           json.dumps(snap, ensure_ascii=False, indent=2))
+    except Exception as e:
+        return None, str(e)
+    dlog("app.save_default_layout", anchors=anchors, pc=pc, mc=mc)
+    return "%d 块屏（%s）" % (len(anchors), ", ".join(
+        r["friendly"] or "显示器" for r in
+        {a: next(x for x in visible if x["anchor"] == a) for a in anchors}.values())), None
+
+
+def load_default_layout():
+    """读回默认布局快照；文件不存在/坏掉返回 (None, 原因)。"""
+    try:
+        with open(DEFAULT_LAYOUT_FILE, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        if not all(k in snap for k in ("pathCount", "modeCount",
+                                       "pathsHex", "modesHex")):
+            return None, "默认布局快照格式不对"
+        return snap, None
+    except FileNotFoundError:
+        return None, "还没记住默认布局"
+    except Exception as e:
+        return None, "读默认布局失败：%s" % e
+
+
+def restore_default_layout(validate_only=False, snap=None):
+    """把默认双屏布局整份写回。
+
+    先 SDC_VALIDATE 校验提交形态（只读、不碰桌面），rc=0 才真正 APPLY。
+    长度对不上/校验失败一律不写。返回 (错误文案 或 None)。
+
+    `validate_only=True` 只做校验，给按钮预检用；`snap` 可注入，便于单测。
+    """
+    if snap is None:
+        snap, err = load_default_layout()
+        if err:
+            return err
+    u32 = _ccd_api()
+    if u32 is None:
+        return "恢复双屏仅支持 Windows"
+    try:
+        u32.SetDisplayConfig.argtypes = [
+            wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+        u32.SetDisplayConfig.restype = wintypes.LONG
+    except (AttributeError, TypeError):
+        pass                      # 测试假对象没有 ctypes 的 argtypes
+
+    def build():
+        paths = (_CcdPathInfo * int(snap["pathCount"]))()
+        modes = (_CcdModeInfo * int(snap["modeCount"]))()
+        pb = bytes.fromhex(snap["pathsHex"])
+        mb_ = bytes.fromhex(snap["modesHex"])
+        if len(pb) != ctypes.sizeof(paths) or len(mb_) != ctypes.sizeof(modes):
+            return None, None, None, "快照与当前显示器结构不符，拒绝写回"
+        if len(pb):
+            ctypes.memmove(ctypes.byref(paths), pb, len(pb))
+        if len(mb_):
+            ctypes.memmove(ctypes.byref(modes), mb_, len(mb_))
+        return paths, modes, (snap["pathCount"], snap["modeCount"]), None
+
+    paths, modes, counts, err = build()
+    if err:
+        dlog("app.restore_default.fail", stage="shape", err=err)
+        return err
+    pc, mc = counts
+    rc = u32.SetDisplayConfig(pc, ctypes.byref(paths), mc, ctypes.byref(modes),
+                              _VALIDATE_FLAGS)
+    dlog("app.restore_default.validate", pc=pc, mc=mc,
+         flags="0x%08X" % _VALIDATE_FLAGS, rc=rc)
+    if rc != 0:
+        return "默认布局已和当前硬件不匹配（校验 rc=%d），请重新「记住布局」" % rc
+    if validate_only:
+        return None
+    # 校验通过 → 用带 SAVE_TO_DATABASE 的正式 flags 提交
+    rc = _ccd_apply(u32, paths, modes, pc, mc)
+    if rc != 0:
+        dlog("app.restore_default.fail", stage="apply", rc=rc)
+        return "恢复失败：SetDisplayConfig rc=%d（拓扑未改动）" % rc
+    anchors = list(snap.get("targetAnchors") or [])
+    ok = _ccd_wait_state(anchors, True, allow_vdd=False) if anchors else True
+    dlog("app.restore_default.done", anchors=anchors, verified=ok)
+    return None if ok else "布局已写回，但 2 秒内没读到确认，请「检测」看结果"
+
+
+def is_vdd_row(row):
+    """这一行是不是虚拟显示器 —— 名称显示与逐台按钮都按它判定。
+
+    单独抽成纯函数是为了单测：VDD 当主屏时它是 index 0，绝不能套用
+    mon_models[0] 那块物理屏的型号名（v2.01.12 修）。
+    """
+    return bool(row and row.get("vdd"))
+
+
+def display_name_for_row(index, row, mon_models):
+    """界面行的显示名：VDD 用 friendly，其余才用按 index 缓存的型号名。"""
+    if is_vdd_row(row):
+        return (row.get("friendly") or "虚拟显示器"), True
+    model = mon_models.get(index)
+    if model:
+        return model, False
+    return "显示器 %d" % index, False
+
+
 def resolve_monitors(cfg):
     """把"用户选过的显示器"解析成**当前**的下标列表。
 
@@ -5091,12 +5235,44 @@ class StatusCard(Card):
                                 width=56, height=34, pad_bg=UI["card"])
         self.probe_btn.pack(side="left", padx=(8, 0))
 
+        # 恢复双屏（v2.01.12）：单独一行，不改上面三个按钮的宽度比例。
+        # 倒计时期间按钮变「恢复中 Ns」，右侧出现「取消」；两者都只在这行里。
+        self.restore_row = tk.Frame(self.inner, bg=UI["card"])
+        self.restore_row.pack(fill="x", pady=(8, 0))
+        self.restore_btn = Button(self.restore_row, "恢复双屏",
+                                  app.ask_restore_default, kind="ghost",
+                                  width=76, height=26, pad_bg=UI["card"], font_size=8)
+        self.restore_btn.pack(side="left")
+        self.restore_cancel = Button(self.restore_row, "取消",
+                                     app.cancel_restore_default, kind="link",
+                                     width=36, height=26, pad_bg=UI["card"], font_size=8)
+        self.cancel_lbl_slot = tk.Frame(self.restore_row, bg=UI["card"])
+        self.cancel_lbl_slot.pack(side="left", padx=(8, 0))
+        Label(self.restore_row, "点后倒计时，到时恢复记住的双屏布局",
+              size=8, color=UI["text3"], bg=UI["card"]).pack(side="left", padx=(8, 0))
+        # 「取消」默认藏起来，倒计时开始才 pack 进槽位
+        self.restore_cancel.pack(in_=self.cancel_lbl_slot, side="left")
+        self.restore_cancel.pack_forget()
+
         # 临时反馈（flash）与常驻提示（hint_default）共用提示行：
         # 操作结果闪 3 秒后回到常驻内容，底部状态栏因此不再需要。
         self._hint_default = ""
         self._flash_until = 0.0
         self._flash_after = None
         self._unknown = False
+
+    def set_restore_countdown(self, left):
+        """恢复双屏倒计时 UI：left=None 复位；否则显示剩余秒并亮出「取消」。"""
+        if left is None:
+            self.restore_btn.set_text("恢复双屏")
+            self.restore_btn.set_enabled(True)
+            self.restore_cancel.pack_forget()
+            self._cancel_lbl_pack = None
+            return
+        self.restore_btn.set_text("恢复中 %ds" % left)
+        self.restore_btn.set_enabled(False)
+        if not self.restore_cancel.winfo_ismapped():
+            self.restore_cancel.pack(in_=self.cancel_lbl_slot, side="left")
 
     def set_hint_default(self, text):
         """常驻提示：检测后写一次；有临时消息在展示时不打断。"""
@@ -5219,8 +5395,14 @@ class MonitorPanel:
                 txt.pack(side="left", fill="x", expand=True)
                 self.mon_text[i] = txt
                 info = self.app.mon_info[i] if i < len(self.app.mon_info) else None
-                model = self.app.mon_models.get(i)
-                Label(txt, model or ("显示器 %d" % i), size=9, bg=UI["card"]).pack(anchor="w")
+                # VDD 当主屏时它是 index 0，绝不能套用 mon_models[0] 那块物理屏
+                # 的型号名（v2.01.12 修，日志 18:38:43 heir=VDD 实证）
+                mon = self.app.monitors[i] if i < len(self.app.monitors) else {}
+                row = {"vdd": bool(getattr(self.app, "is_vdd", lambda _i: False)(i)),
+                       "friendly": (mon.get("desc") or (info[0] if info else "")),
+                       "index": i}
+                name, _is_vdd = display_name_for_row(i, row, self.app.mon_models)
+                Label(txt, name, size=9, bg=UI["card"]).pack(anchor="w")
                 sub = ""
                 if info:
                     sub = "%d × %d · %s · %s" % (
@@ -5838,6 +6020,21 @@ class SettingsSheet(Sheet):
                      p, "记住", app.remember_layout, kind="link",
                      height=22, font_size=8).pack())
 
+        def _restore_delay(p):
+            spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
+            spin.set(cfg.get("restore_delay", 10))
+            spin.pack()
+
+            def cb(_e=None):
+                app.apply_setting("restore_delay", _safe_int(spin.get(), 10))
+            spin.bind("<<Increment>>", cb)
+            spin.bind("<<Decrement>>", cb)
+            spin.bind("<FocusOut>", cb)
+
+        self.row(off, "恢复双屏倒计时",
+                 "点「恢复双屏」后等几秒再执行；0 = 立即恢复",
+                 builder=_restore_delay)
+
         pre = self.section("亮度预设")
         pbg = pre.cget("bg")
         prow = tk.Frame(pre, bg=pbg)
@@ -5966,6 +6163,8 @@ class App:
         self._fit_pending = False
         self._fitted_h = -1
         self._schedule_reg_timer = None
+        self._restore_after = None       # 恢复双屏倒计时 timer 句柄（可取消）
+        self._restore_deadline = 0.0
         self._auto_checked = False
 
         self.scroll = ScrollArea(root, UI["bg"], on_fit=self._fit_window)
@@ -6069,7 +6268,62 @@ class App:
             self.msg.showerror("记住布局失败", err)
             return
         dlog("app.action", what="remember_layout", count=len(layout))
-        self.status_var.set("已记住 %d 块屏的位置" % len(layout))
+        # v2.01.12：位置与完整 CCD 快照一起记，供「恢复双屏」整份写回
+        desc, snap_err = save_default_layout()
+        if snap_err:
+            self.status_var.set("位置已记住，但默认布局快照没存上：%s" % snap_err)
+            return
+        self.status_var.set("已记住 %d 块屏的位置和布局（%s）" % (len(layout), desc))
+
+    # ---- 恢复双屏（倒计时） ------------------------------------------------
+    def ask_restore_default(self):
+        """点「恢复双屏」：先校验默认布局还在且与硬件匹配，再启动倒计时。"""
+        if getattr(self, "_restore_after", None) is not None:
+            return
+        err = restore_default_layout(validate_only=True)
+        if err:
+            dlog("app.action", what="restore_default", stage="precheck", err=err)
+            self.status_var.set(err)
+            self.msg.showwarning("恢复双屏不可用", err)
+            return
+        secs = max(0, min(120, int(self.cfg.get("restore_delay", 10))))
+        dlog("app.action", what="restore_default", stage="countdown", seconds=secs)
+        self._restore_deadline = time.monotonic() + secs
+        self._tick_restore()
+
+    def _tick_restore(self):
+        """每秒刷一次剩余秒数；到点执行恢复。"""
+        left = int(self._restore_deadline - time.monotonic() + 0.999)
+        if left > 0:
+            self.status_card.set_restore_countdown(left)
+            self._restore_after = self.root.after(200, self._tick_restore)
+        else:
+            self._restore_after = None
+            self.status_card.set_restore_countdown(None)
+            self._do_restore_default()
+
+    def cancel_restore_default(self):
+        if getattr(self, "_restore_after", None) is not None:
+            self.root.after_cancel(self._restore_after)
+            self._restore_after = None
+        self.status_card.set_restore_countdown(None)
+        dlog("app.action", what="restore_default", stage="cancel")
+        self.status_var.set("已取消恢复双屏")
+
+    def _do_restore_default(self):
+        """倒计时到点：整份写回默认双屏布局（后台线程，不卡 UI）。"""
+        def job():
+            return restore_default_layout()
+
+        def done(err):
+            if err:
+                self.status_var.set(err)
+                self.msg.showerror("恢复双屏失败", err)
+            else:
+                dlog("app.action", what="restore_default", stage="done")
+                self.status_var.set("已恢复默认双屏布局")
+                self.refresh_monitors(silent=True)
+        self.run_bg(job, done, busy=True)
 
     def export_diag(self):
         """导出诊断包，并直接在资源管理器里选中它。"""
@@ -6367,8 +6621,11 @@ class App:
     def _fetch_models(self):
         """显示器型号缓存没有的补一次（写入行标题与配置）。"""
         targets = self.selected_indices() or list(range(len(self.monitors)))
+        # VDD 不读型号：它没有真实 EDID，按 index 缓存下来的名字会串到
+        # 物理屏行（或反过来，VDD 当主屏时套用物理屏名）—— v2.01.12 修
         missing = [i for i in targets
-                   if i not in self.mon_models and 0 <= i < len(self.monitors)]
+                   if i not in self.mon_models and 0 <= i < len(self.monitors)
+                   and not self.is_vdd(i)]
         if not missing:
             return
 
@@ -6901,6 +7158,9 @@ class App:
 
     def _on_close(self):
         if self.tray is not None:
+            # 倒计时中进行时最小化：不让它在用户看不到界面时偷偷恢复
+            if getattr(self, "_restore_after", None) is not None:
+                self.cancel_restore_default()
             self.root.withdraw()
             self.status_var.set("已最小化到托盘（右下角图标，右键可退出）")
             return
