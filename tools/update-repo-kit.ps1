@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Install or verify the repo-kit copy used by this repository.
@@ -161,3 +161,22 @@ $lock = [ordered]@{
 }
 Write-Utf8NoBom $lockPath (($lock | ConvertTo-Json -Depth 5) + "`n")
 Write-Output ('KIT LOCK: WRITTEN (v' + $version + ', spec=' + $specVersion + ', profile=' + $Profile + ')')
+
+# 存量仓库最容易踩的一步：已经有手写 AGENTS.md，还没建 schema/agents.template.md。
+# 下一步跑 generate --write 时，生成器会因为无法判断而拒绝写入（2.7.4 起 fail-closed）。
+# 这里提前告知，让人当场做决定，而不是等生成时报错。
+$agentsPath = Join-Path $repo 'AGENTS.md'
+$templatePath = [System.IO.Path]::Combine($repo, 'schema', 'agents.template.md')
+if ($Profile -ne 'link-only' -and (Test-Path -LiteralPath $agentsPath) -and -not (Test-Path -LiteralPath $templatePath)) {
+    $declared = $true
+    $taxPath = [System.IO.Path]::Combine($repo, 'schema', 'taxonomy.json')
+    if (Test-Path -LiteralPath $taxPath) {
+        $taxProp = (Read-Json $taxPath).PSObject.Properties['generated_files']
+        if ($null -ne $taxProp) { $declared = (@($taxProp.Value) -contains 'AGENTS.md') }
+    }
+    if ($declared) {
+        Write-Warning ('AGENTS.md exists but schema/agents.template.md is missing; generate.py will refuse to overwrite it. Choose one: ' +
+            '(1) keep it hand-written: remove "AGENTS.md" from generated_files in schema/taxonomy.json; ' +
+            '(2) generate it: copy AGENTS.md to schema/agents.template.md, replace volatile counts with {{PAGES}}/{{CRITICAL}}/{{TYPES}}/{{VERSION}}, then run generate.py --write.')
+    }
+}
