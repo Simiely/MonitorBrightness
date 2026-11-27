@@ -3,6 +3,10 @@
 > 方法来源：`workbuddy-skills/skills/scenario-walkthrough/SKILL.md` v3。
 > 生成日期：2026-11-27。基线：v2.00.1（main，本地领先 origin 10 提交）。
 > 铁律：素材里出现本清单外的功能 = 素材错误。
+>
+> ⚠️ 行号是 v2.00.1 的，已被后续版本改动；新能力见
+> `report.md` 第 2 轮报告（S-31~S-39：恢复双屏 / 首次检测 / 配置迁移 /
+> 悬停说明 / 交接候选 / VDD 名称）。
 
 主实现：`monitor_brightness.py`（5995 行）。所有行号默认指该文件。
 

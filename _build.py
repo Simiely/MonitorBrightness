@@ -11,7 +11,12 @@
 """
 import os
 
-VERSION_DIR = "dist_v20112"         # ← 每次打包改这里（v2.01.12）
+# v2.01.21：打包目录固定为 `dist`，不再每次建 `dist_v201xx`。
+# 原因：v2.01.17 起配置便携化到程序同目录，换版本目录就等于"配置没了"，
+# 用户每升一版都要手动拷一次 config.json（真实抱怨）。
+# 固定目录后：覆盖 exe、配置与日志原地保留，双击同一个路径就是最新版。
+# 需要留历史版本时，先把 dist 整个复制一份再打包。
+VERSION_DIR = "dist"
 for k in ("TCL_LIBRARY", "TK_LIBRARY", "PYTHONPATH"):
     os.environ.pop(k, None)
 assert "TCL_LIBRARY" not in os.environ

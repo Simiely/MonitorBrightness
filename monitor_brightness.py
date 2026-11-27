@@ -73,9 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.12"    # 恢复双屏按钮（倒计时可配）；修 VDD 当主屏时名称错位
-CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+APP_VERSION = "2.01.25"    # 「记住」按钮就地回执（设置弹层挡住状态卡）
 
 
 def _app_dir():
@@ -106,18 +104,26 @@ def _dir_writable(path):
         return False
 
 
+# v2.01.17：配置也便携化到**程序所在目录**（用户要求）。
+# 便携化是软件常见做法（SO #4897525）：配置文件放程序根目录，整个目录拷走
+# 设置就跟着走。只有程序目录不可写（Program Files / 只读介质）才回退 APPDATA。
+_LEGACY_CONFIG_DIR = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
+APP_DIR = _app_dir()
+CONFIG_DIR = APP_DIR if _dir_writable(APP_DIR) else _LEGACY_CONFIG_DIR
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
 def _pick_log_dir():
     """日志放**程序同目录**（便携、出问题整个目录发给开发者就行）。
 
     只有程序目录不可写才回退到 APPDATA —— 装在 Program Files、只读介质、
-    网络盘上时会走到这条回退路径。
-    配置本身仍留在 APPDATA：换版本目录时设置不会丢。
+    网络盘上时会走到这条回退路径。配置现在也在这里（v2.01.17）。
     """
     app_dir = _app_dir()
     return app_dir if _dir_writable(app_dir) else CONFIG_DIR
 
 
-APP_DIR = _app_dir()
 # 事件日志：任务重建 / 配置恢复等旁路记账落在这里，界面只读展示。
 # ⚠️ 本程序启动时不会主动熄屏：启动自检只校验计划任务定义，绝不补执行任何档位。
 LOG_DIR = _pick_log_dir()
@@ -232,7 +238,6 @@ SETTINGS = (
     {"key": "slots", "kind": "slots", "default": DEFAULT_SLOTS},
     {"key": "enabled", "kind": "flag", "default": False},
     {"key": "catch_up_on_logon", "kind": "flag", "default": True},
-    {"key": "screen_hotkeys", "kind": "flag", "default": False},          # 熄屏/点亮热键（需常驻）
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
     {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
     # ⚠️ v2.01.0 删除了 screen_state / screen_state_at / screen_off_tick：
@@ -240,11 +245,15 @@ SETTINGS = (
     # 每次需要结论时现场读（见 screen_verdict）。旧配置里残留的同名字段
     # 会被 load_config 丢弃，不影响任何行为。
     # 熄灭方式：system   = Windows 系统级整组熄灭（一定唤得回来）
-    #           ddc      = 逐台 DDC 0xD6=2 待机（默认；v1.8.5 已验证的熄灭路径）
-    #           topology = CCD 断开副屏（E3/E4 新增选项，默认不变）
-    # v1.9.3 恢复 v1.8.5 的默认值：v1.9.0 曾未经要求把默认改成 system。
+    #           ddc      = 逐台 DDC 0xD6=2 待机（个别面板唤不回）
+    #           topology = CCD 断开副屏（串流隐藏物理屏用）
+    # v2.01.23：默认改为 topology（用户要求）。理由：这条路不碰面板电源，
+    # 只改 Windows 拓扑，唤不回的风险最低；本机面板能力串不声明 0xD6=2，
+    # ddc 那条路本来就得靠"明知有风险"的授权才能走。
+    # ⚠️ load_config 里把 "system 且未授权 ddc" 恢复成 ddc 的那段是历史迁移
+    # 逻辑（撤销 v1.9.0 的误迁移），与这里的默认值无关，不要跟着改。
     {"key": "screen_off_method", "kind": "choice",
-     "values": OFF_METHODS, "default": "ddc"},
+     "values": OFF_METHODS, "default": "topology"},
     # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
     {"key": "wake_switch_input", "kind": "flag", "default": True},
     # v1.9.7 快速点亮：0x60 切源翻转（读当前源 → 写中间源 → 立即写回），单台 ~180ms。
@@ -727,6 +736,9 @@ def save_config(cfg):
     v2.01.0：不再做"屏幕状态按磁盘时间戳合并"——程序已经不记屏幕状态账
     （见 screen_verdict 的说明），没有需要跨进程协调的运行态字段，
     自然也没有"内存旧值覆盖磁盘新值"的问题。
+
+    v2.01.20：**不迁移、不镜像**（用户决策）。配置就是程序目录那一份；
+    老版本留在 APPDATA 的文件不自动搬，跨机器/跨版本各用各的。
     """
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -738,6 +750,20 @@ def save_config(cfg):
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def old_config_present():
+    """程序目录没有配置、而旧 APPDATA 目录有时，返回旧文件路径（否则 ""）。
+
+    v2.01.20：不自动迁移，但要让用户知道"旧配置还在那儿"，而不是以为丢了。
+    只读判断，不碰文件。
+    """
+    if os.path.abspath(CONFIG_DIR) == os.path.abspath(_LEGACY_CONFIG_DIR):
+        return ""
+    if os.path.exists(CONFIG_FILE):
+        return ""
+    old = os.path.join(_LEGACY_CONFIG_DIR, "config.json")
+    return old if os.path.exists(old) else ""
 
 
 def _to_index(item):
@@ -3288,6 +3314,13 @@ def selection_anchors(indices, targets=None):
         for r in rows:
             if r["vdd"]:
                 continue
+            # v2.01.18：只认 ACTIVE path 的 gdi（微软文档 DISPLAYCONFIG_PATH_ACTIVE
+            # = "路径处于活动状态且是桌面的一部分"）。断开屏没有 active path，
+            # 折叠后残留的 gdi 会和当前主屏撞名（都是 DISPLAY1）；不排除它，
+            # selection_anchors 会把主屏和断开屏一起命中 → 交接弹窗 skip 掉
+            # 两块 → 候选只剩 VDD（用户 19:46 截图实证）。
+            if not r.get("active"):
+                continue
             if _short_dev(r.get("gdi")) in wanted and r["anchor"] not in out:
                 out.append(r["anchor"])
         return out
@@ -3457,8 +3490,19 @@ def restore_default_layout(validate_only=False, snap=None):
         dlog("app.restore_default.fail", stage="apply", rc=rc)
         return "恢复失败：SetDisplayConfig rc=%d（拓扑未改动）" % rc
     anchors = list(snap.get("targetAnchors") or [])
-    ok = _ccd_wait_state(anchors, True, allow_vdd=False) if anchors else True
-    dlog("app.restore_default.done", anchors=anchors, verified=ok)
+    # v2.01.19：快照可能是在串流形态（VDD 当主屏）下记的，此时 targetAnchors
+    # 含 VDD。_ccd_wait_state 的 allow_vdd=False 会把 VDD 过滤掉，导致
+    # wanted 里的 VDD 永远等不到 → 误报"2 秒内没读到确认"（实际已写回）。
+    # 所以只拿物理屏锚点做回读验证。
+    try:
+        vdd_anchors = {r["anchor"] for r in ccd_probe_topology()
+                       if r.get("vdd") and r.get("anchor")}
+    except Exception:
+        vdd_anchors = set()
+    phys = [a for a in anchors if a not in vdd_anchors]
+    ok = _ccd_wait_state(phys, True) if phys else True
+    dlog("app.restore_default.done", anchors=anchors, verified=ok,
+         vdd_skipped=sorted(vdd_anchors & set(anchors)))
     return None if ok else "布局已写回，但 2 秒内没读到确认，请「检测」看结果"
 
 
@@ -3471,14 +3515,31 @@ def is_vdd_row(row):
     return bool(row and row.get("vdd"))
 
 
+_GENERIC_DESC = "generic pnp monitor"
+
+
 def display_name_for_row(index, row, mon_models):
-    """界面行的显示名：VDD 用 friendly，其余才用按 index 缓存的型号名。"""
+    """界面行的显示名：VDD 用 friendly，其余才用按 index 缓存的型号名。
+
+    v2.01.21：DDC 读型号走 EDID，真机实测两块屏要 6.2 秒。缓存还没到位时
+    先用 CCD 的 friendly（"R27qe Gen2"，0.1ms 就能拿到）顶上，
+    别让用户盯着"显示器 0"等 6 秒。
+
+    v2.01.22（走查 P-28）：DDC 的 `desc` 恒为 "Generic PnP Monitor"，
+    它是驱动占位名、不是名字，别拿它当兜底显示。
+    """
     if is_vdd_row(row):
-        return (row.get("friendly") or "虚拟显示器"), True
+        name = (row.get("friendly") or "").strip()
+        if name.lower() == _GENERIC_DESC:
+            name = ""
+        return (name or "虚拟显示器"), True
     model = mon_models.get(index)
     if model:
         return model, False
-    return "显示器 %d" % index, False
+    name = (row.get("friendly") or "").strip()
+    if name.lower() == _GENERIC_DESC:
+        name = ""
+    return (name or "显示器 %d" % index), False
 
 
 def resolve_monitors(cfg):
@@ -4480,7 +4541,7 @@ def cli_selftest():
 # ------------------------------------------------------------
 # 设计取向（2026-11 改版，参照 Apple HIG 的 Clarity / Deference / Depth）：
 #   - 主界面只放日常操作：状态卡 + 显示器 + 亮度 + 定时；
-#   - 托盘 / 自启 / 热键 / 熄灭方式 / 预设数值 全部收进「设置」；
+#   - 托盘 / 自启 / 熄灭方式 / 预设数值 全部收进「设置」；
 #   - 解释性文案收进「说明」，界面上不再铺满灰色小字；
 #   - 分组用卡片 + 行分隔，动作按钮按"当前可执行"决定主次并置灰不可用项。
 # tkinter 没有圆角/模糊：圆角用 4 个角上的 Canvas 画四分之一圆补出来，
@@ -5104,6 +5165,103 @@ class SectionTitle(tk.Label):
                          font=_ui_font(8, bold=True), anchor="w")
 
 
+class Tooltip:
+    """鼠标悬停说明气泡（v2.01.15）。
+
+    设置页原先每行都摆一行小字说明，太占地方。改成悬停才显示：
+      - 延迟 400ms 才弹，鼠标划过时不闪；
+      - 跟随鼠标、怕超出屏幕会自动翻边；
+      - 一个控件一个实例，绑定 Enter/Leave/FocusOut/ButtonPress 全覆盖，
+        避免"弹窗关了气泡还留在屏幕上"。
+    """
+
+    DELAY_MS = 400
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self._after = None
+        self._win = None
+        self._bound = set()
+        self._bind(widget)
+
+    def _bind(self, widget):
+        if id(widget) in self._bound:
+            return
+        self._bound.add(id(widget))
+        # add="+" 追加，绝不能替换原有绑定（v2.01.19 走查发现）：
+        # Switch / Button 自己都绑了 <Enter> 做 hover 视觉，不带 add 的
+        # bind() 会把它们整条覆盖掉 → 悬停说明出来了，按钮却不再高亮。
+        for seq, cb in (("<Enter>", self._on_enter),
+                        ("<Leave>", self._on_leave),
+                        ("<ButtonPress>", self._on_leave),
+                        ("<FocusOut>", self._on_leave)):
+            widget.bind(seq, cb, add="+")
+
+    def bind_tree(self, widget=None):
+        """递归给整棵子控件树绑定（v2.01.16）。
+
+        Tk 的 <Enter> 不冒泡：鼠标停在 Label/Switch 子控件上时，绑在父
+        Frame 上的回调根本不会触发 —— 这就是 v2.01.15"悬停不显示"的根因。
+        row 构建完（builder 之后）调用本方法，把子控件全绑上。
+        """
+        widget = widget if widget is not None else self.widget
+        self._bind(widget)
+        for child in widget.winfo_children():
+            self.bind_tree(child)
+
+    def _on_enter(self, _e=None):
+        if self._after is not None:
+            return
+        self._after = self.widget.after(self.DELAY_MS, self._show)
+
+    def _on_leave(self, _e=None):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+        if self._win is not None:
+            self._win.destroy()
+            self._win = None
+
+    def _show(self):
+        self._after = None
+        if self._win is not None or not self.text:
+            return
+        try:
+            w = tk.Toplevel(self.widget)
+            w.withdraw()
+            w.overrideredirect(True)
+            # 设置弹层是 grab_set() 模态窗口：不加 topmost 的话气泡会被
+            # 它压在下面，表现就是"有的行能看到、有的看不到"（Z 序随机）。
+            # 交叉验证：StackOverflow #9135302 / #69869659 —— topmost 是
+            # 模态/置顶父窗口下 tooltip 可见的标准解。
+            w.attributes("-topmost", True)
+            w.configure(bg=UI["accent"])
+            # 1px 边框 + 内部标签，深色主题下气泡有清晰边界
+            inner = tk.Frame(w, bg=UI["card_alt"])
+            inner.pack(padx=1, pady=1)
+            tk.Label(inner, text=self.text, bg=UI["card_alt"], fg=UI["text"],
+                     font=_ui_font(8), justify="left", wraplength=320).pack(
+                padx=8, pady=6)
+            w.update_idletasks()
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            ww, wh = w.winfo_width(), w.winfo_height()
+            sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+            if x + ww > sw - 8:
+                x = max(8, sw - ww - 8)
+            if y + wh > sh - 8:
+                y = max(8, self.widget.winfo_rooty() - wh - 6)
+            w.geometry("+%d+%d" % (x, y))
+            w.deiconify()
+            self._win = w
+        except Exception:
+            self._win = None
+
+
 class Sheet(tk.Toplevel):
     """深色模态弹层（设置 / 说明 / 编辑时间段共用）。
 
@@ -5131,8 +5289,26 @@ class Sheet(tk.Toplevel):
             Label(head, subtitle, size=8, color=UI["text3"], bg=UI["card"],
                   justify="left", wraplength=self._width - 40).pack(anchor="w", pady=(3, 0))
 
-        self.body = tk.Frame(self, bg=UI["card"])
-        self.body.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+        # v2.01.13：弹层正文加滚动条。原来 body 是裸 Frame，设置项一多就
+        # 超出屏幕、底部控件点不到（Sheet 文档一直写着"带滚动正文"却没实现）。
+        # 复用主窗同款 Canvas + Frame 结构；正文高度按屏幕封顶，超出才出滚动条。
+        # v2.01.15：说明文字挪进 tooltip 后正文只剩 636px，封顶再降到 520px，
+        # 滚动条仍稳定出现（用户明确要"有滑动条"），窗口也更矮。
+        self._sheet_max_h = max(360, min(520, self.winfo_screenheight() - 220))
+        wrap = tk.Frame(self, bg=UI["card"])
+        wrap.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+        self._body_canvas = tk.Canvas(wrap, bg=UI["card"], highlightthickness=0, bd=0)
+        self._body_bar = ttk.Scrollbar(wrap, orient="vertical",
+                                       command=self._body_canvas.yview)
+        self.body = tk.Frame(self._body_canvas, bg=UI["card"])
+        self._body_win = self._body_canvas.create_window(
+            (0, 0), window=self.body, anchor="nw")
+        self._body_canvas.configure(yscrollcommand=self._body_bar.set)
+        self._body_canvas.pack(side="left", fill="both", expand=True)
+        self.body.bind("<Configure>", self._on_sheet_body)
+        self._body_canvas.bind("<Configure>", lambda e: self._body_canvas.itemconfigure(
+            self._body_win, width=e.width))
+        # v2.01.22：滚轮不再靠 Canvas 的 Enter/Leave（见 show() 的说明）。
 
         foot = tk.Frame(self, bg=UI["card"])
         foot.pack(fill="x", padx=20, pady=(10, 16))
@@ -5143,12 +5319,33 @@ class Sheet(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.close())
         self.transient(app.root)
 
+    def _on_sheet_wheel(self, event):
+        # 没滚动条就别吞滚轮（内容本来就放得下）
+        if not self._body_bar.winfo_ismapped():
+            return
+        self._body_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_sheet_body(self, _event=None):
+        self._body_canvas.configure(scrollregion=self._body_canvas.bbox("all"))
+        need = self.body.winfo_reqheight() > self._sheet_max_h
+        if need and not self._body_bar.winfo_ismapped():
+            self._body_bar.pack(side="right", fill="y")
+        elif not need and self._body_bar.winfo_ismapped():
+            self._body_bar.pack_forget()
+        # Canvas 显式给尺寸：否则 create_window 的内容把它撑到全高，
+        # show() 一量 reqheight 就是整份正文，窗口又超出屏幕（滚动条白加）。
+        self._body_canvas.configure(
+            width=self.body.winfo_reqwidth(),
+            height=min(self.body.winfo_reqheight(), self._sheet_max_h))
+
     def show(self):
         """内容搭完后再定尺寸并弹出。
 
         必须由子类在 **最后** 调用：基类构造时 body 还是空的，
         那时量出来只有 144px 高（实测），窗口会被 resizable(False) 锁死。
         """
+        self.update_idletasks()
+        self._on_sheet_body()             # 先按封顶高度定好 Canvas
         self.update_idletasks()
         w = max(self.winfo_reqwidth(), self._width)
         h = self.winfo_reqheight()
@@ -5160,19 +5357,40 @@ class Sheet(tk.Toplevel):
         self.deiconify()
         self.wait_visibility()
         self.grab_set()
+        # v2.01.22（走查 P-27）：滚轮改用全局绑定。原来靠 Canvas 的 <Enter>
+        # 才 bind_all —— 鼠标若从窗口外直接进到 Label/Frame 上，Canvas 收不到
+        # Enter（Tk 事件不冒泡），滚轮根本没绑上，设置页只能拖滚动条。
+        # 模态弹层期间只有它在收事件，全局绑定不会误伤别的窗口。
+        self.bind_all("<MouseWheel>", self._on_sheet_wheel, add="+")
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, event=None):
+        """弹层销毁时解掉全局滚轮绑定，避免关窗后还抢滚轮。"""
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        try:
+            self.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
 
     def close(self):
+        self._on_destroy()
         self.grab_release()
         self.destroy()
 
     def section(self, text):
-        SectionTitle(self.body, text).pack(anchor="w", pady=(14, 6))
+        # v2.01.14 紧凑化：原来 (14,6) 让 5 个分区白吃掉 ~190px
+        SectionTitle(self.body, text).pack(anchor="w", pady=(9, 3))
         card = Card(self.body, pad=0, bg=UI["card_alt"], page_bg=UI["card"])
         card.pack(fill="x")
         return card.inner
 
-    def row(self, parent, title, sub="", right_text=None, builder=None):
+    def row(self, parent, title, sub="", right_text=None, builder=None, tip=None):
         """一行：标题（+副标题）在左，右侧放文字或控件，底部一条分隔线。
+
+        `tip`：鼠标悬停才弹出的说明（v2.01.15）。给了 tip 就不显示 sub 文字，
+        把说明藏进气泡——设置页靠这个把 869px 又压下去一大截。
+        HeirSheet 等需要常显副标题的地方不传 tip，行为不变。
 
         ⚠️ 控件必须通过 builder 在**本行内**创建：先建好再 pack 到别的父容器会
         报 "can't pack inside"，或悄悄跑到卡片其它位置（实测踩过）。
@@ -5181,19 +5399,26 @@ class Sheet(tk.Toplevel):
         pbg = parent.cget("bg")
         row = tk.Frame(parent, bg=pbg)
         row.pack(fill="x")
+        tip_obj = Tooltip(row, tip) if tip else None   # 绑定延后到子树建好
+        if tip:
+            sub = ""                       # 说明不再常显
         right = tk.Frame(row, bg=pbg)
         right.pack(side="right", padx=(8, 14))
         left = tk.Frame(row, bg=pbg)
-        left.pack(side="left", fill="x", expand=True, padx=(14, 0), pady=9)
+        # v2.01.14 紧凑化：pady 9 → 4；副标题加宽减少换行
+        left.pack(side="left", fill="x", expand=True, padx=(14, 0), pady=4)
         Label(left, title, size=9, bg=pbg).pack(anchor="w")
         if sub:
             Label(left, sub, size=8, color=UI["text3"], bg=pbg,
-                  justify="left", wraplength=self._width - 170).pack(anchor="w", pady=(1, 0))
+                  justify="left", wraplength=self._width - 130).pack(anchor="w", pady=(1, 0))
         if right_text is not None:
             Label(right, right_text, size=8, color=UI["text3"],
                   bg=pbg).pack(anchor="e")
         if builder is not None:
             builder(right)
+        if tip_obj is not None:
+            tip_obj.bind_tree()            # 子控件全绑上，悬停才真的会出
+            row.tooltip = tip_obj          # 挂引用，便于调试/测试
         sep = tk.Frame(parent, bg=UI["sep"], height=1)
         sep.pack(fill="x", padx=14)
         return row
@@ -5398,10 +5623,14 @@ class MonitorPanel:
                 # VDD 当主屏时它是 index 0，绝不能套用 mon_models[0] 那块物理屏
                 # 的型号名（v2.01.12 修，日志 18:38:43 heir=VDD 实证）
                 mon = self.app.monitors[i] if i < len(self.app.monitors) else {}
-                row = {"vdd": bool(getattr(self.app, "is_vdd", lambda _i: False)(i)),
-                       "friendly": (mon.get("desc") or (info[0] if info else "")),
-                       "index": i}
-                name, _is_vdd = display_name_for_row(i, row, self.app.mon_models)
+                # v2.01.19：friendly 优先取 CCD 的（"VDD by MTT"），
+                # DDC 的 desc 恒为 "Generic PnP Monitor"，只能当兜底。
+                ccd_name = (getattr(self.app, "ccd_friendly", lambda _i: "")(i)
+                            or mon.get("desc") or (info[0] if info else ""))
+                name_row = {"vdd": bool(getattr(self.app, "is_vdd", lambda _i: False)(i)),
+                            "friendly": ccd_name,
+                            "index": i}
+                name, _is_vdd = display_name_for_row(i, name_row, self.app.mon_models)
                 Label(txt, name, size=9, bg=UI["card"]).pack(anchor="w")
                 sub = ""
                 if info:
@@ -5936,12 +6165,19 @@ class HeirSheet(Sheet):
                          % going_off, width=430)
         self._on_pick = on_pick
         inner = self.section("可以接任的屏")
+        # 两块同型号屏 friendly 都是 "R27qe Gen2"，光看名字分不清。
+        # 给物理屏按候选顺序编号（不按 index，重编号后 index 会漂）。
+        phys_no = 0
         for c in candidates:
             if c["vdd"]:
                 sub = "虚拟显示器 · 当前断着，会先接回来再断开物理屏"
+                title = c["friendly"] or "虚拟显示器"
             else:
-                sub = "物理显示器 · %s · 会挪到桌面原点" % (c["gdi"] or "—")
-            self.row(inner, c["friendly"], sub,
+                phys_no += 1
+                sub = "物理显示器 %d · %s · 会挪到桌面原点" % (
+                    phys_no, c["gdi"] or "—")
+                title = "%s（物理显示器 %d）" % (c["friendly"] or "显示器", phys_no)
+            self.row(inner, title, sub,
                      builder=lambda p, a=c["anchor"]: Button(
                          p, "选它", lambda a=a: self._choose(a), kind="link",
                          height=22, font_size=8).pack())
@@ -5954,42 +6190,56 @@ class HeirSheet(Sheet):
 
 
 class SettingsSheet(Sheet):
-    """设置：托盘 / 自启 / 热键 / 熄灭方式 / 预设 / 关于（都是"不常改"的东西）。"""
+    """设置：托盘 / 自启 / 熄灭方式 / 预设 / 关于（都是"不常改"的东西）。"""
+
+    def _build_remember_btn(self, parent, app):
+        """「记住」按钮 + 结果回执（v2.01.25）。
+
+        走查反馈：点完没有任何可见反馈。根因不是没写状态栏——`remember_layout`
+        写了——而是**设置弹层是模态的、盖住主窗口的状态卡**，用户看不见。
+        所以在按钮自己身上给回执：成功变「已记住 ✓」，2 秒后复原。
+        """
+        btn = Button(parent, "记住", app.remember_layout, kind="link",
+                     height=22, font_size=8)
+        btn.pack()
+        app._remember_btn = btn
+        return btn
 
     def __init__(self, app):
-        super().__init__(app, "设置", "不常用的开关都在这里，主界面只留日常操作", width=440)
+        super().__init__(app, "设置", "不常用的开关都在这里，主界面只留日常操作", width=480)
         self.app = app
         cfg = app.cfg
 
         win = self.section("窗口")
-        self.row(win, "系统托盘图标", "在右下角常驻，右键可熄/亮屏、切换定时",
+        self.row(win, "系统托盘图标",
+                 tip="在右下角常驻，右键可熄/亮屏、切换定时",
                  builder=lambda p: Switch(p, bool(cfg.get("tray_enabled", True)),
                                           lambda v: app.apply_setting("tray_enabled", v)).pack())
-        self.row(win, "关闭窗口时最小化到托盘", "关掉则点 × 直接退出程序")
+        self.row(win, "关闭窗口时最小化到托盘",
+                 tip="关掉则点 × 直接退出程序")
 
-        start = self.section("启动与快捷键")
-        self.row(start, "开机自动启动", "启动后直接进托盘",
+        start = self.section("启动")
+        self.row(start, "开机自动启动", tip="启动后直接进托盘",
                  builder=lambda p: Switch(p, get_autostart()[0],
                                           app.apply_autostart).pack())
-        self.row(start, "全局热键", "熄灭 Ctrl Alt Shift O　点亮 Ctrl Alt Shift P",
-                 builder=lambda p: Switch(p, bool(cfg.get("screen_hotkeys", False)),
-                                          lambda v: app.apply_setting("screen_hotkeys", v)).pack())
 
         off = self.section("熄屏")
         pbg = off.cget("bg")
         wrap = tk.Frame(off, bg=pbg)
         wrap.pack(fill="x", padx=14, pady=(10, 6))
-        Label(wrap, "熄灭方式", size=9, bg=pbg).pack(anchor="w")
+        mode_lbl = Label(wrap, "熄灭方式", size=9, bg=pbg)
+        mode_lbl.pack(anchor="w")
+        # v2.01.15：说明文字全挪到悬停气泡，标题下不再常驻小字
+        Tooltip(mode_lbl, "系统级：整组熄灭、键鼠会点亮\n"
+                          "单屏待机：键鼠不点亮，个别面板唤不回\n"
+                          "拓扑断开：从桌面移除副屏，串流用；接回摆回原位")
         mode = Segmented(wrap, [OFF_METHOD_LABEL[m] for m in OFF_METHODS],
-                         index=OFF_METHODS.index(cfg.get("screen_off_method", "system")),
+                         # fallback 跟着 SETTINGS 的默认值走，别再硬编码
+                         index=OFF_METHODS.index(
+                             cfg.get("screen_off_method")
+                             or SETTING_BY_KEY["screen_off_method"]["default"]),
                          command=lambda i: app.apply_off_method(OFF_METHODS[i]))
-        mode.pack(fill="x", pady=(6, 0))
-        Label(wrap, "系统级：整组熄灭、一定唤得回，但键鼠会点亮。"
-                    "这种模式没有逐台按钮（本来就是整组广播）。\n"
-                    "单屏待机：键鼠不点亮（远程防窥用），个别面板唤不回。\n"
-                    "拓扑断开：把选中的副屏从桌面移除（串流用），主屏不动；"
-                    "接回时会摆回原位置。",
-              size=8, color=UI["text3"], bg=pbg, justify="left").pack(anchor="w", pady=(6, 0))
+        mode.pack(fill="x", pady=(5, 0))
         tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
 
         def _relight(p):
@@ -6002,23 +6252,22 @@ class SettingsSheet(Sheet):
             spin.bind("<<Decrement>>", cb)
             spin.bind("<FocusOut>", cb)
 
-        self.row(off, "熄灭后自动点亮", "0 = 不自动；远程时建议设个值", builder=_relight)
+        self.row(off, "熄灭后自动点亮", tip="0 = 不自动；远程时建议设个值", builder=_relight)
 
-        self.row(off, "点亮时允许切信号源", "最后一招；DP+HDMI 双线时可能切到空口",
+        self.row(off, "点亮时允许切信号源",
+                 tip="最后一招；DP+HDMI 双线时可能切到空口",
                  builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
                                           lambda v: app.apply_setting("wake_switch_input", v)).pack())
         # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
         self.row(off, "改显示器时窗口跟着屏走",
-                 "拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",
+                 tip="拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",
                  builder=lambda p: Switch(p, bool(cfg.get("window_follow", True)),
                                           lambda v: app.apply_setting("window_follow", v)).pack())
         # 位置记录不会自动覆盖（交接会把屏挪来挪去，那一刻的位置不是用户摆的），
         # 所以给一个主动更新的入口 —— 这是"记住布局"的唯一途径
         self.row(off, "记住当前显示器布局",
-                 "断开/接回都按这份位置摆放；自己挪过屏之后点一次",
-                 builder=lambda p: Button(
-                     p, "记住", app.remember_layout, kind="link",
-                     height=22, font_size=8).pack())
+                 tip="断开/接回都按这份位置摆放；自己挪过屏之后点一次",
+                 builder=lambda p: self._build_remember_btn(p, app))
 
         def _restore_delay(p):
             spin = ttk.Spinbox(p, from_=0, to=120, width=5, justify="center")
@@ -6032,14 +6281,16 @@ class SettingsSheet(Sheet):
             spin.bind("<FocusOut>", cb)
 
         self.row(off, "恢复双屏倒计时",
-                 "点「恢复双屏」后等几秒再执行；0 = 立即恢复",
+                 tip="点「恢复双屏」后等几秒再执行；0 = 立即恢复",
                  builder=_restore_delay)
 
         pre = self.section("亮度预设")
         pbg = pre.cget("bg")
         prow = tk.Frame(pre, bg=pbg)
         prow.pack(fill="x", padx=14, pady=9)
-        Label(prow, "三个快捷按钮的值", size=9, bg=pbg).pack(anchor="w")
+        lbl = Label(prow, "三个快捷按钮的值", size=9, bg=pbg)
+        lbl.pack(anchor="w")
+        Tooltip(lbl, "主界面亮度卡片下面三个快捷按钮对应的百分比")
         spins = tk.Frame(prow, bg=pbg)
         spins.pack(anchor="w", pady=(6, 0))
         self.preset_spins = []
@@ -6051,21 +6302,22 @@ class SettingsSheet(Sheet):
             self.preset_spins.append(sp)
 
         about = self.section("关于")
-        self.row(about, "版本", "", right_text="v%s" % APP_VERSION)
-        self.row(about, "配置文件", "", right_text="%APPDATA%\\MonitorBrightness")
-        # 诊断日志（临时模块 v2.01.4）：排障时留着，问题收敛后连同 dlog 一起删
-        self.row(about, "诊断日志", "排障用；问题解决后可关掉",
-                 builder=lambda p: Switch(
-                     p, bool(cfg.get("diag_log", True)),
-                     lambda v: app.apply_setting("diag_log", v)).pack())
-        self.row(about, "打开日志目录", "diag.log / events.log / error.log",
-                 builder=lambda p: Button(
-                     p, "打开", app.open_log_dir, kind="link",
-                     height=22, font_size=8).pack())
-        self.row(about, "导出诊断包", "日志 + 配置打成一个 zip，直接发出去",
-                 builder=lambda p: Button(
-                     p, "导出", app.export_diag, kind="link",
-                     height=22, font_size=8).pack())
+        # v2.01.14：5 行压成 3 行 —— 版本/路径并一行，两个诊断动作并排
+        self.row(about, "版本 / 配置位置", "",
+                 right_text="v%s · %%APPDATA%%\\MonitorBrightness" % APP_VERSION)
+
+        def _diag_controls(p):
+            box = tk.Frame(p, bg=p.cget("bg"))
+            Button(box, "导出", app.export_diag, kind="link",
+                   height=22, font_size=8, width=34).pack(side="right")
+            Button(box, "日志", app.open_log_dir, kind="link",
+                   height=22, font_size=8, width=30).pack(side="right", padx=(0, 6))
+            Switch(box, bool(cfg.get("diag_log", True)),
+                   lambda v: app.apply_setting("diag_log", v)).pack(side="right", padx=(0, 8))
+            box.pack()
+
+        self.row(about, "诊断", tip="开关 + 日志/导出；问题收敛后可关掉",
+                 builder=_diag_controls)
         self.show()
 
 
@@ -6142,12 +6394,10 @@ class App:
         self._bg_tasks = 0
         self._busy = False
         self._busy_action = None      # 当前忙任务对应的屏幕动作（"on"/"off"/None）
-        self._pending_screen = None   # 忙时最后一次点击/热键，结束后补执行一次
+        self._pending_screen = None   # 忙时最后一次点击，结束后补执行一次
         self._task_querying = False
-        self._hotkeys_on = False
         self._relight_pending = False
         self._relight_timer = None       # 走查 E1-05：自动复亮 timer 句柄（可取消）
-        self._hotkey_tid = None
         # 启动时**不猜**屏幕状态：unknown 直到第一次「检测」拿到真实读数。
         # v2.01.0：以前这里从配置里读 screen_state，等于把上次的记账当成当前事实。
         self._last_verdict = {"state": "unknown", "detail": ""}
@@ -6195,8 +6445,6 @@ class App:
             "write", lambda *_: self.status_card.flash(self.status_var.get()))
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        if self.cfg.get("screen_hotkeys"):
-            self._start_hotkey_listener()
 
         self.refresh_monitors(silent=True)
         self.refresh_task_status()
@@ -6208,9 +6456,26 @@ class App:
 
         # 配置读坏的显式提示（不能静默吞掉：用户的设置还在坏文件里）
         self.root.after(150, self._warn_config_error)
+        # 首次启动：自动把检测到的显示器锚点写进配置（v2.01.17）。
+        # 原因：锚点只在用户手动勾选时才存，首次打开配置里 anchors 是空的，
+        # 定时/熄灭逻辑只能靠纯 index 兜底，换屏/重排后就会认错屏。
+        # 用 after_idle（Tk 官方推荐的"窗口显示后再初始化"做法，Bryan Oakley）：
+        # 等窗口可见、显示器列表建好再做，不阻塞首屏绘制。
+        # 只在"从未保存过锚点"时写一次，不覆盖用户后续的手动选择。
+        if not (self.cfg.get("monitor_anchors") or []):
+            self.root.after_idle(self._first_run_detect)
+
         # 启动后台自检：只校验任务定义与当前进程是否一致（不一致则原地重建）。
         # 不补执行、不改亮度、不熄屏；900ms 是给首屏探测让路，全程后台线程。
         self.root.after(900, self._start_auto_checks)
+
+        # v2.01.20：发现旧 APPDATA 配置时提示一句（不自动迁移）。
+        # 延迟到首屏探测之后，避免被启动期的其它状态文案盖掉。
+        old_cfg = old_config_present()
+        if old_cfg:
+            _write_event_log("检测到旧版配置（未自动迁移）：%s" % old_cfg)
+            self.root.after(1400, lambda p=old_cfg: self.status_var.set(
+                "旧版配置在 %s；要沿用就手动复制 config.json 到程序目录" % p))
 
     def _fit_window(self):
         """内容晚到（任务状态行/显示器行）后按请求尺寸重排窗口。
@@ -6272,8 +6537,35 @@ class App:
         desc, snap_err = save_default_layout()
         if snap_err:
             self.status_var.set("位置已记住，但默认布局快照没存上：%s" % snap_err)
+            self._flash_remember_btn("快照失败", err=True)
             return
         self.status_var.set("已记住 %d 块屏的位置和布局（%s）" % (len(layout), desc))
+        self._flash_remember_btn("已记住 ✓")
+
+    def _flash_remember_btn(self, text, err=False):
+        """在「记住」按钮上短暂显示结果（v2.01.25）。
+
+        设置弹层是模态的，会挡住主窗口状态卡；不给就地回执，用户就以为没反应。
+        2 秒后复原；弹层先被关掉时 widget 已销毁，静默跳过。
+        """
+        btn = getattr(self, "_remember_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.set_text(text)
+            if err:
+                btn.after(2600, lambda: self._restore_remember_btn(btn))
+            else:
+                btn.after(1800, lambda: self._restore_remember_btn(btn))
+        except Exception:
+            pass
+
+    def _restore_remember_btn(self, btn):
+        try:
+            if btn.winfo_exists():
+                btn.set_text("记住")
+        except Exception:
+            pass
 
     # ---- 恢复双屏（倒计时） ------------------------------------------------
     def ask_restore_default(self):
@@ -6312,6 +6604,15 @@ class App:
 
     def _do_restore_default(self):
         """倒计时到点：整份写回默认双屏布局（后台线程，不卡 UI）。"""
+        # v2.01.20（走查 P-22）：到点时如果正有屏幕动作在跑（用户刚点了
+        # 熄灭/点亮），两边都改拓扑会互相覆盖，_busy 的归属也会错乱
+        # （先完成的那个把按钮启用了，另一个还在跑）。直接取消并说明。
+        if self._busy:
+            self.status_var.set("有屏幕操作正在进行，恢复双屏已取消，请稍后重试")
+            dlog("app.action", what="restore_default", stage="cancel_busy",
+                 busy_action=self._busy_action)
+            return
+
         def job():
             return restore_default_layout()
 
@@ -6351,14 +6652,6 @@ class App:
                 else:
                     self._stop_tray()
                     self.status_var.set("托盘图标已关闭（点 × 直接退出）")
-            elif key == "screen_hotkeys":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
-                if value:
-                    self._start_hotkey_listener()
-                else:
-                    self._stop_hotkey_listener()
-                    self.status_var.set("已停用熄屏热键")
             elif key == "screen_auto_relight_min":
                 self.cfg[key] = max(0, min(120, int(value)))
                 save_config(self.cfg)
@@ -6436,6 +6729,10 @@ class App:
             self.status_var.set("熄灭方式：拓扑断开（副屏移除，主屏不动）")
         else:
             self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
+        # v2.01.22（走查 P-29）：切模式必须重建列表 ——
+        # topology 才列"断开的物理屏"，ddc/system 只留 VDD。
+        # 原来只 probe_screens，用户切到 topology 后看不到能接回的屏。
+        self.refresh_monitors(silent=True)
         # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
         self.probe_screens()
 
@@ -6478,21 +6775,58 @@ class App:
         finally:
             release_targets(targets)
         self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
-        # 拓扑模式额外列出「断开但设备还在」的屏；ddc/system 一律清空。
-        # 顺手记下虚拟显示器的设备名：它们不能有逐台按钮（见 _row_action_button）。
-        if self.cfg.get("screen_off_method") == "topology":
-            try:
-                rows = ccd_probe_topology()
-                self._vdd_devs = {_short_dev(r.get("gdi"))
-                                  for r in rows if r.get("vdd")}
-                self.topo_inactive = topology_inactive_rows(rows)
-            except Exception:
-                self._vdd_devs = set()
-                self.topo_inactive = []
-        else:
+        # v2.01.21：CCD 探测（QDC_ALL_PATHS，实测 0.1ms）在**任何模式**都做：
+        #   1) 填 `_ccd_names` —— DDC 读型号要 6.2 秒，期间先用真实友好名显示，
+        #      别让用户看"显示器 0"（截图实证）；
+        #   2) 填 `topo_inactive` —— 虚拟显示器始终列出来。以前只有 topology
+        #      模式才列，默认 ddc 模式下串流在跑也看不见 VDD（用户报"没刷新出
+        #      虚拟显示器"）。物理断开屏仍只在 topology 模式列（只有它能接回）。
+        try:
+            rows = ccd_probe_topology()
+            self._vdd_devs = {_short_dev(r.get("gdi"))
+                              for r in rows if r.get("vdd")}
+            self._ccd_names = {_short_dev(r.get("gdi")): r.get("friendly")
+                               for r in rows
+                               if r.get("gdi") and r.get("friendly")}
+            inactive = topology_inactive_rows(rows)
+            if self.cfg.get("screen_off_method") == "topology":
+                self.topo_inactive = inactive
+            else:
+                # 非拓扑模式：只留 VDD（灰显、无操作按钮），它代表串流在跑
+                self.topo_inactive = [r for r in inactive if r.get("vdd")]
+        except Exception:
             self._vdd_devs = set()
+            self._ccd_names = {}
             self.topo_inactive = []
         self.mon_panel.rebuild(self._restore_selection(prev))
+
+    def _first_run_detect(self):
+        """首次启动补一次全量检测，并补写显示器锚点（v2.01.17，v2.01.19 修）。
+
+        v2.01.19 修：原实现无条件 `list(range(len(self.monitors)))`，把老配置
+        里"用户只勾了一块屏"的选择**静默改成全选**。现在按配置解析：
+        `resolve_monitors()` 返回 [] 才表示"配置里确实没有选择信息"= 全选；
+        有选择就按原选择补锚点，不动物理勾选语义。
+        """
+        if not self.monitors:
+            return
+        # 全量检测一次（启动链路里已有一次 probe_screens，这里再补一次是
+        # 为了 after_idle 时窗口已可见、显示器句柄都稳定了，读数更可靠）
+        self.probe_screens()
+        idx = resolve_monitors(self.cfg) or list(range(len(self.monitors)))
+        anchors = selection_anchors(idx)
+        if not anchors:
+            dlog("app.first_run_detect", err="拿不到锚点", idx=idx)
+            return
+        # v2.01.24（走查 R-02 转正）：只写 anchors，**不动 monitors/monitor_ids**。
+        # 用户配的 `monitors: []` 是"全部"语义；写成 [0,1] 会把"全部"固化成
+        # "这两块"，以后插新屏不会自动纳入。anchors 只用来让定时任务认得住屏，
+        # 不承担"范围"语义。
+        self.cfg["monitor_anchors"] = anchors
+        ok, err = save_config(self.cfg)
+        dlog("app.first_run_detect", idx=idx, anchors=anchors, saved=ok, err=err)
+        if ok:
+            self.status_var.set("已自动识别 %d 块显示器" % len(idx))
 
     def is_vdd(self, index):
         """这一行是不是虚拟显示器 —— 归串流软件管，不给逐台按钮。"""
@@ -6500,6 +6834,18 @@ class App:
             return False
         dev = _short_dev(self.monitors[index].get("dev"))
         return bool(getattr(self, "_vdd_devs", ()) and dev in self._vdd_devs)
+
+    def ccd_friendly(self, index):
+        """这块屏在 CCD 里的友好名（v2.01.19）。
+
+        DDC 枚举出来的 `desc` 恒为 "Generic PnP Monitor"（真机实测），
+        拿它当名字会让 VDD 显示成物理屏的通用名。CCD 的
+        `monitorFriendlyDeviceName` 才是用户看到的 "VDD by MTT" / "R27qe Gen2"。
+        """
+        if index >= len(self.monitors):
+            return ""
+        dev = _short_dev(self.monitors[index].get("dev"))
+        return (getattr(self, "_ccd_names", {}) or {}).get(dev) or ""
         if not self.monitors:
             self.status_var.set(
                 "未检测到显示器：请确认显示器 OSD 已开 DDC/CI，且用 HDMI/DP/DVI 直连")
@@ -6540,8 +6886,8 @@ class App:
         self._poll_read_queue()
 
     def _poll_read_queue(self):
-        # 走查 E1-03：hotkey 分支直接调 screen_on/off → run_bg 内又同步调
-        # _poll_read_queue，每次重入都会多挂一条 after(150)，链数随热键次数
+        # 走查 E1-03：screen_action 分支直接调 screen_on/off → run_bg 内又同步调
+        # _poll_read_queue，每次重入都会多挂一条 after(150)，链数随调用次数
         # 线性增长且永不回落。用 _polling 护栏保证同时只有一条链。
         if getattr(self, "_polling", False):
             return
@@ -6557,11 +6903,8 @@ class App:
                 kind, payload, _extra = self._read_queue.get_nowait()
             except queue.Empty:
                 break
-            if kind == "hotkey":
+            if kind == "screen_action":
                 (self.screen_off if payload == "off" else self.screen_on)()
-                continue
-            if kind == "hotkey_error":
-                self.status_var.set(payload)
                 continue
             if kind != "done":
                 continue
@@ -6578,7 +6921,7 @@ class App:
                 # 忙时排队的屏幕请求：当前动作一结束就补执行（只一次）
                 if busy:
                     self._dispatch_pending_screen()
-        if self._bg_tasks > 0 or self._hotkeys_on or self._relight_pending:
+        if self._bg_tasks > 0 or self._relight_pending:
             self.root.after(150, self._poll_read_queue)
 
     def _set_actions_enabled(self, enabled):
@@ -6822,6 +7165,12 @@ class App:
     def _ask_heir(self, index, off_anchors):
         """弹窗让用户挑一块屏接任主显示器。"""
         cands = topology_heir_candidates(off_anchors)
+        # 诊断（v2.01.13）：候选数用户报过"该有 2 个却只显示 1 个"。
+        # 这里把候选来源与每块屏的状态落日志，下次出现时一眼能看出
+        # 是 targetAvailable=0 还是查询失败——只记录，不改任何行为。
+        dlog("app.heir_prompt", off=list(off_anchors), count=len(cands),
+             candidates=[{"anchor": c["anchor"], "vdd": c["vdd"],
+                          "active": c["active"]} for c in cands])
         if not cands:
             self.msg.showwarning(
                 "没有屏可以接任主显示器",
@@ -6859,9 +7208,9 @@ class App:
                     self._finish_screen_on, busy=True)
 
     def _queue_screen_action(self, action):
-        """忙时点击/热键：给可见反馈，并记下最后一次请求，结束后补执行一次。
+        """忙时点击：给可见反馈，并记下最后一次请求，结束后补执行一次。
 
-        v1.9.5：之前 `_busy` 窗口内直接静默 return，热键也一样，用户看到的是
+        v1.9.5：之前 `_busy` 窗口内直接静默 return，用户看到的是
         「点了没反应」。这里只做排队记账，**不启动任何屏幕动作**，因此不改变
         熄灭/点亮调用链，也不改变 `_busy` 窗口长度。
         """
@@ -6925,7 +7274,7 @@ class App:
             # 否则残留 timer 会在用户已手动点亮后触发一次"无缘无故的点亮"。
             self._cancel_relight_timer()
             self._relight_timer = threading.Timer(
-                mins * 60, lambda: self._read_queue.put(("hotkey", "on", None)))
+                mins * 60, lambda: self._read_queue.put(("screen_action", "on", None)))
             self._relight_timer.start()
         if self.cfg.get("screen_off_method") == "topology":
             # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
@@ -7023,59 +7372,6 @@ class App:
                 pass
             self.tray = None
 
-    def _start_hotkey_listener(self):
-        if self._hotkeys_on:
-            return
-        self._hotkeys_on = True
-        # 走查 E2-06：tid 提前到线程启动前写入，避免"开→立刻关"时
-        # _stop_hotkey_listener 看到 None 不发 WM_QUIT、旧线程泄漏。
-        self._hotkey_tid = None
-        ready = threading.Event()
-
-        def listener():
-            user32 = ctypes.windll.user32
-            mods = 0x0001 | 0x0002 | 0x0004 | 0x4000
-            ids = {1: ("off", 0x4F), 2: ("on", 0x50)}
-            registered = []
-            self._hotkey_tid = threading.get_ident()
-            ready.set()
-            for hid, (_act, vk) in ids.items():
-                if not user32.RegisterHotKey(None, hid, mods, vk):
-                    # 走查 E1-04：第 2 个失败必须回滚第 1 个，
-                    # 否则系统里留下指向已退出线程的全局热键。
-                    for done in registered:
-                        try:
-                            user32.UnregisterHotKey(None, done)
-                        except Exception:
-                            pass
-                    self._hotkeys_on = False
-                    self._hotkey_tid = None
-                    self._read_queue.put(("hotkey_error",
-                                          "热键注册失败（可能被其他程序占用）", None))
-                    return
-                registered.append(hid)
-            msg = ctypes.wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                if msg.message == 0x0312 and msg.wParam in ids:
-                    self._read_queue.put(("hotkey", ids[msg.wParam][0], None))
-            # E2-06：只注销自己注册的 hid；关→开极快时旧线程的 unregister
-            # 不会误伤新线程刚注册的同一个 hid（系统按 hid 独立持有）。
-            for hid in registered:
-                try:
-                    user32.UnregisterHotKey(None, hid)
-                except Exception:
-                    pass
-
-        threading.Thread(target=listener, daemon=True).start()
-        ready.wait(timeout=2)         # 等 tid 就绪，让随后的 stop 能发 WM_QUIT
-        self.status_var.set("熄屏热键已启用（Ctrl+Alt+Shift+O / P）")
-
-    def _stop_hotkey_listener(self):
-        self._hotkeys_on = False
-        if self._hotkey_tid is not None:
-            ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
-            self._hotkey_tid = None
-
     # ---------- 托盘 ----------
     def _tray_image(self):
         from PIL import Image, ImageDraw
@@ -7129,6 +7425,11 @@ class App:
     def _tray_show_main(self):
         self.root.deiconify()
         self.root.lift()
+        # v2.01.22（走查 P-30）：窗口在托盘里期间可能拔插过屏、开关过串流，
+        # 打开时必须重读，否则列表还是最小化前那一份（用户报"打开没有
+        # 刷新出虚拟显示器"的另一条路径）。
+        self.refresh_monitors(silent=True)
+        self.probe_screens()
         self.status_var.set("就绪")
 
     def _tray_toggle_schedule(self):
@@ -7153,7 +7454,6 @@ class App:
 
     def _tray_quit(self):
         self._stop_tray()
-        self._stop_hotkey_listener()
         self.root.destroy()
 
     def _on_close(self):
@@ -7164,7 +7464,6 @@ class App:
             self.root.withdraw()
             self.status_var.set("已最小化到托盘（右下角图标，右键可退出）")
             return
-        self._stop_hotkey_listener()
         self.root.destroy()
 
     # ---------- 启动自检（只校验任务，不执行业务动作） ----------
@@ -7630,6 +7929,8 @@ def cli_screen(action):
 
 def main():
     args = sys.argv[1:]
+    # v2.01.20：不自动迁移旧配置（用户决策：每台电脑各用各的）。
+    # 旧 APPDATA 文件只在界面上提示一句，由用户决定是否手动拷贝。
     _migrate_old_logs()
     dlog("app.start", ver=APP_VERSION, argv=args,
          packaged=bool(getattr(sys, "frozen", False)),

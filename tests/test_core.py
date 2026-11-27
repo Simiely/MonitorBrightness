@@ -37,10 +37,14 @@ def setUpModule():
     """
     global _MODULE_TMP
     _MODULE_TMP = tempfile.mkdtemp(prefix="mb-test-module-")
+    _MODULE_LEGACY = os.path.join(_MODULE_TMP, "legacy")
     mb.CONFIG_DIR = _MODULE_TMP
     mb.CONFIG_FILE = os.path.join(_MODULE_TMP, "config.json")
     mb.LOG_DIR = _MODULE_TMP
     mb.EVENTS_FILE = os.path.join(_MODULE_TMP, "events.log")
+    # v2.01.20：save_config 会把配置镜像到 APPDATA，模块级也必须隔离，
+    # 否则任何没继承 TempConfigCase 的用例都会写进用户真实配置。
+    mb._LEGACY_CONFIG_DIR = _MODULE_LEGACY
 
 
 def tearDownModule():
@@ -61,21 +65,27 @@ def pump_ui(root, rounds=2):
 
 
 class TempConfigCase(unittest.TestCase):
-    """把 CONFIG_DIR / CONFIG_FILE / EVENTS_FILE 指到临时目录。"""
+    """把 CONFIG_DIR / CONFIG_FILE / EVENTS_FILE 指到临时目录。
+
+    v2.01.20：`_LEGACY_CONFIG_DIR` 也必须一起指走 —— `save_config` 现在会
+    镜像一份配置到 APPDATA 当迁移种子，不隔离的话单测会覆盖**用户真实配置**
+    （走查时自查发现，属 P-24）。
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mb-test-")
         self._old = (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR)
+                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR)
         mb.CONFIG_DIR = self.tmp
         mb.CONFIG_FILE = os.path.join(self.tmp, "config.json")
         mb.LOG_DIR = self.tmp
         mb.EVENTS_FILE = os.path.join(self.tmp, "events.log")
         mb.CONFIG_LOAD_ERROR = ""
+        mb._LEGACY_CONFIG_DIR = os.path.join(self.tmp, "legacy")
 
     def tearDown(self):
         (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR) = self._old
+         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR) = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -115,9 +125,9 @@ class ConfigTest(TempConfigCase):
         self.assertEqual([s["time"] for s in cfg["slots"]], ["09:00", "20:00"])
         self.assertEqual([s["level"] for s in cfg["slots"]], [80, 30])
 
-    def test_default_off_method_is_ddc(self):
-        """v1.9.3：默认熄灭方式恢复 v1.8.5 的 ddc。"""
-        self.assertEqual(mb.default_config()["screen_off_method"], "ddc")
+    def test_default_off_method_is_topology(self):
+        """v2.01.23：默认熄灭方式是拓扑断开（不碰面板电源，风险最低）。"""
+        self.assertEqual(mb.default_config()["screen_off_method"], "topology")
 
     def test_migrated_system_is_restored_to_ddc_with_log(self):
         """v1.9.3：撤销 v1.9.0 的 ddc→system 迁移；反向恢复必须落日志。"""
@@ -483,7 +493,9 @@ class FastFlipTest(TempConfigCase):
 
     def test_fast_path_gate_needs_ddc_and_switch_allowed(self):
         cfg = mb.default_config()
-        self.assertEqual(cfg["screen_off_method"], "ddc")
+        # 显式指定 ddc：默认值可能变（v2.01.23 改成 topology），
+        # 这条用例测的是"ddc 模式下的快速点亮闸门"，不该依赖默认值。
+        cfg["screen_off_method"] = "ddc"
         self.assertTrue(cfg["wake_fast_flip"])
 
         calls = []
@@ -1338,17 +1350,40 @@ class SelectionAnchorsTest(unittest.TestCase):
         targets = [{"index": 0, "dev": "DISPLAY1", "primary": True},
                    {"index": 1, "dev": "DISPLAY2", "primary": False}]
         rows = [
-            {"anchor": "A1", "gdi": "\\\\.\\DISPLAY1", "vdd": False,
+            {"anchor": "A1", "gdi": "\\\\.\\DISPLAY1", "vdd": False, "active": True,
              "aliases": ["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"]},
-            {"anchor": "A2", "gdi": "\\\\.\\DISPLAY2", "vdd": False,
+            {"anchor": "A2", "gdi": "\\\\.\\DISPLAY2", "vdd": False, "active": True,
              "aliases": ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY1"]},
-            {"anchor": "V1", "gdi": "\\\\.\\DISPLAY92", "vdd": True, "aliases": []},
+            {"anchor": "V1", "gdi": "\\\\.\\DISPLAY92", "vdd": True, "active": False,
+             "aliases": []},
         ]
         with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
             self.assertEqual(mb.selection_anchors([0], targets), ["A1"])
             self.assertEqual(mb.selection_anchors([1], targets), ["A2"])
             self.assertEqual(mb.selection_anchors([0, 1], targets), ["A1", "A2"])
             self.assertEqual(mb.selection_anchors([], targets), [])   # 空=全部，不锚死
+
+    def test_inactive_screen_with_same_gdi_does_not_steal_anchor(self):
+        """v2.01.18：断开屏 gdi 撞名主屏时，不能把它一起命中。
+
+        用户 19:46 截图实证：主屏 active DISPLAY1，断开屏 inactive 也残留
+        DISPLAY1。selection_anchors 若按 gdi 匹配不排除 inactive，会把两块
+        都命中 → 交接弹窗 skip 掉两块 → 候选只剩 VDD（该有 2 个却只有 1 个）。
+        """
+        targets = [{"index": 0, "dev": "DISPLAY1", "primary": True}]
+        rows = [
+            {"anchor": "A1", "gdi": "\\\\.\\DISPLAY1", "vdd": False,
+             "active": True, "connected": True},
+            {"anchor": "A2", "gdi": "\\\\.\\DISPLAY1", "vdd": False,
+             "active": False, "connected": True},
+            {"anchor": "VDD", "gdi": "\\\\.\\DISPLAY92", "vdd": True,
+             "active": False, "connected": True},
+        ]
+        with unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+            anchors = mb.selection_anchors([0], targets)
+        self.assertEqual(anchors, ["A1"])          # 只命中主屏，不带 A2
+        cands = mb.topology_heir_candidates(anchors, rows=rows)
+        self.assertEqual([c["anchor"] for c in cands], ["A2", "VDD"])  # 候选 2 个
 
 
 class _FakeU32:
@@ -1544,6 +1579,9 @@ class WalkthroughRound2Test(TempConfigCase):
         取消了，这条回归改成：无论成败，apply_schedule 都不许写配置。）
         """
         cfg = mb.default_config()
+        # 显式选 ddc：这条用例要的是"走 screen_off_cfg 这条路时也不写状态"，
+        # 与默认值无关（v2.01.23 默认改 topology 后不能再依赖默认）。
+        cfg["screen_off_method"] = "ddc"
         cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80, "screen": "off"}])
         with unittest.mock.patch.object(mb, "active_slot_dict",
                                         return_value={"level": 80, "screen": "off"}), \
@@ -1556,6 +1594,26 @@ class WalkthroughRound2Test(TempConfigCase):
         self.assertNotIn("screen_state", cfg)
         self.assertEqual(ok, [0])                # 亮度成功仍保留在返回值里
         self.assertTrue(errs)                    # 屏幕动作错误必须上报
+
+    def test_save_config_does_not_touch_legacy_dir(self):
+        """v2.01.20（用户决策）：不迁移、不镜像，旧 APPDATA 目录一个字节不动。"""
+        cfg = mb.default_config()
+        cfg["tray_enabled"] = False
+        self.assertTrue(mb.save_config(cfg)[0])
+        self.assertFalse(os.path.exists(mb._LEGACY_CONFIG_DIR),
+                         "不迁移策略下不能创建/写入旧目录")
+
+    def test_old_config_present_detects_but_does_not_copy(self):
+        """旧配置只在存在时被报告，绝不自动拷到程序目录。"""
+        os.makedirs(mb._LEGACY_CONFIG_DIR, exist_ok=True)
+        old = os.path.join(mb._LEGACY_CONFIG_DIR, "config.json")
+        with open(old, "w", encoding="utf-8") as f:
+            f.write('{"legacy": true}')
+        self.assertEqual(mb.old_config_present(), old)
+        self.assertFalse(os.path.exists(mb.CONFIG_FILE), "不能自动复制")
+        # 程序目录已有配置时，不再提示
+        self.assertTrue(mb.save_config(mb.default_config())[0])
+        self.assertEqual(mb.old_config_present(), "")
 
     def test_save_config_is_pure_write(self):
         """v2.01.0：保存就是整份写盘，不再与磁盘合并运行态（已经没有运行态字段）。"""
@@ -1656,6 +1714,7 @@ class WalkthroughRound2Test(TempConfigCase):
             cfg=cfg,
             msg=types.SimpleNamespace(askyesno=lambda *a, **k: True),
             status_var=types.SimpleNamespace(set=lambda t: None),
+            refresh_monitors=lambda silent=False: None,
             probe_screens=lambda: None)
         with unittest.mock.patch.object(mb, "save_config", return_value=(True, "")):
             mb.App.apply_off_method(fake, "system")
@@ -1874,10 +1933,11 @@ class _TopoFixture(TempConfigCase):
 class TopologyActionTest(_TopoFixture):
     """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
 
-    def test_config_option_added_without_changing_default(self):
+    def test_topology_is_default_off_method(self):
+        """v2.01.23：拓扑断开成为默认（原用例名是"新增选项但不改默认"）。"""
         self.assertIn("topology", mb.OFF_METHODS)
         self.assertEqual(mb.coerce_setting("screen_off_method", "topology"), "topology")
-        self.assertEqual(mb.default_config()["screen_off_method"], "ddc")
+        self.assertEqual(mb.default_config()["screen_off_method"], "topology")
 
     def test_plan_hands_over_primary_to_other_physical_screen(self):
         """只断主屏时，接班屏优先**物理屏**（用户看得见），而不是虚拟屏。"""
@@ -2650,6 +2710,26 @@ class VddNameTest(unittest.TestCase):
         self.assertEqual(name, "显示器 2")
         self.assertFalse(is_vdd)
 
+    def test_physical_uses_ccd_friendly_before_model_arrives(self):
+        """v2.01.21：DDC 读型号要 6.2 秒，期间用 CCD friendly 顶上。"""
+        name, is_vdd = mb.display_name_for_row(
+            2, {"vdd": False, "friendly": "R27qe Gen2"}, {})
+        self.assertEqual(name, "R27qe Gen2")     # 不是"显示器 2"
+        self.assertFalse(is_vdd)
+        # 型号缓存到位后仍以完整型号为准
+        name2, _ = mb.display_name_for_row(
+            2, {"vdd": False, "friendly": "R27qe Gen2"}, {2: "Legion R27qe Gen2"})
+        self.assertEqual(name2, "Legion R27qe Gen2")
+
+    def test_generic_pnp_desc_is_not_a_name(self):
+        """v2.01.22（P-28）：desc 恒为 "Generic PnP Monitor"，不能当名字显示。"""
+        name, _ = mb.display_name_for_row(
+            2, {"vdd": False, "friendly": "Generic PnP Monitor"}, {})
+        self.assertEqual(name, "显示器 2")
+        name2, _ = mb.display_name_for_row(
+            2, {"vdd": False, "friendly": "generic pnp monitor  "}, {})
+        self.assertEqual(name2, "显示器 2")
+
 
 class DefaultLayoutTest(TempConfigCase):
     """「恢复双屏」的默认布局快照：落盘、读回、校验后才写回。"""
@@ -2728,6 +2808,184 @@ class DefaultLayoutTest(TempConfigCase):
         self.assertEqual(mb.coerce_setting("restore_delay", 999), 120)
         self.assertEqual(mb.coerce_setting("restore_delay", -5), 0)
         self.assertEqual(mb.coerce_setting("restore_delay", "abc"), 10)
+
+    def test_restore_skips_vdd_anchor_in_verify(self):
+        """v2.01.19：快照含 VDD 时，回读验证只等物理屏，不能误报超时。"""
+        class FakeU32:
+            def SetDisplayConfig(self, pc, paths, mc, modes, flags):
+                return 0
+
+        snap = self._snap()
+        snap["targetAnchors"] = ["A1", "VDD"]
+        waited = {}
+
+        def fake_wait(anchors, expect, **kw):
+            waited["anchors"] = list(anchors)
+            return True
+
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=FakeU32()), \
+                unittest.mock.patch.object(mb, "_ccd_apply", return_value=0), \
+                unittest.mock.patch.object(
+                    mb, "ccd_probe_topology",
+                    return_value=[{"anchor": "VDD", "vdd": True}]), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", fake_wait), \
+                unittest.mock.patch.object(mb, "dlog"):
+            err = mb.restore_default_layout(snap=snap)
+        self.assertIsNone(err)
+        self.assertEqual(waited["anchors"], ["A1"])     # VDD 被排除
+
+
+class TooltipTest(unittest.TestCase):
+    """v2.01.15：设置说明改成悬停气泡；气泡要能显示、隐藏、不泄漏。"""
+
+    def test_tooltip_show_hide(self):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            old = mb.Tooltip.DELAY_MS
+            mb.Tooltip.DELAY_MS = 1
+            widget = tk.Label(root, text="设置项")
+            widget.pack()
+            tip = mb.Tooltip(widget, "悬停说明")
+            tip._show()
+            root.update_idletasks()
+            self.assertIsNotNone(tip._win)
+            # 气泡里是一个 Frame + Label，文字必须正确
+            labels = [w for w in tip._win.winfo_children()[0].winfo_children()
+                      if isinstance(w, tk.Label)]
+            self.assertEqual(len(labels), 1)
+            self.assertEqual(labels[0].cget("text"), "悬停说明")
+            tip._on_leave()
+            self.assertIsNone(tip._win)
+            mb.Tooltip.DELAY_MS = old
+        finally:
+            root.destroy()
+
+    def test_tooltip_on_child_widget(self):
+        """v2.01.16 回归：Tk 的 <Enter> 不冒泡，子控件必须也被绑定。
+
+        不断言 event_generate 后气泡立刻可见 —— 那是事件队列时序，CI 上会
+        flake（见模块顶部 pump_ui 的同样教训）。改断言结构性事实：bind_tree
+        覆盖了每个后代且都绑上了 <Enter>；气泡本身由 show_hide 用例验证。
+        """
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            fake = types.SimpleNamespace(root=root, cfg=mb.default_config())
+            sheet = mb.Sheet(fake, "测试", width=400)
+            card = sheet.section("分组")
+            row = sheet.row(card, "设置项", tip="悬停说明",
+                            builder=lambda p: tk.Label(p, text="开关").pack())
+            root.update_idletasks()
+            tip_obj = row.tooltip
+            all_widgets = []
+            def walk(w):
+                all_widgets.append(w)
+                for c in w.winfo_children():
+                    walk(c)
+            walk(row)
+            self.assertGreater(len(all_widgets), 3)
+            for w in all_widgets:
+                self.assertIn(id(w), tip_obj._bound,
+                              "子控件 %s 没被 tooltip 绑定" % w.winfo_class())
+            sheet.destroy()
+        finally:
+            root.destroy()
+
+    def test_tooltip_keeps_widget_own_hover_binding(self):
+        """v2.01.19 回归：Tooltip 必须用 add="+" 追加，不能覆盖控件自身的
+        <Enter>（自绘 Button 用它做 hover 高亮），否则悬停说明有了、按钮不再亮。
+        """
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            base = mb.Button(root, "基线", lambda: None, kind="link",
+                             height=22, font_size=8)
+            root.update_idletasks()
+            base_blocks = base.bind("<Enter>").count("if {")
+            self.assertEqual(base_blocks, 1)          # 自带一个 hover 绑定
+            fake = types.SimpleNamespace(root=root, cfg=mb.default_config())
+            sheet = mb.Sheet(fake, "测试", width=400)
+            card = sheet.section("分组")
+            holder = {}
+            def build(p):
+                b = mb.Button(p, "记住", lambda: None, kind="link",
+                              height=22, font_size=8)
+                b.pack()
+                holder["b"] = b
+            sheet.row(card, "设置项", tip="说明", builder=build)
+            root.update_idletasks()
+            after = holder["b"].bind("<Enter>").count("if {")
+            self.assertEqual(after, base_blocks + 1)  # 原有 + Tooltip，未被覆盖
+            sheet.destroy()
+        finally:
+            root.destroy()
+
+    def test_remember_btn_flashes_result(self):
+        """v2.01.25：设置弹层挡住主窗口状态卡，「记住」必须在按钮上给回执。"""
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            btn = mb.Button(root, "记住", None, kind="link",
+                            height=22, font_size=8)
+            fake = types.SimpleNamespace(_remember_btn=btn)
+            self.assertEqual(btn.text(), "记住")
+            mb.App._flash_remember_btn(fake, "已记住 ✓")
+            self.assertEqual(btn.text(), "已记住 ✓")
+            mb.App._restore_remember_btn(fake, btn)
+            self.assertEqual(btn.text(), "记住")
+            # 弹层先关（按钮已销毁）时静默跳过，不能抛
+            btn.destroy()
+            mb.App._flash_remember_btn(fake, "已记住 ✓")
+            mb.App._restore_remember_btn(fake, btn)
+        finally:
+            root.destroy()
+
+    def test_row_tip_hides_sub(self):
+        """row 传了 tip 就不显示 sub 文字；不传 tip 的 HeirSheet 行为不变。"""
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:                       # pragma: no cover
+            self.skipTest("没有可用显示：%s" % e)
+        try:
+            fake = types.SimpleNamespace(root=root, cfg=mb.default_config())
+            sheet = mb.Sheet(fake, "测试", width=400)
+            card = sheet.section("分组")
+            def texts_in(row):
+                out = []
+                for w in row.winfo_children():
+                    if isinstance(w, tk.Label):
+                        out.append(w.cget("text"))
+                    else:
+                        out.extend(c.cget("text") for c in w.winfo_children()
+                                   if isinstance(c, tk.Label))
+                return out
+
+            row = sheet.row(card, "设置项", sub="常显说明", tip="悬停说明")
+            self.assertEqual(texts_in(row), ["设置项"])       # sub 被藏进气泡
+            row2 = sheet.row(card, "另一项", sub="常显说明")
+            self.assertEqual(texts_in(row2), ["另一项", "常显说明"])  # 不传 tip 不变
+            sheet.destroy()
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":

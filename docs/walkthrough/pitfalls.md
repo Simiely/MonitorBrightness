@@ -160,6 +160,131 @@
 - **附带**：`SDC_VALIDATE`(0x40) 让"试提交"变成无副作用的操作，两者合起来
   就是完整的真机验证闭环——不碰硬件、不麻烦用户。
 
+## 第 5 类根因：修了"名字"却没修"名字的来源"（v2.01.19 走查沉淀）
+
+### P-18 · VDD 名称修复用了恒为常量的字段 ✅ verified
+
+- **现象**：用户报"虚拟显示器当主屏时名称错误"。v2.01.12 改成 VDD 行用
+  `mon.get("desc")` 取名，但真机实测 `enumerate_targets()` 的 `desc`
+  **恒为 `"Generic PnP Monitor"`**（DDC 的物理监视器描述，不是型号名）。
+  修复上线后 VDD 只会显示成 "Generic PnP Monitor"，等于没修。
+- **原因**：把"拿得到字段"当成"字段有信息量"。CCD 的
+  `monitorFriendlyDeviceName` 才是 "VDD by MTT"，DDC 的 desc 是通用驱动名。
+- **解决**：`refresh_monitors` 缓存 CCD friendly（`_ccd_names`，按 gdi 归一），
+  `App.ccd_friendly(index)` 优先返回它，desc 只作兜底。
+- **预防**：走查时对"用来显示的字段"必须真机打印取值，不能只看字段存在。
+- **相关**：`ccd_friendly:6710`、`rebuild` 名称行。
+
+### P-19 · 验证条件把目标自己过滤掉 → 永远等不到 ✅ verified
+
+- **现象**：串流形态（VDD 当主屏）下点过「记住布局」，之后「恢复双屏」
+  布局已写回，却提示"2 秒内没读到确认"。
+- **原因**：快照 `targetAnchors` 含 VDD；`_ccd_wait_state(..., allow_vdd=False)`
+  把 VDD 从**回读结果**里过滤掉，而 `wanted` 仍含 VDD → 集合永不满足。
+- **解决**：验证前按当前拓扑剔掉 VDD 锚点，只等物理屏。
+- **预防**：凡是"wanted ⊆ got"的等待，先检查过滤条件会不会把 wanted 里的元素
+  从 got 里剔掉。
+- **相关**：`restore_default_layout:3491`、`_ccd_wait_state:1733`。
+
+### P-20 · 绑事件不带 add 覆盖了控件自己的 hover ✅ verified
+
+- **现象**：悬停说明加上后，设置页「记住/日志/导出」按钮不再高亮。
+- **原因**：`Tooltip._bind` 用 `widget.bind("<Enter>", cb)` 不带 `add="+"`，
+  把自绘 `Button` 自己的 `<Enter>`（hover 高亮）整条替换了。
+- **解决**：四个事件全部 `add="+"` 追加。
+- **预防**：给"别人的控件"绑事件一律 `add="+"`；只有自己独占的控件才替换。
+- **相关**：`Tooltip._bind:5124`。
+
+### P-23 · "补默认值"把用户已有的选择改成全选 ✅ verified
+
+- **现象**：老配置（有 `monitors`、没有 `monitor_anchors`）首次跑新版，
+  `_first_run_detect` 无条件 `list(range(len(monitors)))` → 用户只勾一块屏
+  的选择被静默改成全选。
+- **原因**：把"缺锚点"当成"没有选择"。
+- **解决**：先 `resolve_monitors(cfg)` 解析原选择，返回 [] 才按全选兜底。
+- **预防**：任何"补默认值"的分支，先问"用户是不是已经表达过偏好"。
+- **相关**：`_first_run_detect:6680`。
+
+### P-25 · 把"读得慢"当成"读不到" ✅ verified
+
+- **现象**：新版首次启动，显示器只显示"显示器 0/1"，几秒后才变真名；
+  虚拟显示器整条不见。用户报"打开没有刷新出虚拟显示器"。
+- **原因**：① `monitor_model()` 走 DDC 读 EDID，**真机实测两块屏 6213ms**；
+  旧配置有 `models` 缓存所以秒显，配置一重置就只能先显示"显示器 N"。
+  ② `refresh_monitors` 只在 topology 模式才探测断开屏，默认 ddc 模式下
+  `topo_inactive` 直接清空 → VDD 不列。
+- **解决**：① `ccd_probe_topology()` 只要 0.5ms，改为**任何模式**都调，
+  填 `_ccd_names`；`display_name_for_row` 在型号未到位时用 CCD friendly 兜底。
+  ② ddc/system 模式也列 VDD（灰显、无按钮），物理断开屏仍只 topology 列。
+- **预防**：界面上任何"看起来是空/默认值"的地方，先量一次真实耗时——
+  6 秒的空窗在用户眼里就是 bug，不是"正在加载"。
+- **相关**：`refresh_monitors:6664`、`display_name_for_row:3506`。
+
+### P-26 · 换版本目录 = 悄悄丢配置 ✅ verified
+
+- **现象**：每次发新版（新 `dist_v201xx` 目录）用户都要重新设置一遍；
+  以为是"配置没保存"。
+- **原因**：v2.01.17 配置便携化到程序同目录，而打包脚本每次建新目录 →
+  新目录没有 config.json。
+- **解决**：打包目录固定为 `dist`，覆盖 exe、配置与日志原地保留。
+- **预防**：任何"数据跟着程序走"的设计，必须同时固定程序的**落地路径**；
+  否则便携化反而制造了"每次都是新装"的体验。
+- **相关**：`_build.py:14`。
+
+## 第 6 类根因：同一个 Tk 机制坑踩了三次（v2.01.22 沉淀）
+
+### P-27 · 滚轮靠父容器的 Enter 绑定 → 在子控件上失灵 ✅ verified
+- **现象**：设置页滚动条能拖，但滚轮怎么滚都不动。
+- **原因**：`canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>"))`
+  —— 鼠标从窗口外直接进到 Label/Frame 上时，Canvas 收不到 `<Enter>`
+  （Tk 事件不冒泡，和 P-20 同源），`bind_all` 从未执行。
+- **解决**：`show()` 时直接 `bind_all`，`<Destroy>`/`close()` 解绑；
+  无滚动条时不吞滚轮。
+- **预防**：Tk 里"整块区域响应某事件"一律递归绑子树或 `bind_all`，
+  不要指望父容器的 Enter。
+
+### P-29 · 切换模式只重探状态、不重建列表 ✅ verified
+- **现象**：熄灭方式从「单屏待机」切到「拓扑断开」，能接回的物理屏不出现；
+  切回来断开的屏又不会消失。
+- **原因**：`apply_off_method` 末尾只 `probe_screens()`，没 `refresh_monitors()`；
+  而"列不列断开屏"取决于 `refresh_monitors` 里的模式分支。
+- **解决**：切完补 `refresh_monitors(silent=True)` 再探测。
+- **预防**：凡是"影响列表内容"的配置项，改完必须走 rebuild 入口。
+
+### P-30 · 托盘唤起只显示窗口、不重读数据 ✅ verified
+- **现象**：窗口最小化到托盘，期间拔插显示器或开关串流，从托盘打开还是旧列表。
+- **原因**：`_tray_show_main` 只 `deiconify()+lift()`。
+- **解决**：唤起时 `refresh_monitors(silent=True)` + `probe_screens()`。
+- **预防**："窗口重新可见"是一个数据可能已过期的信号，要重读。
+
+### P-28 · 驱动占位名被当显示器名 ✅ verified
+- **现象**：CCD 查询失败时，行标题显示 "Generic PnP Monitor"。
+- **原因**：`desc` 兜底，而它是 DDC 的通用描述。
+- **解决**：`display_name_for_row` 过滤该占位名（VDD 分支同样处理）。
+- **预防**：兜底值的"质量"要检查——占位名比"显示器 N"更糟。
+
+### N-10 · 用"机制推理"代替"查文档"，把结论说反 ✅ verified
+
+- **现象**：我告诉用户"默认 topology 与镜像式远控冲突，断开后可能黑屏；
+  DDC 单屏待机不会"。用户要求先检索交叉验证，结果**结论是反的**。
+- **查证结果**：
+  - 微软 DXGI 文档：`DuplicateOutput` 是 **per-output**，显示器增删/模式变化
+    会让 duplication 接口失效、需重建。
+  - Sunshine 文档：`output_name` 可写死 `\\.\DISPLAY1`，但**默认选"默认显示器"**。
+  - Sunshine issue #5673 + 24H2DummyFix：**Win 11 24H2 起，"当前选中的显示器"
+    离线/断电会让 DXGI 整体初始化失败**。
+  - ToDesk 帮助中心：虚拟屏开启后"**原显示器会显示黑屏**"，远程正常；
+    官方明确"可以直接把物理显示器关掉，只靠虚拟屏运行"。
+- **正确结论**：决定因素是"远控抓的那块输出还在不在线"，不是"物理/虚拟"。
+  拓扑把主屏交给在线虚拟屏后，抓主屏的远控**正常**；只有写死 output 名才会失败。
+  反而 DDC 待机在深度睡眠面板上可能触发 24H2 的 DXGI 回归。
+  **默认 topology 恰好保证"总有一块在线屏"，确定性最高。**
+- **本质**：我掌握的是"DXGI 是 per-output 抓取"这个正确机制，却用它推出
+  "所以移除就黑屏"这个**没验证的结论**——忽略了"主屏可以交给另一块在线屏"。
+- **规则**：涉及第三方软件行为的断言，必须找到**该软件的文档/issue/源码**；
+  只有 API 机制时，只能说"机制上会失效，实际取决于对方如何处理"，
+  不能直接下"会黑屏"的结论。
+
 ### N-09 · 段错误不一定是崩的那行代码 ✅ verified
 
 - **现象**：端到端脚本 `finally` 里崩成 access violation，`faulthandler`
