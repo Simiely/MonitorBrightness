@@ -1631,6 +1631,89 @@ class UiDecisionTest(unittest.TestCase):
         self.assertEqual(mb.plan_model_updates({"a": "X"}, {}, 2), [])
 
 
+class UiSmokeTest(unittest.TestCase):
+    """v2.03.0 U0：UI 重构的护栏。
+
+    搬家（拆 ui/ 包）最容易出的错是 import 断掉、控件构造参数错、
+    父类没先定义 —— 这些都不会被业务测试抓到。这里把每个控件真建一遍。
+    故意不建 App（会真去查显示器），也不建弹层（show() 会 grab + 等可见）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import tkinter as tk
+        try:
+            cls.root = tk.Tk()
+            cls.root.withdraw()
+        except Exception as e:                        # pragma: no cover
+            raise unittest.SkipTest("无可用显示：%s" % e)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.root.destroy()
+        except Exception:
+            pass
+
+    def test_widgets_construct(self):
+        """每个自绘控件都要能建出来且能正常销毁。"""
+        import tkinter as tk
+        parent = tk.Frame(self.root, bg="#1c1c1e")
+        made = [
+            mb.Label(parent, "文字"),
+            mb.Label(parent, "小字", size=8, color="#fff"),
+            mb.SectionTitle(parent, "分区标题"),
+            mb.Card(parent),
+            mb.Button(parent, "确定"),
+            mb.Button(parent, "主操作", kind="primary"),
+            mb.Switch(parent, True),
+            mb.Slider(parent, 50),
+            mb.Segmented(parent, ["不变", "熄灭", "点亮"]),
+            mb.WeekdayPicker(parent, [1, 3, 5]),
+            mb.TimeField(parent, "08:30"),
+            mb.ScrollArea(parent, "#1c1c1e"),
+        ]
+        for w in made:
+            w.pack() if hasattr(w, "pack") else None
+        self.root.update_idletasks()
+        # 逐个销毁：能建不能毁同样是 bug（比如 <Destroy> 回调里抛异常）
+        for w in made:
+            w.destroy()
+
+    def test_tooltip_binds_and_unbinds(self):
+        """Tooltip 依赖递归绑子树（P-20），搬家时最容易丢。"""
+        import tkinter as tk
+        parent = tk.Frame(self.root)
+        btn = mb.Button(parent, "带提示")
+        tip = mb.Tooltip(btn, "说明文字")
+        self.assertIsNotNone(tip)
+        btn.destroy()
+
+    def test_button_state_helpers(self):
+        """按钮的可用/文字切换是 UI 最常用的接口，别搬家搬坏。"""
+        import tkinter as tk
+        parent = tk.Frame(self.root)
+        b = mb.Button(parent, "记住")
+        b.set_text("已记住 ✓")
+        self.assertEqual(b.text(), "已记住 ✓")
+        b.set_enabled(False)
+        b.set_enabled(True)
+        b.destroy()
+
+    def test_segmented_and_weekday_get(self):
+        import tkinter as tk
+        parent = tk.Frame(self.root)
+        seg = mb.Segmented(parent, ["a", "b", "c"], index=1)
+        self.assertEqual(seg.get(), 1)
+        seg.index = 2            # Segmented 没有 set_index，用属性 + 重绘
+        seg._draw()
+        self.assertEqual(seg.get(), 2)
+        picker = mb.WeekdayPicker(parent, [6, 7])
+        self.assertEqual(picker.get(), [6, 7])
+        picker.set([1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(picker.get(), [], "选满 7 天归一成每天")
+
+
 class WheelRouterTest(unittest.TestCase):
     """v2.03.1：滚轮改成进程级路由。
 

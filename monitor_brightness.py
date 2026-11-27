@@ -5141,6 +5141,22 @@ def _ui_font(size, bold=False):
 
 _AA_CACHE = {}
 _AA_REFS = []
+_AA_EPOCH = [None]
+
+
+def _aa_sync_epoch():
+    """缓存的 PhotoImage 属于**某个 Tk 解释器**；解释器换了旧图必然失效。
+
+    v2.03.0（写 UI 冒烟测试时暴露）：单测会反复建/销毁 Tk，模块级缓存却留着
+    上一次的 PhotoImage，再用就抛 `TclError: image "pyimageN" doesn't exist`。
+    正常 GUI 全程同一 root 不会遇到，但"同进程重建 GUI"和"测试"都会。
+    这里按解释器标识清一次缓存，比在每个调用点 try/except 更干净。
+    """
+    ep = id(getattr(tk, "_default_root", None))
+    if _AA_EPOCH[0] != ep:
+        _AA_CACHE.clear()
+        _AA_REFS.clear()
+        _AA_EPOCH[0] = ep
 
 
 def _hex_rgba(color):
@@ -5152,6 +5168,7 @@ def _hex_rgba(color):
 
 def _aa_rounded(w, h, radius, fill, outline=None, ow=0):
     """抗锯齿圆角矩形 PhotoImage（4x 超采样 + LANCZOS 缩小，带缓存）。"""
+    _aa_sync_epoch()
     key = ("r", int(w), int(h), int(radius), fill, outline, int(ow))
     got = _AA_CACHE.get(key)
     if got is not None:
@@ -5171,6 +5188,7 @@ def _aa_rounded(w, h, radius, fill, outline=None, ow=0):
 
 def _aa_circle(dia, fill):
     """抗锯齿圆形 PhotoImage（圆点 / 滑块手柄 / 开关圆钮共用）。"""
+    _aa_sync_epoch()
     key = ("c", int(dia), fill)
     got = _AA_CACHE.get(key)
     if got is not None:
