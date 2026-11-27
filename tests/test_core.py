@@ -1262,6 +1262,41 @@ class DiagExportTest(TempConfigCase):
         self.assertIn("磁盘满", err)
 
 
+class SessionEventsTest(TempConfigCase):
+    """界面只显示**本次运行**的事件（v2.01.6）。
+
+    用户反馈：界面底部一直挂着 16:29 / 16:39 那几条「source mode 已不在
+    modes 数组里」，以为程序一直在报错。那其实是一次正常接回的实现细节，
+    被写进了 events.log，而界面又把整个文件的历史读出来显示。
+    """
+
+    def setUp(self):
+        super().setUp()
+        mb._SESSION_EVENTS.clear()
+
+    def tearDown(self):
+        mb._SESSION_EVENTS.clear()
+        super().tearDown()
+
+    def test_history_file_is_not_shown_in_ui(self):
+        with open(mb.EVENTS_FILE, "w", encoding="utf-8") as f:
+            f.write("01-01 08:00 很久以前的事件\n")
+        self.assertEqual(mb.read_session_events(), [])       # 界面什么都拿不到
+        mb._write_event_log("本次事件")
+        got = mb.read_session_events()
+        self.assertEqual(len(got), 1)
+        self.assertIn("本次事件", got[0])
+        # 文件里仍是两行（历史 + 本次），但界面只拿到本次这一条
+        self.assertEqual(len(mb.read_recent_events(10)), 2)
+
+    def test_session_events_are_capped(self):
+        for i in range(60):
+            mb._write_event_log("事件 %d" % i)
+        got = mb.read_session_events(3)
+        self.assertEqual(len(got), 3)
+        self.assertIn("事件 59", got[-1])
+
+
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 
@@ -1929,7 +1964,7 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
                 unittest.mock.patch.object(mb, "current_level", return_value=80), \
                 unittest.mock.patch.object(mb, "set_brightness_many",
                                            return_value=([1], [])), \
-                unittest.mock.patch.object(mb, "_write_event_log"):
+                unittest.mock.patch.object(mb, "_write_event_log") as evt:
             ok, errs = mb.screen_on_cfg(cfg, [1])
         self.assertEqual(errs, [])
         self.assertEqual(seen["mc"], 7)                       # 原 6 条 + 补 1 条
@@ -1937,6 +1972,8 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
         self.assertEqual(int(seen["modes"][6].sourceMode.width), 2560)
         self.assertEqual(int(seen["modes"][6].sourceMode.pixelFormat),
                          mb._CCD_PIXELFORMAT_NONGDI)
+        # 成功的接回不往 events.log 写实现细节（那是 diag.log 的事）
+        evt.assert_not_called()
 
     def test_on_falls_back_to_windows_target_choice(self):
         """降级链只有两档：现算三元组 → source 现算 + target/desktop 交 Windows。"""
@@ -1973,9 +2010,11 @@ class TopologySourceModeSynthesisTest(_TopoFixture):
         # 第一档给了 target mode，第二档交 Windows
         self.assertNotEqual(seq[0][2], 0xFFFFFFFF)
         self.assertEqual(seq[1][2], 0xFFFFFFFF)
-        # 降级必须真的被拒过一次才写日志
+        # 降级必须真的被拒过一次才写日志，且文案是人话（不甩参数名）
         self.assertEqual(len(logs), 1)
-        self.assertIn("被拒 rc=87", logs[0])
+        self.assertIn("rc=87", logs[0])
+        self.assertIn("重试", logs[0])
+        self.assertNotIn("modeInfoIdx", logs[0])
 
     def test_on_first_tier_success_writes_no_warning(self):
         """回归：旧代码在第一档里无条件写"现算 mode 被拒"，一次成功也说降级过。"""

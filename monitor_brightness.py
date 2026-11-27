@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.5"     # 日志改到程序目录；加「导出诊断包」
+APP_VERSION = "2.01.6"     # 界面只显示本次运行的事件（不再挂历史）
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -400,7 +400,9 @@ def shift_time(text, delta_min):
 def _write_event_log(text):
     """追加一行事件日志（线程安全）。返回写入的那一行。
 
-    ⚠️ 只用于旁路记账（任务重建/配置恢复等），不得在熄灭、点亮调用链里使用。
+    ⚠️ 只用于旁路记账（任务重建/配置恢复/降级重试等），不得在熄灭、点亮
+    调用链里写下正常成功的实现细节 —— 那些进 diag.log（dlog），
+    因为它们对用户没有意义，只会让界面看起来"一直在报东西"。
     """
     line = "%s %s" % (datetime.now().strftime("%m-%d %H:%M"), text)
     try:
@@ -413,22 +415,34 @@ def _write_event_log(text):
                 pass
             with open(EVENTS_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            _SESSION_EVENTS.append(line)
+            del _SESSION_EVENTS[:-40]
     except Exception:
         pass
     return line
 
 
+def read_session_events(limit=3):
+    """**本次运行**产生的事件最后几条。
+
+    不读 events.log 文件：那里面是历史，界面一开机就把上周的记录摆出来，
+    用户会以为"一直报错"。历史留给 --diag / 诊断包，界面只反映这一次。
+    """
+    return list(_SESSION_EVENTS[-limit:])
+
+
+_EVENT_LOCK = threading.Lock()
+_SESSION_EVENTS = []            # 本次进程写的事件，界面只看这一份
+
+
 def read_recent_events(limit=3):
-    """读事件日志最后几行，界面用来显示「任务计划已重建」这类记录。"""
+    """读事件日志文件最后几行（给 --diag / 诊断包用，**不再直接喂界面**）。"""
     try:
         with open(EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = [x.strip() for x in f.readlines() if x.strip()]
         return lines[-limit:]
     except Exception:
         return []
-
-
-_EVENT_LOCK = threading.Lock()
 
 
 # ============================================================================
@@ -2086,10 +2100,8 @@ def _ccd_fill_missing_source_modes(u32, paths, modes, mc, rows, plan, want=None)
         mc += 1
         it["sourceModeIdx"] = idx
         it["makeSourceMode"] = False
-        _write_event_log(
-            "拓扑接回：%s 的 source mode 已不在 modes 数组里"
-            "（断开后被 Windows 摘掉），现造一条 %dx%d 放在 (%d,%d) 补在第 %d 位"
-            % (it["anchor"], w, h, x, y, idx))
+        # 这条只进 diag.log：它是"为了接回而临时造了一条 source mode"，
+        # 属于实现细节，写进 events.log 只会让界面挂着看不懂的术语。
         dlog("topo.on.synth.item", anchor=it["anchor"], size=[w, h], pos=[x, y],
              modeIdx=idx, saved=bool(saved))
     return modes, mc
@@ -2333,8 +2345,6 @@ def topology_on(anchors, cfg=None):
     if u32 is None:
         return [], [(-1, "拓扑模式仅支持 Windows")], []
     tries = ("full", "windows-picks-target")
-    labels = {"full": "现算 modeInfoIdx",
-              "windows-picks-target": "target/desktop 交 Windows 定"}
     last_err = "CCD 查询失败，未做任何改动"
     dlog("topo.on", anchors=list(anchors or []),
          saved_positions=(cfg or {}).get("monitor_positions"))
@@ -2372,8 +2382,9 @@ def topology_on(anchors, cfg=None):
         last_err = "SetDisplayConfig 失败 rc=%d（拓扑未改动）" % rc
         dlog("topo.on.fail", tier=mode, stage="apply", rc=rc, mc=cur_mc, pc=pc)
         if n + 1 < len(tries):
-            _write_event_log("拓扑接回：%s 被拒 rc=%d，改用%s重试"
-                             % (labels[mode], rc, labels[tries[n + 1]]))
+            # 降级是用户能感知的（结果一样但过程换了路），说人话，别甩参数名
+            _write_event_log("接回显示器：第一套参数被 Windows 拒绝（rc=%d），"
+                             "已自动换一种方式重试" % rc)
     return [], [(-1, last_err)], []
 
 
@@ -5237,10 +5248,10 @@ class SchedulePanel:
         self.task_sub = Label(self.inner, "", size=8, color=UI["text3"],
                               bg=UI["card"], justify="left", wraplength=360)
         self.task_sub.pack(fill="x", pady=(2, 0))
-        # 事件日志（任务重建 / 配置恢复）：辅助说明色，仅异常时才用橙色提示
+        # 事件（任务重建 / 配置恢复 / 降级重试）：**只放本次运行产生的**。
+        # 创建时不 pack —— 没有事件就不占位，否则底部会留一条空白线。
         self.event_lbl = Label(self.inner, "", size=8, color=UI["text3"],
                                bg=UI["card"], justify="left", wraplength=360)
-        self.event_lbl.pack(fill="x", pady=(2, 0))
 
         self.render()
 
@@ -5352,14 +5363,24 @@ class SchedulePanel:
         self.task_sub.config(text=info.get("detail", ""))
 
     def set_events(self, lines):
-        """显示最近的事件（任务重建 / 配置恢复 / 重建失败）。
+        """显示**本次运行**产生的事件（任务重建 / 配置恢复 / 降级重试）。
+
+        没有事件就把这一行收起来 —— 以前这里读的是 events.log 的历史，
+        开机就把上周的排障记录摆出来，用户以为"程序一直在报错"。
 
         正常事件用辅助灰（与 task_sub 同色）；含失败/异常字样时保留橙色，
-        避免把告警一起灰掉。只改颜色，不碰 pady 与字号。
+        避免把告警一起灰掉。
         """
-        text = "\n".join(lines or [])
+        lines = list(lines or [])
+        if not lines:
+            self.event_lbl.pack_forget()
+            self.event_lbl.config(text="")
+            return
+        text = "\n".join(lines)
         bad = any(k in text for k in ("失败", "错误", "异常", "未就绪"))
         self.event_lbl.config(text=text, fg=UI["orange"] if bad else UI["text3"])
+        if not self.event_lbl.winfo_ismapped():
+            self.event_lbl.pack(fill="x", pady=(2, 0))
 
     def set_actions_enabled(self, enabled):
         # 添加/编辑是本地操作，只受"正在执行"影响，不受定时开关影响
@@ -6452,7 +6473,7 @@ class App:
 
     def _refresh_events(self):
         try:
-            self.sch_panel.set_events(read_recent_events(3))
+            self.sch_panel.set_events(read_session_events(3))
         except Exception:
             pass
 
