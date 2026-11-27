@@ -73,7 +73,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.01.9"     # 改显示器时应用窗口跟着自己的屏走
+APP_VERSION = "2.01.10"    # 启动默认全选显示器；修回副屏在左的布局
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -6150,10 +6150,18 @@ class App:
             self.read_current()
 
     def _restore_selection(self, prev):
+        """界面上要勾哪些屏。
+
+        **启动时全选**（v2.01.10 起）：用户打开程序最常见的目的就是"把所有屏
+        一起调一下"，默认只勾一块还得先手动补。刷新时（`prev` 非空）保留用户
+        当前的勾选，不打断他正在做的事。
+        定时任务的目标是另一套解析（`resolve_monitors` 读 monitor_anchors），
+        不受这里影响。
+        """
         keep = [i for i in prev if i < len(self.monitors)]
-        if not keep:
-            keep = [i for i in resolve_monitors(self.cfg) if i < len(self.monitors)]
-        return keep or list(range(len(self.monitors)))
+        if keep:
+            return keep
+        return list(range(len(self.monitors)))
 
     def refresh_monitors(self, silent=False):
         prev = self.selected_indices()

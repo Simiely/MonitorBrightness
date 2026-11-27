@@ -1445,6 +1445,30 @@ class WindowFollowTest(unittest.TestCase):
         self.assertEqual(mb.coerce_setting("window_follow", 0), False)
 
 
+class RestoreSelectionTest(unittest.TestCase):
+    """启动时默认勾选**全部**显示器（v2.01.10）。
+
+    用户："打开的时候，应该默认勾选两个显示器，这样我可以方便的，一起调节亮度。"
+    之前启动会沿用 `cfg["monitors"]`（只剩一块），每次都得先手动补勾。
+    """
+
+    def _app(self, n):
+        return types.SimpleNamespace(monitors=[{"index": i} for i in range(n)],
+                                     cfg={})
+
+    def test_startup_selects_everything(self):
+        self.assertEqual(mb.App._restore_selection(self._app(2), []), [0, 1])
+        self.assertEqual(mb.App._restore_selection(self._app(3), []), [0, 1, 2])
+
+    def test_refresh_keeps_current_selection(self):
+        """刷新（改分辨率/插拔）不该把用户正在用的勾选洗掉。"""
+        self.assertEqual(mb.App._restore_selection(self._app(2), [1]), [1])
+        self.assertEqual(mb.App._restore_selection(self._app(3), [0, 2]), [0, 2])
+
+    def test_stale_index_is_dropped(self):
+        self.assertEqual(mb.App._restore_selection(self._app(2), [5]), [0, 1])
+
+
 class WalkthroughRound2Test(TempConfigCase):
     """场景走查第 2 轮：探索会话 E1-01~E2-03 的回归测试。"""
 
