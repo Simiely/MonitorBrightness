@@ -28,6 +28,23 @@ v1.1.0 相比 v1.0.0：
      另加一条登录触发任务，保证开机时间已晚于切换点时也能立刻补上。
 """
 import sys
+
+# ── DPI 声明：必须在 import tkinter 之前 ────────────────────────────────
+# v2.02.1：本程序原先没有 DPI 感知声明，Windows 会把整个窗口当"低 DPI 老程序"
+# 做位图拉伸 —— 在 125%/150% 缩放下字体发虚、边框毛糙（多来源一致结论）。
+# 这里用「系统级感知」(1)：单屏/同缩放多屏完全正确，代价是窗口拖到
+# 缩放比例不同的屏时需要重启才会重新适配。
+# 不用 (2) Per-Monitor：Tk 8.6 不响应 WM_DPICHANGED，跨屏会错乱甚至崩溃，
+# 多个来源都明确建议 Tk 程序不要开 2。
+try:
+    import ctypes as _dpi_ctypes
+    try:
+        _dpi_ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:                    # Win7 没有 shcore
+        _dpi_ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 import os
 import re
 import math
@@ -73,7 +90,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.02.0"     # 定时档位可按星期生效（Weekly 触发器 + 执行时二次判断）
+APP_VERSION = "2.02.1"     # DPI 感知声明（系统级）+ tk scaling 同步
 
 
 def _app_dir():
@@ -4457,6 +4474,23 @@ def apply_dark_titlebar(root):
         pass
 
 
+def apply_tk_scaling(root):
+    """DPI 感知之后，把 Tk 的"逻辑像素/点"比例同步成系统缩放。
+
+    v2.02.1：不设的话，Tk 内部仍按 96 DPI 排版，字体和控件在 125% 屏上
+    会小一号（虽然不再模糊）。Tk 的 scaling 语义是"每点多少像素"：
+      100% → 96/72 = 1.3333；125% → 120/72 = 1.6667；150% → 144/72 = 2.0
+    即 `百分比 / 75`。取不到就保持 Tk 默认，不影响启动。
+    """
+    try:
+        import ctypes
+        pct = ctypes.windll.shcore.GetScaleFactorForDevice(0)
+        if pct and 50 <= pct <= 500:
+            root.tk.call("tk", "scaling", pct / 75.0)
+    except Exception:
+        pass
+
+
 # ============================================================
 # 六、命令行模式（供任务计划静默调用）
 # ============================================================
@@ -8246,6 +8280,7 @@ def main():
             "--apply-schedule。\n安装后重试：pip install pillow")
         return
     root = tk.Tk()
+    apply_tk_scaling(root)          # 必须在建控件之前：字体按新比例算
     App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)
     root.mainloop()
