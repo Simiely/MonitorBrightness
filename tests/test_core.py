@@ -34,13 +34,16 @@ import hw.power as hw_power
 import hw.topology as hw_topology
 import hw.winfollow as hw_winfollow
 import monitor_brightness as mb
+import schedule as schedule_mod
+import schedule_report as sched_report_mod
 import service as svc_mod
 
 # R2：同一个函数可能同时绑在主文件与多个 hw/service 模块里。测试 patch 必须
 # 覆盖**调用方所在的那个绑定**，否则 mock 根本不会被调用到。这里用同一个
 # mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
 _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
-                  hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod)
+                  hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
+                  schedule_mod, sched_report_mod)
 
 
 _UNSET = object()
