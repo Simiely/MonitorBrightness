@@ -28,6 +28,11 @@
   清单里「时间」和「异步」两坑）。实测弹窗要么在点击调用内同步创建、要么经 `after(0)`
   投递，**1 次 Tk 事件循环就 mapped**，完全不用等真实时间。改成固定轮数 `pump_ui()`：
   CI runner 上 Tk 初始化实测 810ms，旧的 300ms 时限是潜在的 flake 源。本地连跑 10 次全绿
+- **阶段 0 只读探针**：新增 `scripts/topology_probe.py`（无第三方依赖，只查不写）与
+  `docs/拓扑探针.md`。本机实测：`QDC_ALL_PATHS` 返回 **233 条 path 却只有 3 块屏**
+  （2 物理 + 1 VDD）；`DISPLAYn` **不唯一**（同一块屏对应 4 个 source）；
+  稳定锚点（显卡 LUID + EDID mfr/prod + `connectorInstance`）唯一区分两块同型号屏；
+  VDD 可单独识别；只有 ACTIVE 的屏能读到 DDC
 - 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、35 tests OK
 
 ### 2026-11-17 · 接入单项目规范机器层
