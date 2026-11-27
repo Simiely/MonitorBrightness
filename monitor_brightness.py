@@ -1643,27 +1643,52 @@ def topology_off(indices):
     return done or list(normalize_indices(indices)), []
 
 
-def topology_on(indices):
-    """拓扑接回：恢复动作前快照 → 有界轮询回读 → 写亮度（D3/D6）。
+def topology_indices_for_anchors(anchors):
+    """把恢复出来的锚点映射回**当前**显示器下标（只认 ACTIVE source 的 GDI）。
 
-    返回 (成功下标列表, [(下标, 错误), ...])。
+    不能走 resolve_monitors()：它的 aliases 会把同一块屏的 4 个 DISPLAYn 混在一起，
+    只勾副屏时会误中主屏。接回后 enumeratetargets 才重新看到副屏，所以必须现算。
+    """
+    wanted = set(anchors or [])
+    if not wanted:
+        return []
+    targets = enumerate_targets()
+    try:
+        by_dev = {_short_dev(t.get("dev")): t.get("index") for t in targets}
+    finally:
+        release_targets(targets)
+    out = []
+    for r in ccd_probe_topology():
+        if r["anchor"] in wanted and not r["vdd"]:
+            i = by_dev.get(_short_dev(r.get("gdi")))
+            if i is not None and i not in out:
+                out.append(i)
+    return sorted(out)
+
+
+def topology_on(indices):
+    """拓扑接回：恢复动作前快照 → 有界轮询回读（D3/D6）。
+
+    返回 (成功下标列表, [(下标, 错误), ...], restored_anchors)。
+    亮度不在这里写：断开源在恢复后才重新出现在 EnumDisplayMonitors 里，
+    必须由 screen_on_cfg 用恢复后的下标写，否则刚接回的屏拿不到亮度。
     """
     u32 = _ccd_api()
     if u32 is None:
-        return [], [(-1, "拓扑模式仅支持 Windows")]
+        return [], [(-1, "拓扑模式仅支持 Windows")], []
     try:
         snap = _ccd_load_snapshot()
     except FileNotFoundError:
-        return [], [(-1, "没有拓扑快照，未执行恢复")]
+        return [], [(-1, "没有拓扑快照，未执行恢复")], []
     except Exception as e:
-        return [], [(-1, "拓扑快照读取失败：%s" % e)]
+        return [], [(-1, "拓扑快照读取失败：%s" % e)], []
     rc = _ccd_restore_from_bytes(u32, snap)
     if rc != 0:
-        return [], [(-1, "拓扑恢复失败 rc=%d" % rc)]
+        return [], [(-1, "拓扑恢复失败 rc=%d" % rc)], []
     anchors = snap.get("targetAnchors") or []
     if not _ccd_wait_state(anchors, True):
-        return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")]
-    return list(normalize_indices(indices)), []
+        return [], [(-1, "接回后 2 秒内回读未确认 ACTIVE；亮度未写")], []
+    return list(normalize_indices(indices)), [], anchors
 
 
 # ---- 熄屏 / 点亮 ----------------------------------------------------------
@@ -1944,10 +1969,14 @@ def screen_on_cfg(cfg, indices):
     if cfg.get("screen_off_method") == "ddc":
         return screen_wake_many(indices, **wake_options(cfg))
     if cfg.get("screen_off_method") == "topology":
-        ok, errs = topology_on(indices)
-        if not ok:
+        ok, errs, anchors = topology_on(indices)
+        if errs:
             return ok, errs
-        bok, berrs = set_brightness_many(indices, current_level(cfg))
+        # 断开的屏在恢复后才回到 EnumDisplayMonitors；用「恢复后」的下标写亮度，
+        # 否则副屏接回来了却拿不到亮度（D3）。
+        write_to = sorted(set(normalize_indices(indices))
+                          | set(topology_indices_for_anchors(anchors)))
+        bok, berrs = set_brightness_many(write_to, current_level(cfg))
         return ok + bok, errs + berrs
     if not screen_on_system():
         return [], [(-1, "系统级点亮下发失败")]

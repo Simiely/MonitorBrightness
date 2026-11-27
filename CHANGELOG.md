@@ -22,7 +22,12 @@
   默认值仍 `ddc`。档位层在 topology 模式下 `off` 跳过亮度、`on` 把亮度交给
   `screen_on_cfg` 在回读成功后写。旧配置不写盘、继续可用。
 - 跨机器验证按用户要求**暂缓**（E3 前置项未做完即进入实现）；E5 串流回归仍需用户执行。
-- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、54 tests OK。
+- 验收：`REPO CHECK: PASS`、`KIT LOCK: PASS (v2.9.1, spec=2.1.5)`、56 tests OK。
+- **接回亮度漏写修复**（同日，用户指出"断开的屏也应被检测"后复现的 E3 缺陷）：
+  断开期间副屏不在 `EnumDisplayMonitors` 里，`apply_schedule` 算出的下标只有主屏；
+  恢复快照后若照旧下标写亮度，刚接回的副屏拿不到亮度。改为按快照锚点**恢复后重新映射**
+  下标（`topology_indices_for_anchors`，只认 ACTIVE source 的 gdi，不碰 aliases 串味），
+  与旧下标取并集再写。新增 2 项回归单测 → **56 tests OK**。
 
 ### 2026-11-27 · 按单项目规范 2.1.5 整理文档维护
 

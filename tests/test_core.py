@@ -1037,6 +1037,40 @@ class TopologyActionTest(TempConfigCase):
         self.assertEqual(calls[:2], ["restore", "verify"])
         self.assertEqual(calls[2], ("brightness", [1], 80))
 
+    def test_reconnect_writes_brightness_to_newly_restored_screen(self):
+        """回归：断开源恢复后才回到 EnumDisplayMonitors，不能拿断开前的旧序号写亮度。"""
+        snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
+                "targetAnchors": ["A2"]}
+        cfg = self._cfg(screen_off_method="topology")
+        # 断开期间算出的 indices 只有主屏 [0]；恢复后 A2 重新成为 [1]。
+        with unittest.mock.patch.object(mb, "_ccd_api", return_value=object()), \
+                unittest.mock.patch.object(mb, "_ccd_load_snapshot", return_value=snap), \
+                unittest.mock.patch.object(mb, "_ccd_restore_from_bytes", return_value=0), \
+                unittest.mock.patch.object(mb, "_ccd_wait_state", return_value=True), \
+                unittest.mock.patch.object(mb, "topology_indices_for_anchors",
+                                           return_value=[1]), \
+                unittest.mock.patch.object(mb, "current_level", return_value=80), \
+                unittest.mock.patch.object(mb, "set_brightness_many") as bright:
+            bright.return_value = ([0, 1], [])
+            ok, errs = mb.screen_on_cfg(cfg, [0])
+        self.assertEqual(errs, [])
+        self.assertEqual(ok, [0, 0, 1])
+        bright.assert_called_once_with([0, 1], 80)
+
+    def test_anchor_to_index_uses_active_gdi_only(self):
+        """aliases 会混入另一块屏的 DISPLAYn；映射下标只认 ACTIVE source 的 gdi。"""
+        rows = [
+            {"anchor": "A1", "gdi": "\\\\.\\DISPLAY1", "vdd": False,
+             "aliases": ["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"]},
+            {"anchor": "A2", "gdi": "\\\\.\\DISPLAY2", "vdd": False,
+             "aliases": ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY1"]},
+        ]
+        with unittest.mock.patch.object(mb, "enumerate_targets",
+                                        return_value=list(self.TARGETS)), \
+                unittest.mock.patch.object(mb, "release_targets"), \
+                unittest.mock.patch.object(mb, "ccd_probe_topology", return_value=rows):
+            self.assertEqual(mb.topology_indices_for_anchors(["A2"]), [1])
+
     def test_on_does_not_write_brightness_when_restore_fails(self):
         snap = {"pathCount": 3, "modeCount": 3, "pathsHex": "", "modesHex": "",
                 "targetAnchors": ["A2"]}
