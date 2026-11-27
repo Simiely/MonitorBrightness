@@ -97,7 +97,7 @@ except Exception:
 # 留这个开关只是为了让"缺依赖"的旧提示不再误报——真正的枚举不看它。
 
 APP_TITLE = "显示器亮度定时调节"
-APP_VERSION = "2.02.1"     # DPI 感知声明（系统级）+ tk scaling 同步
+APP_VERSION = "2.03.1"     # 滚轮改进程级路由（修 unbind_all 清空全局绑定的回归）
 
 
 def _app_dir():
@@ -5048,6 +5048,32 @@ class DarkBox:
         return answer["ok"]
 
 
+def _route_wheel(event):
+    """把滚轮事件交给鼠标下最近的「可滚动容器」。
+
+    为什么不再让各个容器自己 bind_all：Tk 的 `unbind_all("<MouseWheel>")`
+    会清掉**所有**绑定。P-27 那次修复（Sheet 里 bind_all + Destroy 时
+    unbind_all）就引入了这个副作用 —— **开一次设置页再关掉，主界面滚轮
+    永久失效**（用户实测：滚轮控制不了上下滚动）。
+
+    现在的做法：整个进程只绑一次、永不 unbind；容器在自身上挂
+    `_wheel_target` 标记，由本函数沿 master 链往上找。
+    容器返回 False 表示"我不需要滚"，继续往上找。
+    """
+    w = getattr(event, "widget", None)
+    while w is not None:
+        target = getattr(w, "_wheel_target", None)
+        if target is not None and target(event) is not False:
+            return "break"
+        w = getattr(w, "master", None)
+    return None
+
+
+def install_wheel_router(root):
+    """进程级滚轮路由：只装一次（main 里调），谁都不许 unbind_all。"""
+    root.bind_all("<MouseWheel>", _route_wheel, add="+")
+
+
 class ScrollArea(ttk.Frame):
     """可滚动内容容器（Canvas + 内部 Frame + 滚动条）。
 
@@ -5068,13 +5094,18 @@ class ScrollArea(ttk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.body.bind("<Configure>", self._on_body)
         self.canvas.bind("<Configure>", self._on_canvas)
-        self.canvas.bind("<Enter>",
-                         lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
-        self.canvas.bind("<Leave>",
-                         lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        # 滚轮交给全局路由（见 _route_wheel）：不再用 <Enter>/<Leave> 绑 bind_all。
+        # 老写法有两个坑：鼠标直接进到子控件时 Canvas 收不到 <Enter>（P-27）；
+        # <Leave> 里的 unbind_all 还会把弹层的绑定一起清掉。
+        self.canvas._wheel_target = self._on_wheel
 
     def _on_wheel(self, event):
+        # 内容放得下就别吞滚轮，让上层容器有机会处理
+        first, last = self.canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return False
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return True
 
     def _on_canvas(self, event):
         self.canvas.itemconfigure(self._inner, width=event.width)
@@ -5678,8 +5709,9 @@ class Sheet(tk.Toplevel):
     def _on_sheet_wheel(self, event):
         # 没滚动条就别吞滚轮（内容本来就放得下）
         if not self._body_bar.winfo_ismapped():
-            return
+            return False
         self._body_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return True
 
     def _on_sheet_body(self, _event=None):
         self._body_canvas.configure(scrollregion=self._body_canvas.bbox("all"))
@@ -5713,21 +5745,19 @@ class Sheet(tk.Toplevel):
         self.deiconify()
         self.wait_visibility()
         self.grab_set()
-        # v2.01.22（走查 P-27）：滚轮改用全局绑定。原来靠 Canvas 的 <Enter>
-        # 才 bind_all —— 鼠标若从窗口外直接进到 Label/Frame 上，Canvas 收不到
-        # Enter（Tk 事件不冒泡），滚轮根本没绑上，设置页只能拖滚动条。
-        # 模态弹层期间只有它在收事件，全局绑定不会误伤别的窗口。
-        self.bind_all("<MouseWheel>", self._on_sheet_wheel, add="+")
+        # 滚轮：v2.03.1 起交给进程级路由（见 _route_wheel）。
+        # P-27 原来在这里 bind_all、Destroy 时 unbind_all —— 后者会清掉**所有**
+        # 滚轮绑定，导致"开一次设置页再关掉，主界面滚轮永久失效"（用户实测）。
+        # 现在只挂标记，路由沿 master 链找到谁该滚。
+        self._body_canvas._wheel_target = self._on_sheet_wheel
+        self._wheel_target = self._on_sheet_wheel      # 鼠标落在页脚时也能滚正文
         self.bind("<Destroy>", self._on_destroy, add="+")
 
     def _on_destroy(self, event=None):
-        """弹层销毁时解掉全局滚轮绑定，避免关窗后还抢滚轮。"""
+        """弹层销毁时不需要解绑任何全局滚轮（v2.03.1：全局只绑一次）。"""
         if event is not None and getattr(event, "widget", None) is not self:
             return
-        try:
-            self.unbind_all("<MouseWheel>")
-        except Exception:
-            pass
+        self._body_canvas._wheel_target = None
 
     def close(self):
         self._on_destroy()
@@ -8399,6 +8429,7 @@ def main():
         return
     root = tk.Tk()
     apply_tk_scaling(root)          # 必须在建控件之前：字体按新比例算
+    install_wheel_router(root)      # 滚轮全局路由：只装这一次，谁都不许 unbind_all
     App(root, start_minimized=("--minimized" in args))
     apply_dark_titlebar(root)
     root.mainloop()

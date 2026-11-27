@@ -1631,6 +1631,54 @@ class UiDecisionTest(unittest.TestCase):
         self.assertEqual(mb.plan_model_updates({"a": "X"}, {}, 2), [])
 
 
+class WheelRouterTest(unittest.TestCase):
+    """v2.03.1：滚轮改成进程级路由。
+
+    原实现两处 `unbind_all("<MouseWheel>")`（Sheet 关闭、ScrollArea 的 Leave），
+    会清掉**所有**滚轮绑定 —— 开一次设置页再关掉，主界面滚轮就永久失效。
+    """
+
+    def test_no_unbind_all_anywhere(self):
+        """硬回归锁：源码里不许再出现 unbind_all 调用（注释除外）。"""
+        import ast as _ast
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "monitor_brightness.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        offenders = []
+        for n in _ast.walk(_ast.parse(src)):
+            if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") == "unbind_all":
+                offenders.append(n.lineno)
+        self.assertEqual(offenders, [],
+                         "unbind_all 会清空全局滚轮绑定（见 P-27 副作用）")
+
+    def test_route_wheel_finds_nearest_target(self):
+        calls = []
+
+        def target(event):
+            calls.append(event.widget)
+            return True
+
+        parent = types.SimpleNamespace(_wheel_target=target)
+        child = types.SimpleNamespace(master=parent)
+        event = types.SimpleNamespace(widget=child)
+        self.assertEqual(mb._route_wheel(event), "break")
+        self.assertEqual(calls, [child])
+
+    def test_route_wheel_skips_declining_target(self):
+        """容器返回 False（内容放得下）→ 继续往上找，最终没人接就返回 None。"""
+        outer_hits = []
+        inner = types.SimpleNamespace(_wheel_target=lambda e: False)
+        outer = types.SimpleNamespace(_wheel_target=lambda e: outer_hits.append(1) or True)
+        inner.master = outer
+        event = types.SimpleNamespace(widget=inner)
+        self.assertEqual(mb._route_wheel(event), "break")
+        self.assertEqual(outer_hits, [1])
+        # 全都不接 → None（不吞事件）
+        solo = types.SimpleNamespace(_wheel_target=lambda e: False, master=None)
+        self.assertIsNone(mb._route_wheel(types.SimpleNamespace(widget=solo)))
+
+
 class RegisterScriptTest(unittest.TestCase):
     """v2.03.0 P0：build_register_script 原为零覆盖。
 
