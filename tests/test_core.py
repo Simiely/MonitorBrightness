@@ -8,7 +8,10 @@
   - 「添加时间段」点击后立即创建弹窗、跑事件循环即可见，并能在弹窗里完成一次添加
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
+import app.brightness as app_bright_mod
+import app.common as app_common_mod
 import app.diag as app_diag_mod
+import app.screen_power as app_power_mod
 import app.settings as app_settings_mod
 import cli as cli_mod
 import contextlib
@@ -48,7 +51,8 @@ import ui.sheets as ui_sheets_mod
 _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
                   hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
                   schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod,
-                  app_settings_mod, app_diag_mod)
+                  app_settings_mod, app_diag_mod, app_common_mod,
+                  app_bright_mod, app_power_mod)
 
 
 _UNSET = object()
@@ -1748,6 +1752,14 @@ class UiSmokeTest(unittest.TestCase):
         self.assertIs(mb._SettingsActions, app_settings_mod._SettingsActions)
         self.assertIs(mb._DiagActions, app_diag_mod._DiagActions)
         self.assertIs(mb.tray_tooltip_text, app_settings_mod.tray_tooltip_text)
+
+    def test_screen_action_split(self):
+        """R4-3：共用纯函数再导出仍在，App 仍同时混入两个屏幕控制器。"""
+        for name in ("status_payload", "row_action_blocker",
+                     "auto_relight_minutes", "selection_payload"):
+            self.assertIs(getattr(mb, name), getattr(app_common_mod, name))
+        self.assertTrue(issubclass(mb.App, app_bright_mod._BrightnessActions))
+        self.assertTrue(issubclass(mb.App, app_power_mod._ScreenPowerActions))
 
     def test_widgets_construct(self):
         """每个自绘控件都要能建出来且能正常销毁。"""
