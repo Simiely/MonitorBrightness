@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """P1-8 拆分出的测试用例；由 tests/test_core.py 聚合运行。"""
 
-from tests.support import *  # noqa: F401,F403
 from tests.support import (  # noqa: F401
     _FakeU32, _PATCH_MODULES, _TopoFixture, _UNSET, _row_button_texts,
+    TempConfigCase, app_base_mod, app_cli_entry_mod, datetime, html, mb,
+    os, pump_ui, schedule_mod, sys, types, unittest,
 )
 
 

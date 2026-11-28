@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """P1-8 拆分出的测试用例；由 tests/test_core.py 聚合运行。"""
 
-from tests.support import *  # noqa: F401,F403
 from tests.support import (  # noqa: F401
     _FakeU32, _PATCH_MODULES, _TopoFixture, _UNSET, _row_button_texts,
+    TempConfigCase, app_bright_mod, app_common_mod, app_diag_mod,
+    app_layout_mod, app_power_mod, app_schedule_mod, app_settings_mod,
+    mb, os, patch_any, restore_any, set_any, types, ui_sheets_mod,
+    unittest,
 )
 from tests.cases_screen import BusyQueueTest  # noqa: F401
 
