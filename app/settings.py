@@ -19,6 +19,7 @@ from domain.timeutil import parse_hhmm
 from schedule import (
     _days_by_min_from_fp, _next_run_text, _slot_trigger_fingerprint, task_target,
 )
+from app.schedule import _finish_enable_register
 
 
 def tray_tooltip_text(cfg, last_verdict, title):
@@ -130,7 +131,7 @@ class _SettingsActions:
         # v2.01.22（走查 P-29）：切模式必须重建列表 ——
         # topology 才列"断开的物理屏"，ddc/system 只留 VDD。
         # 原来只 probe_screens，用户切到 topology 后看不到能接回的屏。
-        self.refresh_monitors(silent=True)
+        self.refresh_monitors()
         # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
         self.probe_screens()
 
@@ -187,19 +188,13 @@ class _SettingsActions:
         # v2.01.22（走查 P-30）：窗口在托盘里期间可能拔插过屏、开关过串流，
         # 打开时必须重读，否则列表还是最小化前那一份（用户报"打开没有
         # 刷新出虚拟显示器"的另一条路径）。
-        self.refresh_monitors(silent=True)
+        self.refresh_monitors()
         self.probe_screens()
         self.status_var.set("就绪")
 
     def _finish_tray_register(self, result):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            self._rollback_schedule(False, "注册任务失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("定时已启用")
+        # 托盘开关与界面开关共用同一套“失败回滚 + 成功刷新”收尾。
+        _finish_enable_register(self, result)
 
     def _tray_quit(self):
         self._stop_tray()

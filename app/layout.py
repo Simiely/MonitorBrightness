@@ -340,7 +340,7 @@ class _LayoutActions:
             else:
                 dlog("app.action", what="restore_default", stage="done")
                 self.status_var.set("已恢复默认双屏布局")
-                self.refresh_monitors(silent=True)
+                self.refresh_monitors()
         self.run_bg(job, done, busy=True)
 
     def _restore_selection(self, prev):
@@ -532,7 +532,7 @@ class _LayoutActions:
             save_config(self.cfg)
             self.status_var.set("显示器已启用")
             self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
-            self.refresh_monitors(silent=True)
+            self.refresh_monitors()
         for i, e in errs:
             self.status_var.set("启用失败：" + (e if i < 0 else "显示器 %d: %s" % (i, e)))
         if errs:

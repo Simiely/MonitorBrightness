@@ -16,6 +16,24 @@ from service import selection_anchors
 from app.common import selection_payload
 
 
+def _finish_enable_register(app, result):
+    """注册完成后的公共收尾：失败回滚，成功刷新状态。返回 (ok, out)。
+
+    放在模块级而不是 Mixin 方法：托盘回调与主界面回调共用同一套逻辑，
+    测试里的 FakeApp 也不必再补一个只做转发的绑定。
+    """
+    if isinstance(result, Exception):
+        result = (False, str(result))
+    ok, out = result
+    if not ok:
+        # 开关是"切换即注册"：注册失败统一回滚（改状态 + 落盘 + 界面）
+        app._rollback_schedule(False, "注册任务失败", out)
+        return False, out
+    app.refresh_task_status()
+    app.status_var.set("定时已启用")
+    return True, out
+
+
 class _ScheduleActions:
     """定时：档位保存、任务重建、启动自检。
 
@@ -183,16 +201,9 @@ class _ScheduleActions:
         self.root.after(0, lambda: self.msg.shownotice(title, message))
 
     def _finish_register(self, result, part, before_xml=""):
-        if isinstance(result, Exception):
-            result = (False, str(result))
-        ok, out = result
-        if not ok:
-            # 开关是"切换即注册"：注册失败统一回滚（改状态 + 落盘 + 界面）
-            self._rollback_schedule(False, "注册任务失败", out)
-            return
-        self.refresh_task_status()
-        self.status_var.set("定时已启用")
-        self._announce_rebuilt(part, out, before_xml, "定时已保存")
+        ok, out = _finish_enable_register(self, result)
+        if ok:
+            self._announce_rebuilt(part, out, before_xml, "定时已保存")
 
     def _set_schedule_enabled(self, enabled, persist=True):
         """定时开关状态的**唯一**写入者：改内存 + 落盘 + 同步界面开关。

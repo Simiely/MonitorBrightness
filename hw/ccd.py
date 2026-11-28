@@ -52,7 +52,7 @@ def _ccd_query_all_paths(u32, flags):
             return None
     return None
 
-def _ccd_rows_from_paths(u32, paths, modes, mc):
+def _ccd_rows_from_paths(u32, paths, modes):
     """把每条 path 翻成一行（同一块屏可能有多条 path，由折叠步骤处理）。"""
     rows = []
     for p in list(paths):
@@ -138,7 +138,7 @@ def ccd_probe_topology():
             return []
         paths, modes, mc = got
         return _ccd_merge_rows_by_anchor(
-            _ccd_rows_from_paths(u32, paths, modes, mc))
+            _ccd_rows_from_paths(u32, paths, modes))
     except Exception:
         return []
 

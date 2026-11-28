@@ -130,7 +130,7 @@ class _ScreenPowerActions:
             self._relight_timer.start()
         if self.cfg.get("screen_off_method") == "topology":
             # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
-            self.refresh_monitors(silent=True)
+            self.refresh_monitors()
         self.probe_screens()
 
     def screen_on(self):
@@ -179,7 +179,7 @@ class _ScreenPowerActions:
             self.msg.showwarning("点亮失败", detail + tip)
         if self.cfg.get("screen_off_method") == "topology":
             # 接回后副屏重新出现，刷新列表把灰显行去掉
-            self.refresh_monitors(silent=True)
+            self.refresh_monitors()
         self.probe_screens()
 
     def _auto_relight_minutes(self):

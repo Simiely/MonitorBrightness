@@ -43,7 +43,7 @@ class _BrightnessActions:
         if not self.mon_panel._suspend:
             self.read_current()
 
-    def refresh_monitors(self, silent=False):
+    def refresh_monitors(self):
         prev = self.selected_indices()
         targets = enumerate_targets()
         try:
