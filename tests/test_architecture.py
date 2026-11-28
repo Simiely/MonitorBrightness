@@ -38,10 +38,6 @@ _FUNC_EXCEPTIONS = {
     "hw/topology.py::topology_plan_on": "topology 状态机时序壳（P4 已拆 helper）",
     "hw/ccd.py::screen_verdict": "亮灭判定多分支状态机",
     "hw/power.py::_wake_one": "四级唤醒阶梯，顺序即契约",
-    "ui/theme.py::apply_dark_theme": "ttk 主题批量配置，按控件类分块后仍长",
-    "ui/panels.py::MonitorPanel.rebuild": "显示器行重建，按区块拆会丢上下文",
-    "ui/panels.py::SchedulePanel.__init__": "定时面板一次装配，拆开易漏控件",
-    "app/layout.py::restore_default_layout": "CCD 恢复时序 + 错误分支，待后续专项拆分",
 }
 
 
