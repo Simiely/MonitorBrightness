@@ -18,6 +18,11 @@ dist_v*/
 .obsidian/
 .vscode/
 
+# 测试覆盖率产物
+.coverage
+.coverage.*
+htmlcov/
+
 # 系统文件
 Thumbs.db
 .DS_Store

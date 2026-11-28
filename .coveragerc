@@ -1,0 +1,24 @@
+[run]
+source =
+    core
+    domain
+    hw
+    ui
+    app
+    service
+    schedule
+    schedule_report
+    cli
+    monitor_brightness
+omit =
+    legacy/*
+    tests/*
+    tools/*
+    scripts/*
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
