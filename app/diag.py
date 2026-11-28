@@ -32,6 +32,8 @@ class _DiagActions:
             return
         self.status_var.set("诊断包已导出：%s" % path)
         try:
-            subprocess.Popen(["explorer", "/select,%s" % path])
+            # 路径可能含空格/逗号；用 list2cmdline 统一加引号，避免 explorer
+            # 把 /select, 后面的路径拆成多个参数。
+            subprocess.Popen(["explorer", "/select," + subprocess.list2cmdline([path])])
         except Exception:
             pass

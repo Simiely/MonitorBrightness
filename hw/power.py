@@ -325,11 +325,11 @@ def pick_flip_source(cur, declared):
     cands = []
     for c in (declared or []):
         try:
-            c = int(c)
+            value = int(c)
         except Exception:
             continue
-        if 15 <= c <= 19 and c not in cands:
-            cands.append(c)
+        if 15 <= value <= 19 and value not in cands:
+            cands.append(value)
     if not cands:
         cands = [15, 16, 17, 18, 19]
     if 17 in cands and cur != 17:

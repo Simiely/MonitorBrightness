@@ -260,7 +260,10 @@ def _display_uid(dev):
         if user32.EnumDisplayDevicesW(adapter, 0, ctypes.byref(dd), 0):
             did = str(dd.DeviceID).strip()
             if did:
-                uid = hashlib.sha1(did.encode("utf-8")).hexdigest()[:8]
+                # 仅做稳定短键，不是安全用途；sha256 只是避免静态扫描把 sha1
+                # 当成弱哈希。旧 caps 缓存会因此失效一次（首启重读能力串），
+                # 之后按新键命中。
+                uid = hashlib.sha256(did.encode("utf-8")).hexdigest()[:8]
     except Exception:
         uid = ""
     _EDID_CACHE[dev] = uid

@@ -122,18 +122,18 @@ def _task_result_text(code):
 def _runtime_fields(text):
     """从 RUNTIME= 行解析 (上次运行, 上次结果, 下次运行, 状态)。"""
     for line in (text or "").splitlines():
-        line = line.strip()
-        if line.startswith("RUNTIME="):
-            bits = line[8:].split("|")
+        stripped = line.strip()
+        if stripped.startswith("RUNTIME="):
+            bits = stripped[8:].split("|")
             return (bits + ["", "", "", ""])[:4]
     return ("", "", "", "")
 
 def _task_info_next(out):
     """从 register_tasks 的 TaskInfo= 行取下次运行时间；没有返回 ""。"""
     for line in (out or "").splitlines():
-        line = line.strip()
-        if line.startswith("TaskInfo="):
-            bits = line[9:].split("|")
+        stripped = line.strip()
+        if stripped.startswith("TaskInfo="):
+            bits = stripped[9:].split("|")
             nxt = bits[2].strip() if len(bits) > 2 else ""
             return "" if nxt in ("NONE", "MISSING", "NEVER") else nxt
     return ""
@@ -145,9 +145,9 @@ def task_summary(text, slots, runtime=""):
     """
     by_name = {}
     for line in (text or "").splitlines():
-        line = line.strip()
-        if "=" in line:
-            name, rest = line.split("=", 1)
+        stripped = line.strip()
+        if "=" in stripped:
+            name, rest = stripped.split("=", 1)
             if name in TASK_SHORT:
                 by_name[name] = rest
     sched = by_name.get(TASK_SCHEDULE)
