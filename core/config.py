@@ -33,11 +33,9 @@ DEFAULT_SLOTS = [{'time': '08:30', 'level': 80, 'screen': '', 'days': []},
                  {'time': '21:00', 'level': 0, 'screen': '', 'days': []}]
 
 
-# 熄灭方式：system   = 系统级整组熄灭（一定唤得回来）
-#           ddc      = 逐台 DDC 0xD6=2 待机（本机实测可能唤不回，仅作高级选项）
-#           topology = CCD 断开副屏（串流隐藏物理屏用；默认不是它）
-OFF_METHODS = ("system", "ddc", "topology")
-OFF_METHOD_LABEL = {"system": "系统级", "ddc": "单屏待机", "topology": "拓扑断开"}
+# v2.04：熄灭方式固定为 topology（CCD 断开副屏）。ddc 待机与系统级广播
+# 因兼容性/适用性差已移除；旧配置里的 screen_off_method / ddc_allow_undeclared /
+# wake_* 键会被 load_config 自动丢弃，不影响行为。
 SETTINGS = (
     {"key": "monitors", "kind": "indices", "default": []},
     # 设备名锚点（如 ['DISPLAY1','DISPLAY2']），与 monitors 同序对应。
@@ -52,27 +50,11 @@ SETTINGS = (
     {"key": "screen_auto_relight_min", "kind": "level", "default": 0},    # 熄灭后 N 分钟自动点亮（0=关）
     {"key": "tray_enabled", "kind": "flag", "default": True},             # 托盘开关（关 = 点 X 直接退出）
     # ⚠️ v2.01.0 删除了 screen_state / screen_state_at / screen_off_tick：
-    # 程序不再维护"屏幕现在亮还是灭"的状态账。拓扑/系统才是唯一事实源，
+    # 程序不再维护"屏幕现在亮还是灭"的状态账。拓扑才是唯一事实源，
     # 每次需要结论时现场读（见 screen_verdict）。旧配置里残留的同名字段
     # 会被 load_config 丢弃，不影响任何行为。
-    # 熄灭方式：system   = Windows 系统级整组熄灭（一定唤得回来）
-    #           ddc      = 逐台 DDC 0xD6=2 待机（个别面板唤不回）
-    #           topology = CCD 断开副屏（串流隐藏物理屏用）
-    # v2.01.23：默认改为 topology（用户要求）。理由：这条路不碰面板电源，
-    # 只改 Windows 拓扑，唤不回的风险最低；本机面板能力串不声明 0xD6=2，
-    # ddc 那条路本来就得靠"明知有风险"的授权才能走。
-    # ⚠️ load_config 里把 "system 且未授权 ddc" 恢复成 ddc 的那段是历史迁移
-    # 逻辑（撤销 v1.9.0 的误迁移），与这里的默认值无关，不要跟着改。
-    {"key": "screen_off_method", "kind": "choice",
-     "values": OFF_METHODS, "default": "topology"},
-    # 点亮时是否允许"切信号源"这最后一招（仅 ddc 方式下有效）
-    {"key": "wake_switch_input", "kind": "flag", "default": True},
-    # v1.9.7 快速点亮：0x60 切源翻转（读当前源 → 写中间源 → 立即写回），单台 ~180ms。
-    # 仅有「ddc + 允许切源 + 记账认为熄过屏」时启用；关掉=完全回到 v1.9.6 完整阶梯。
-    {"key": "wake_fast_flip", "kind": "flag", "default": True},
-    # 是否允许写入面板未声明的待机值（0xD6=2）。默认关；
-    # 用户在界面里选择"DDC 单屏待机"并确认风险后才会置 True。
-    {"key": "ddc_allow_undeclared", "kind": "flag", "default": False},
+    # v2.04：熄灭只走拓扑。DDC 仅保留亮度读写与只读探测；不再写 0xD6/0x60，
+    # 也不发系统级 SC_MONITORPOWER 广播。点亮 = 拓扑接回 + 写亮度。
     # 拓扑模式的显示器锚点（显卡 LUID + EDID mfr/prod + connectorInstance）。
     # E1 只读层先声明；E2 才做旧 monitors/monitor_ids 的迁移。
     {"key": "monitor_anchors", "kind": "anchors", "default": []},
@@ -92,7 +74,7 @@ SETTINGS = (
     {"key": "window_follow", "kind": "flag", "default": True},
 )
 SETTING_BY_KEY = {s["key"]: s for s in SETTINGS}
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 
 
 def coerce_setting(key, value):
@@ -310,7 +292,6 @@ def load_config():
     """
     _state.set_load_error("")
     cfg = default_config()
-    _recovered_off_method = False
     if not os.path.exists(CONFIG_FILE):
         return cfg
     try:
@@ -328,13 +309,8 @@ def load_config():
         # v1 -> v2 迁移：旧配置只有 "monitor": 0
         if "monitors" not in raw and "monitor" in raw:
             raw = dict(raw, monitors=[raw["monitor"]])
-        # v1.9.3：撤销 v1.9.0 的「旧配置 ddc → system」自动迁移。
-        # 迁移的判别特征是「system 且未允许未声明的 0xD6=2」；这里按同样特征
-        # 反向恢复为 v1.8.5 的默认 ddc。改动必须落日志，不静默改用户配置。
-        if (raw.get("screen_off_method") == "system"
-                and not raw.get("ddc_allow_undeclared")):
-            raw = dict(raw, screen_off_method="ddc")
-            _recovered_off_method = True
+        # v2.04：旧配置里的 screen_off_method / ddc_allow_undeclared / wake_*
+        # 不再迁移，也不再写回；它们不在 SETTING_BY_KEY 里，会自动被丢弃。
         # 能力串缓存播种（静态固件属性，避免每次熄灭前重读 3s/台）。
         # v1.9.0 起 key 里带 EDID 短哈希（dev#uid），旧 dev-only 键不再播种：
         # 换面板后不会沿用旧缓存，代价只是首次重新实测一次。
@@ -351,13 +327,6 @@ def load_config():
                 cfg[key] = coerce_setting(key, raw[key])
         cfg["models"] = _load_model_cache(raw)
         diag_set_enabled(cfg.get("diag_log", True))
-        if _recovered_off_method:
-            _ok, _err = save_config(cfg)
-            if _ok:
-                _write_event_log("熄灭方式已恢复：system → ddc"
-                                 "（撤销 v1.9.0 的默认值迁移，恢复 v1.8.5 行为）")
-            else:
-                _write_event_log("熄灭方式恢复失败（磁盘仍为 system）：%s" % _err)
     except Exception as e:
         _state.set_load_error(_backup_bad_config("%s: %s" % (type(e).__name__, e)))
     return cfg

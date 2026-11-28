@@ -158,14 +158,8 @@ class MonitorPanel:
 
         以前是两个都摆上（一个常灰），实测用户看到的是"这按钮怎么是灰的、
         是不是坏了"。按钮本来就该表达"现在能做的那一件事"。
-        系统级熄灭是整组广播，没有"只动一块"，那种模式一个都不放。
-        虚拟显示器也不放：它归串流软件管，本程序断/接它没有意义
-        （实测：VDD 当主屏时它也会出现在列表里，给个「熄灭」点了只会
-        提示"拿不到锚点"，纯属骗人）。
+        虚拟显示器也不放：它归串流软件管，本程序断/接它没有意义。
         """
-        method = self.app.cfg.get("screen_off_method")
-        if method not in ("ddc", "topology"):
-            return None
         if getattr(self.app, "is_vdd", lambda i: False)(index):
             return None
         box = tk.Frame(row, bg=UI["card"])

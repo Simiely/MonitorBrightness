@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """策略分发层（v2.03.0 R2）：按配置把动作路由到 hw/ 的具体实现。
 
-放在 hw/ 之上、App 之下：hw.power 与 hw.topology 因此互不反向依赖，
-环②（topology_enable_anchor ↔ screen_on_cfg）在此消失。
+放在 hw/ 之上、App 之下：v2.04 起开关屏只走 hw.topology，
+DDC 只用于亮度读写；策略集中在 service.py。
 """
 from core.config import load_config, normalize_indices
 from core.logging import dlog
 from domain.decisions import _short_dev
 from domain.slots import _minutes, _slot_minutes, active_slot
 from hw.ccd import ccd_probe_topology
-from hw.ddc import enumerate_targets, probe_states, release_targets, set_brightness_many
-from hw.power import (
-    _system_ok_targets, reset_wake_info, screen_off_many, screen_off_system,
-    screen_on_system, screen_wake_flip, screen_wake_many,
-)
+from hw.ddc import enumerate_targets, release_targets, set_brightness_many
 from hw.topology import (
     topology_indices_for_anchors, topology_off, topology_on,
     topology_wanted_anchors,
@@ -32,35 +28,21 @@ def topology_enable_anchor(cfg, anchor):
     return screen_on_cfg(cfg, [], anchors=[anchor])
 
 def screen_off_cfg(cfg, indices):
-    """熄灭显示器。ddc = 逐台 0xD6=2；topology = CCD 断开副屏；其余系统级。
+    """熄灭显示器：v2.04 起只走 CCD 拓扑断开。
 
-    返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状，
-    这样界面与 CLI 不用关心底层是哪种方式。
+    返回 (成功序号列表, [(序号, 错误), ...])，与逐台接口保持同一形状。
     """
-    dlog("screen.off.enter", method=cfg.get("screen_off_method"),
-         indices=normalize_indices(indices))
-    if cfg.get("screen_off_method") == "ddc":
-        out = screen_off_many(indices, bool(cfg.get("ddc_allow_undeclared")))
-    elif cfg.get("screen_off_method") == "topology":
-        out = topology_off(indices, cfg)
-    elif not screen_off_system():
-        out = ([], [(-1, "系统级熄灭下发失败")])
-    else:
-        out = (_system_ok_targets(indices), [])
+    dlog("screen.off.enter", indices=normalize_indices(indices))
+    out = topology_off(indices, cfg)
     dlog("screen.off.exit", ok=out[0], errs=out[1])
     return out
 
 def screen_on_row(cfg, index):
-    """行内「显示」：只点亮这一块。
+    """行内「显示」：只把这一块按拓扑接回，再写亮度。
 
-    拓扑模式下分两种情况，靠"有没有真的接回一块屏"来分：
-      - 它确实断开了 → 按拓扑接回，再写亮度；
-      - 它本来就在拓扑里（`restored` 为空）→ 那多半只是面板被待机了，
-        拓扑帮不上忙，改走 DDC 唤醒。**不许切信号源**：拓扑模式下切源
-        会把副屏切到空口，等于自找黑屏。
+    v2.04：不再用 DDC 唤醒兜底——程序已不写 0xD6 待机，面板若被外部待机，
+    请由显示器物理按键或系统自身的电源管理恢复。
     """
-    if cfg.get("screen_off_method") != "topology":
-        return screen_wake_entry(cfg, [index])
     anchors = selection_anchors([index])
     if not anchors:
         return [], [(-1, "拿不到这块屏的锚点，无法单独点亮")]
@@ -69,58 +51,24 @@ def screen_on_row(cfg, index):
         return ok, errs
     ids = topology_indices_for_anchors(restored) or [index]
     bok, berrs = set_brightness_many(ids, current_level(cfg))
-    if restored:
-        dlog("screen.on.row", index=index, via="topology", ids=ids)
-        return ok + bok, errs + berrs
-    wok, werrs = screen_wake_many([index], allow_switch=False)
-    dlog("screen.on.row", index=index, via="ddc-wake", ok=wok, errs=werrs)
-    return wok + bok, werrs + berrs
+    dlog("screen.on.row", index=index, via="topology", ids=ids, restored=restored)
+    return ok + bok, errs + berrs
 
-def screen_on_cfg(cfg, indices, anchors=None, wake_opts=None):
-    """点亮显示器。ddc = 分级 DDC；topology = 现读现算接回后写亮度；其余系统级。"""
-    dlog("screen.on.enter", method=cfg.get("screen_off_method"),
-         indices=normalize_indices(indices), anchors=anchors)
-    if cfg.get("screen_off_method") == "ddc":
-        out = screen_wake_many(indices, **(wake_opts or wake_options(cfg)))
-        dlog("screen.on.exit", ok=out[0], errs=out[1])
-        return out
-    if cfg.get("screen_off_method") == "topology":
-        want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
-        ok, errs, restored = topology_on(want, cfg)
-        if errs:
-            return ok, errs
-        # 断开的屏在接回后才回到 EnumDisplayMonitors；用「接回后」的下标写亮度，
-        # 否则副屏接回来了却拿不到亮度（D3）。
-        write_to = sorted(set(normalize_indices(indices))
-                          | set(topology_indices_for_anchors(restored)))
-        if not write_to:
-            return ok, errs
-        bok, berrs = set_brightness_many(write_to, current_level(cfg))
-        return ok + bok, errs + berrs
-    if not screen_on_system():
-        return [], [(-1, "系统级点亮下发失败")]
-    return _system_ok_targets(indices), []
-
-def screen_wake_entry(cfg, indices):
-    """点亮统一入口（v1.9.7）：快速翻转优先，其余情况原样走 v1.9.6。
-
-    只有同时满足以下条件才走快速路径，任何一条不满足都完全回到旧行为：
-      - 开关 wake_fast_flip 打开（旧配置缺键 -> 默认 1）；
-      - 熄灭方式为 ddc（system 模式的 SC_MONITORPOWER -1 是即时广播，不需要翻转）；
-      - 允许切信号源（用户关掉「切信号源」时不得偷偷切换）。
-    `expect_off` 由 wake_options 当场探测得出（v2.01.0 起不读记账）：
-    探不到"确实待机"就按保守路径走，不翻转、不切源。
-
-    ⚠️ 这里只算一次 wake_options：它内部要读 DDC，算两次会让点亮慢一倍。
-    """
-    reset_wake_info()
-    if (not bool(cfg.get("wake_fast_flip", True))
-            or cfg.get("screen_off_method") != "ddc"):
-        return screen_on_cfg(cfg, indices)
-    opts = wake_options(cfg)
-    if not opts["allow_switch"]:
-        return screen_on_cfg(cfg, indices, wake_opts=opts)
-    return screen_wake_flip(indices, opts["allow_switch"], opts["expect_off"])
+def screen_on_cfg(cfg, indices, anchors=None):
+    """点亮显示器：现读现算把拓扑接回，再写亮度。"""
+    dlog("screen.on.enter", indices=normalize_indices(indices), anchors=anchors)
+    want = [str(a) for a in anchors] if anchors else topology_wanted_anchors(cfg)
+    ok, errs, restored = topology_on(want, cfg)
+    if errs:
+        return ok, errs
+    # 断开的屏在接回后才回到 EnumDisplayMonitors；用「接回后」的下标写亮度，
+    # 否则副屏接回来了却拿不到亮度（D3）。
+    write_to = sorted(set(normalize_indices(indices))
+                      | set(topology_indices_for_anchors(restored)))
+    if not write_to:
+        return ok, errs
+    bok, berrs = set_brightness_many(write_to, current_level(cfg))
+    return ok + bok, errs + berrs
 
 def current_level(cfg=None, now=None):
     """当前时刻应处的亮度（纯逻辑；定时任务与「测试当前档」共用）。"""
@@ -163,26 +111,6 @@ def selection_anchors(indices, targets=None):
     finally:
         if owned:
             release_targets(targets)
-
-def wake_options(cfg, probes=None):
-    """唤醒策略的两个开关，CLI 与界面共用。
-
-    `expect_off` 的意思是"这次点亮之前，屏幕可能真的是灭的"——它决定要不要
-    动用「切信号源」「快速翻转」这两招（会给本来就亮着的屏白闪两秒）。
-
-    v2.01.0：改成**当场探测**，不再读软件记账。判据只认可信方向：
-      读到任一屏 0xD6=2/3/4/5  → 确实待机过 → True
-      其余情况（含读不到）    → False，走保守路径
-    依据：`0xD6` 只会假阴性（待机时仍报 1），不会假阳性，所以"报了待机"
-    就是真的待机；"报了开"什么都不能证明。
-    """
-    if probes is None:
-        try:
-            probes = probe_states()
-        except Exception:
-            probes = []
-    return {"allow_switch": bool(cfg.get("wake_switch_input", True)),
-            "expect_off": any(p.get("state") == "off" for p in (probes or []))}
 
 def resolve_monitors(cfg):
     """把"用户选过的显示器"解析成**当前**的下标列表。

@@ -5,22 +5,12 @@ from hw.ddc import enumerate_targets, release_targets
 
 
 def status_payload(cfg, state, hint):
-    """动作刚结束时的即时显示。
-
-    v2.01.0：只有拓扑模式"动作完成 = 拓扑回读确认"才算知道结果；
-    ddc / system 读不到可信的亮灭，一律先显示未知，随后的「检测」
-    会用真实读数覆盖。宁可短暂不显示，也不给假结论。
-    """
-    if cfg.get("screen_off_method") != "topology":
-        return {"state": "unknown", "hint": hint}
+    """动作刚结束时的即时显示：拓扑回读确认后即可给出结论。"""
     return {"state": state, "hint": hint}
 
 
 def row_action_blocker(cfg, busy):
     """逐台按钮能不能用？不能用就返回一句原因。"""
-    method = cfg.get("screen_off_method")
-    if method not in ("ddc", "topology"):
-        return "「系统级」熄灭是整组广播，不能只动一块；改成「DDC」或「拓扑」才有逐台按钮"
     if busy:
         return "正在处理上一个操作，请稍候"
     return ""

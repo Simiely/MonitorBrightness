@@ -65,9 +65,6 @@ class _SettingsActions:
             elif key == "screen_auto_relight_min":
                 self.cfg[key] = max(0, min(120, int(value)))
                 save_config(self.cfg)
-            elif key == "wake_switch_input":
-                self.cfg[key] = bool(value)
-                save_config(self.cfg)
             elif key == "diag_log":
                 self.cfg[key] = bool(value)
                 save_config(self.cfg)
@@ -95,45 +92,6 @@ class _SettingsActions:
             self.status_var.set("开机自启动已" + ("开启" if enable else "关闭"))
         except Exception as e:
             self.msg.showerror("设置失败", "%s: %s" % (type(e).__name__, e))
-
-    def apply_off_method(self, value):
-        if value == "ddc" and not self.cfg.get("ddc_allow_undeclared"):
-            if not self.msg.askyesno(
-                    "单屏待机：有风险",
-                    "这条路的「熄灭」用面板待机命令（0xD6=2），但：\n"
-                    "• 你的面板能力串只声明 01/04/05，没声明 02；\n"
-                    "• 微软文档警告盲写未实现的 MCCS 值会导致未定义行为；\n"
-                    "• 万一唤不回，只能按显示器电源键。\n\n"
-                    "点亮时会依次尝试：电源模式 → 写亮度 → 输出重驱动 → 切信号源。"):
-                return
-            self.cfg["ddc_allow_undeclared"] = True
-        if value == "topology" and not self.msg.askyesno(
-                "拓扑断开：先确认",
-                "这条路会把「选中的副屏」从 Windows 桌面拓扑里移除，供串流隐藏物理屏用：\n"
-                "• 主屏不会被断（Windows 实测 rc=87），虚拟屏 VDD 永不作目标；\n"
-                "• 每次只断一块；恢复时先回读 ACTIVE 再写亮度（≤2 秒）；\n"
-                "• 窗口位置不保证完全还原，首次使用请做一次串流回归。\n\n"
-                "默认仍是「单屏待机」，选它才会切到本方式。"):
-            return
-        self.cfg["screen_off_method"] = value
-        # v2.01.0：`ddc_allow_undeclared` 是"这一次明知有风险"的授权，不是永久状态。
-        # 离开 ddc 就收回——否则用户在旧屏上点过一次「同意」，换屏后盲写
-        # 未声明的待机值这件事会被悄悄继承下来（走查 E2-05 的单向阀门）。
-        if value != "ddc":
-            self.cfg["ddc_allow_undeclared"] = False
-        save_config(self.cfg)
-        if value == "ddc":
-            self.status_var.set("熄灭方式：单屏待机（键鼠不会点亮）")
-        elif value == "topology":
-            self.status_var.set("熄灭方式：拓扑断开（副屏移除，主屏不动）")
-        else:
-            self.status_var.set("熄灭方式：系统级（整组熄灭，一定能唤回）")
-        # v2.01.22（走查 P-29）：切模式必须重建列表 ——
-        # topology 才列"断开的物理屏"，ddc/system 只留 VDD。
-        # 原来只 probe_screens，用户切到 topology 后看不到能接回的屏。
-        self.refresh_monitors()
-        # 状态卡的结论形态随模式变化（DDC 下不显示亮灭），立即重探一次
-        self.probe_screens()
 
     def _stop_tray(self):
         if self.tray is not None:

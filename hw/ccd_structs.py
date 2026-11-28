@@ -95,7 +95,7 @@ _CCD_EDID_IDS_VALID = 0x4          # DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.edid
 _CCD_TARGET_IN_USE = 0x1          # DISPLAYCONFIG_TARGET_IN_USE
 
 # ---- 拓扑动作层（E3）-----------------------------------------------------
-# 只服务于 screen_off_method == "topology"；默认 ddc / system 的路径完全不经过这里。
+# v2.04 起熄灭固定走拓扑，这些结构体就是唯一的开关屏路径。
 # 事实依据见 docs/拓扑探针.md C2–C5：
 #   - 副屏断开 rc=0 / 805ms，接回 986ms（含进程启动）；
 #   - 主屏断开 rc=87，Windows 不允许直接移除主屏；

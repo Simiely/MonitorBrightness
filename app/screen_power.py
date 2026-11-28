@@ -9,9 +9,8 @@ import threading
 
 from core.config import save_config
 from core.logging import _write_event_log, dlog
-from hw.power import take_wake_info
 from schedule import _as_ok_errs
-from service import screen_off_cfg, screen_on_row, screen_wake_entry, selection_anchors
+from service import screen_off_cfg, screen_on_cfg, screen_on_row, selection_anchors
 from app.common import auto_relight_minutes, row_action_blocker
 
 
@@ -29,17 +28,16 @@ class _ScreenPowerActions:
         if why:
             self.status_var.set(why)
             return
-        if self.cfg.get("screen_off_method") == "topology":
-            anchors = selection_anchors([index])
-            if not anchors:
-                self.status_var.set("拿不到这块屏的锚点，无法单独断开")
-                return
-            is_primary = (index < len(self.mon_info) and self.mon_info[index][3])
-            if is_primary:
-                # 主屏不能直接从拓扑里摘掉（Windows 实测 rc=87），但可以先把
-                # 主屏角色交给别人再摘 —— 全程纯拓扑操作，不碰面板电源。
-                self._ask_heir(index, anchors)
-                return
+        anchors = selection_anchors([index])
+        if not anchors:
+            self.status_var.set("拿不到这块屏的锚点，无法单独断开")
+            return
+        is_primary = (index < len(self.mon_info) and self.mon_info[index][3])
+        if is_primary:
+            # 主屏不能直接从拓扑里摘掉（Windows 实测 rc=87），但可以先把
+            # 主屏角色交给别人再摘 —— 全程纯拓扑操作，不碰面板电源。
+            self._ask_heir(index, anchors)
+            return
         self._busy_action = "off"
         self._row_action = True
         self.status_var.set("正在熄灭显示器 %d…" % index)
@@ -128,9 +126,8 @@ class _ScreenPowerActions:
             self._relight_timer = threading.Timer(
                 mins * 60, lambda: self._read_queue.put(("screen_action", "on", None)))
             self._relight_timer.start()
-        if self.cfg.get("screen_off_method") == "topology":
-            # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
-            self.refresh_monitors()
+        # 断开后副屏从 enumerate_targets 消失，重刷列表把它灰显列出来
+        self.refresh_monitors()
         self.probe_screens()
 
     def screen_on(self):
@@ -144,7 +141,7 @@ class _ScreenPowerActions:
             return
         self._busy_action = "on"
         self.status_var.set("正在点亮显示器…")
-        self.run_bg(lambda: screen_wake_entry(self.cfg, targets),
+        self.run_bg(lambda: screen_on_cfg(self.cfg, targets),
                     self._finish_screen_on, busy=True)
 
     def _cancel_relight_timer(self):
@@ -161,25 +158,20 @@ class _ScreenPowerActions:
     def _finish_screen_on(self, result):
         row_action, self._row_action = getattr(self, "_row_action", False), False
         ok, errs = _as_ok_errs(result)
-        info = take_wake_info()
         self._cancel_relight_timer()
         if ok:
             if not row_action:
                 self._remember_selection()
             save_config(self.cfg)
-            self.status_var.set("已点亮显示器" + (" · " + "；".join(info) if info else ""))
+            self.status_var.set("已点亮显示器")
             self.status_card.render(self._status_payload("on", "亮度与定时均正常"))
         if errs:
             detail = "\n".join(("显示器 %d：%s" % (i, e)) if i >= 0 else e
                                for i, e in errs)
             self.status_var.set("点亮失败：" + detail.replace("\n", " "))
-            tip = ("\n\n若这台屏是 DP+HDMI 同时接线，把「点亮时允许切信号源」关掉"
-                   "或改用「系统级」再试一次。"
-                   if self.cfg.get("screen_off_method") == "ddc" else "")
-            self.msg.showwarning("点亮失败", detail + tip)
-        if self.cfg.get("screen_off_method") == "topology":
-            # 接回后副屏重新出现，刷新列表把灰显行去掉
-            self.refresh_monitors()
+            self.msg.showwarning("点亮失败", detail)
+        # 接回后副屏重新出现，刷新列表把灰显行去掉
+        self.refresh_monitors()
         self.probe_screens()
 
     def _auto_relight_minutes(self):

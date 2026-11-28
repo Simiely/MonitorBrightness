@@ -10,11 +10,10 @@ from tests.support import (  # noqa: F401
 class TopologyActionTest(_TopoFixture):
     """E3/E4：拓扑动作层全部 monkeypatch，绝不碰真机屏幕。"""
 
-    def test_topology_is_default_off_method(self):
-        """v2.01.23：拓扑断开成为默认（原用例名是"新增选项但不改默认"）。"""
-        self.assertIn("topology", mb.OFF_METHODS)
-        self.assertEqual(mb.coerce_setting("screen_off_method", "topology"), "topology")
-        self.assertEqual(mb.default_config()["screen_off_method"], "topology")
+    def test_topology_is_the_only_off_path(self):
+        """v2.04：熄灭方式不再是可选项，配置里也不再有这个键。"""
+        self.assertNotIn("screen_off_method", mb.default_config())
+        self.assertNotIn("screen_off_method", mb.SETTING_BY_KEY)
 
     def test_plan_hands_over_primary_to_other_physical_screen(self):
         """只断主屏时，接班屏优先**物理屏**（用户看得见），而不是虚拟屏。"""
@@ -702,12 +701,12 @@ class TopologyScheduleTest(_TopoFixture):
 
     def test_schedule_on_defers_brightness_to_screen_on_cfg(self):
         """D3：档位层不能在接回拓扑之前写亮度；写亮度归 screen_on_cfg。"""
-        cfg = self._cfg(screen_off_method="topology")
+        cfg = self._cfg()
         with patch_any("active_slot_dict",
                                         return_value={"level": 75, "screen": "on"}), \
                 patch_any("resolve_monitors", return_value=[1]), \
                 patch_any("set_brightness_many") as bright, \
-                patch_any("screen_wake_entry",
+                patch_any("screen_on_cfg",
                                            return_value=([1], [])):
             level, screen, ok, errs = mb.apply_schedule(cfg)
         self.assertEqual((level, screen, ok, errs), (75, "on", [1], []))

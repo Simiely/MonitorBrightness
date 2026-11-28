@@ -41,7 +41,6 @@ import hw.ccd as hw_ccd
 import hw.ccd_structs as hw_structs
 import hw.ddc as hw_ddc
 import hw.geometry as hw_geometry
-import hw.power as hw_power
 import hw.topology as hw_topology
 import hw.winfollow as hw_winfollow
 import monitor_brightness as mb
@@ -54,7 +53,7 @@ import ui.sheets as ui_sheets_mod
 # 覆盖**调用方所在的那个绑定**，否则 mock 根本不会被调用到。这里用同一个
 # mock 实例同时 patch 所有持有该名字的模块，`as x` 拿到的仍是这个实例。
 _PATCH_MODULES = (mb, cfg_mod, log_mod, slots_mod, hw_ddc, hw_structs, hw_ccd,
-                  hw_topology, hw_geometry, hw_power, hw_winfollow, svc_mod,
+                  hw_topology, hw_geometry, hw_winfollow, svc_mod,
                   schedule_mod, sched_report_mod, cli_mod, ui_sheets_mod,
                   app_settings_mod, app_diag_mod, app_common_mod,
                   app_bright_mod, app_power_mod, app_schedule_mod,

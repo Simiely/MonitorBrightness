@@ -101,237 +101,11 @@ class BusyQueueTest(TempConfigCase):
         self.assertIn("正在点亮显示器", fake.status_var.get())
 
 
-class WakeSelectionTest(TempConfigCase):
-    """v1.9.6：点亮只作用于已勾选显示器；空勾选不发命令。"""
-
-    def _targets(self):
-        return [{"index": 0, "handle": 0xA0, "dev": "DISPLAY1", "desc": "A"},
-                {"index": 1, "handle": 0xB0, "dev": "DISPLAY2", "desc": "B"}]
-
-    def _patch(self):
-        self.writes, self.switches, self.recycles = [], [], []
-        self._saves = []
-        self._saves.append(set_any("enumerate_targets", self._targets))
-        self._saves.append(set_any("release_targets", lambda ts: None))
-        self._saves.append(set_any("_write_vcp", lambda h, c, v: (self.writes.append((h, c, v)), True)[1]))
-        self._saves.append(set_any("_read_vcp", lambda h, c: (80, 100)))
-        self._saves.append(set_any("_nudge_user_input", lambda: None))
-        self._saves.append(set_any("_output_recycle", lambda: (self.recycles.append("recycle"), True)[1]))
-        self._saves.append(set_any("_switch_input_roundtrip", lambda t: (self.switches.append(t["handle"]), True)[1]))
-        self._old_sleep = mb.time.sleep
-        mb.time.sleep = lambda s: None
-
-    def _restore(self):
-        for saved in reversed(self._saves):
-            restore_any(saved)
-        mb.time.sleep = self._old_sleep
-
-    def test_subset_wake_writes_only_checked_monitor(self):
-        self._patch()
-        try:
-            ok, errs = mb.screen_wake_many([0], allow_switch=True, expect_off=True)
-        finally:
-            self._restore()
-        self.assertEqual([w[0] for w in self.writes], [0xA0, 0xA0],
-                         "只勾 1 台时，另一台必须 0 次写调用")
-        self.assertEqual(self.recycles, [], "子集时不得广播 SC_MONITORPOWER")
-        self.assertEqual(self.switches, [0xA0])
-        self.assertEqual(ok, [0])
-        self.assertEqual(errs, [])
-
-    def test_all_selected_keeps_recycle_behavior(self):
-        self._patch()
-        try:
-            ok, errs = mb.screen_wake_many([0, 1], allow_switch=True, expect_off=True)
-        finally:
-            self._restore()
-        self.assertEqual(sorted({w[0] for w in self.writes}), [0xA0, 0xB0])
-        self.assertEqual(len(self.recycles), 2, "全选时每台仍走系统级重驱动（原行为）")
-        self.assertEqual(sorted(ok), [0, 1])
-
-    def test_empty_selection_shows_prompt_without_commands(self):
-        fake = type("F", (), {})()
-        fake.status_var = BusyQueueTest._Var()
-        fake._busy = False
-        fake.selected_indices = lambda: []
-        fake.run_bg = lambda *a, **k: self.fail("空勾选不得发命令")
-
-        mb.App.screen_on(fake)
-        self.assertIn("请先勾选", fake.status_var.get())
-        mb.App.screen_off(fake)
-        self.assertIn("请先勾选", fake.status_var.get())
-
-
-class FastFlipTest(TempConfigCase):
-    """v1.9.7：0x60 切源翻转快速点亮（打桩，不发任何真实 DDC 命令）。"""
-
-    def setUp(self):
-        super().setUp()
-        names = ("_read_vcp", "_write_vcp", "_capabilities_cached",
-                 "_display_key", "enumerate_targets", "release_targets",
-                 "screen_on_cfg", "screen_wake_flip", "_fast_flip_one",
-                 "_wake_one", "_broadcast_monitor_power")
-        self._orig = [(name, [(mod, getattr(mod, name))
-                              for mod in _PATCH_MODULES if hasattr(mod, name)])
-                      for name in names]
-        self._old_at = dict(mb._FAST_FLIP_AT)
-        self._old_sleep = mb.time.sleep
-        mb._FAST_FLIP_AT.clear()
-        self.sleeps = []
-        mb.time.sleep = lambda s: self.sleeps.append(s)
-
-    def tearDown(self):
-        for name, saves in reversed(self._orig):
-            for mod, old in saves:
-                setattr(mod, name, old)
-        mb._FAST_FLIP_AT.clear()
-        mb._FAST_FLIP_AT.update(self._old_at)
-        mb.time.sleep = self._old_sleep
-        super().tearDown()
-
-    def _targets(self):
-        return [{"index": 0, "handle": 0xA0, "dev": "DISPLAY1", "desc": "A"},
-                {"index": 1, "handle": 0xB0, "dev": "DISPLAY2", "desc": "B"}]
-
-    def test_flip_sequence_has_no_wait(self):
-        writes = []
-        set_any("_read_vcp", lambda h, c: (15, 100) if c == mb.VCP_INPUT_SOURCE else None)
-        set_any("_write_vcp", lambda h, c, v: (writes.append((h, c, v)), True)[1])
-        set_any("_capabilities_cached", lambda h, k: "60(11 12 0F)")
-        set_any("_display_key", lambda t: t["dev"])
-
-        ok, note = mb._fast_flip_one({"index": 0, "handle": 0xA0, "dev": "DISPLAY1"})
-        self.assertTrue(ok, note)
-        self.assertEqual(writes, [(0xA0, mb.VCP_INPUT_SOURCE, 17),
-                                 (0xA0, mb.VCP_INPUT_SOURCE, 15)],
-                         "必须 读 0x60 → 写中间源 → 立即写回原源")
-        self.assertEqual(self.sleeps, [], "快速路径不得有任何 sleep")
-        self.assertIn("翻转 0x60 15→17→15", note)
-        self.assertIn("耗时", note)
-
-    def test_mid_source_when_current_is_17(self):
-        self.assertEqual(mb.pick_flip_source(15, [17, 18, 15]), 17)
-        self.assertEqual(mb.pick_flip_source(17, [17, 18, 15]), 15,
-                         "当前就是 17 时必须换一个声明过的口")
-        self.assertEqual(mb.pick_flip_source(17, [17, 18]), 18)
-        self.assertEqual(mb.pick_flip_source(15, []), 17, "能力串读不到时用通用候选")
-        self.assertIsNone(mb.pick_flip_source(17, [17]))
-
-    def test_second_trigger_within_8s_escalates(self):
-        mb._mark_fast_flip("DISPLAY1#x", 100.0)
-        self.assertTrue(mb._fast_flip_recent("DISPLAY1#x", 103.0), "8 秒内算第二次")
-        self.assertFalse(mb._fast_flip_recent("DISPLAY1#x", 120.0), "超过窗口不算")
-        self.assertFalse(mb._fast_flip_recent("DISPLAY2#x", 103.0), "另一台不受影响")
-
-    def test_second_trigger_uses_full_ladder_and_says_so(self):
-        ladder = []
-        set_any("enumerate_targets", self._targets)
-        set_any("release_targets", lambda ts: None)
-        set_any("_display_key", lambda t: t["dev"])
-        set_any("_fast_flip_one", lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms"))
-        set_any("_wake_one", lambda t, a, e, r: (ladder.append((t["dev"], e)),
-                                                (True, 4, "x"))[1])
-
-        mb.screen_wake_flip([0])
-        # 第二次点击 = 第一次没点亮，8 秒内必须升级为完整阶梯。
-        # （v2.01.0 起 expect_off 由当场探测给出，不再依赖"第一次成功后把记账改成 on"）
-        mb.screen_wake_flip([0], expect_off=False)
-        self.assertEqual(ladder, [("DISPLAY1", True)],
-                         "第二次必须以 expect_off=True 走完整 _wake_one 阶梯")
-        self.assertIn("已升级为完整点亮", "；".join(mb.take_wake_info()))
-
-    def test_fast_flip_never_broadcasts(self):
-        broadcast = []
-        set_any("enumerate_targets", self._targets)
-        set_any("release_targets", lambda ts: None)
-        set_any("_display_key", lambda t: t["dev"])
-        set_any("_broadcast_monitor_power", lambda flag: (broadcast.append(flag), True)[1])
-        set_any("_fast_flip_one", lambda t: (True, "翻转 0x60 15→17→15，耗时 0.0 ms"))
-
-        ok, errs = mb.screen_wake_flip([0, 1])
-        self.assertEqual(sorted(ok), [0, 1])
-        self.assertEqual(errs, [])
-        self.assertEqual(broadcast, [], "快速路径绝不发 SC_MONITORPOWER 广播")
-
-    def test_switch_off_falls_back_to_v196_ladder(self):
-        cfg = mb.default_config()
-        cfg["wake_fast_flip"] = False
-        calls = []
-        set_any("screen_on_cfg", lambda c, i, **k: (calls.append("ladder"), ([0], []))[1])
-        set_any("screen_wake_flip", lambda *a, **k: self.fail("关掉开关不得走快速路径"))
-
-        ok, errs = mb.screen_wake_entry(cfg, [0])
-        self.assertEqual(calls, ["ladder"])
-        self.assertEqual(ok, [0])
-        self.assertEqual(errs, [])
-
-    def test_fast_path_gate_needs_ddc_and_switch_allowed(self):
-        cfg = mb.default_config()
-        # 显式指定 ddc：默认值可能变（v2.01.23 改成 topology），
-        # 这条用例测的是"ddc 模式下的快速点亮闸门"，不该依赖默认值。
-        cfg["screen_off_method"] = "ddc"
-        self.assertTrue(cfg["wake_fast_flip"])
-
-        calls = []
-        set_any("screen_wake_flip", lambda *a, **k: (calls.append("flip"), ([0], []))[1])
-        set_any("screen_on_cfg", lambda c, i, **k: (calls.append("ladder"), ([0], []))[1])
-
-        # v2.01.0：expect_off 现在靠当场探测；这里打桩成"读到待机"，避免碰真机 DDC。
-        with patch_any(
-                "probe_states",
-                return_value=[{"index": 0, "state": "off"}]):
-            mb.screen_wake_entry(cfg, [0])
-            cfg["wake_switch_input"] = False            # 用户禁用切源：回旧路径
-            mb.screen_wake_entry(cfg, [0])
-            cfg["wake_switch_input"] = True
-            cfg["screen_off_method"] = "system"         # 系统级点亮本来就是即时广播
-            mb.screen_wake_entry(cfg, [0])
-            cfg["screen_off_method"] = "ddc"
-            mb.screen_wake_entry(cfg, [0])
-        self.assertEqual(calls, ["flip", "ladder", "ladder", "flip"])
-
-    def test_expect_off_comes_from_live_probe_not_config(self):
-        """v2.01.0：点亮策略不再读记账，只看当场探测到的待机值。"""
-        cfg = mb.default_config()
-        cfg["screen_state"] = "off"        # 残留的旧记账，不得参与决策
-        with patch_any(
-                "probe_states",
-                return_value=[{"index": 0, "state": "on"}]):
-            self.assertFalse(mb.wake_options(cfg)["expect_off"])
-        with patch_any(
-                "probe_states",
-                return_value=[{"index": 0, "state": "off"}]):
-            self.assertTrue(mb.wake_options(cfg)["expect_off"])
-
-    def test_lit_screen_without_recent_flip_keeps_old_behavior(self):
-        calls = []
-        set_any("enumerate_targets", self._targets)
-        set_any("release_targets", lambda ts: None)
-        set_any("_display_key", lambda t: t["dev"])
-        set_any("_fast_flip_one", lambda t: self.fail("屏亮着且无近期记录时不得翻转"))
-        set_any("_wake_one", lambda t, a, e, r: (calls.append((t["dev"], e, r)),
-                                                (True, 4, "x"))[1])
-
-        mb.screen_wake_flip([0, 1], expect_off=False)
-        self.assertEqual(sorted(calls),
-                         [("DISPLAY1", False, True), ("DISPLAY2", False, True)],
-                         "必须原样按 expect_off=False 走 _wake_one，不翻转")
-
-    def test_old_config_without_key_defaults_to_enabled(self):
-        with open(mb.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"version": 6, "screen_off_method": "ddc"}, f)
-        cfg = mb.load_config()
-        self.assertIs(cfg["wake_fast_flip"], True,
-                      "旧配置缺 wake_fast_flip 必须按默认 1 处理")
-        self.assertEqual(mb.default_config()["wake_fast_flip"], True)
-
-
 class TopologyVerdictTest(unittest.TestCase):
     """E1 只读层：拓扑模式用 ACTIVE 当结论；非拓扑模式不再假装知道亮灭。"""
 
-    def _cfg(self, method="topology", anchors=None, **kw):
+    def _cfg(self, anchors=None, **kw):
         cfg = mb.default_config()
-        cfg["screen_off_method"] = method
         cfg["monitor_anchors"] = anchors or []
         cfg.update(kw)
         return cfg
@@ -364,38 +138,6 @@ class TopologyVerdictTest(unittest.TestCase):
             v = mb.screen_verdict(self._cfg(), probes=[])
         self.assertEqual(v["state"], "unknown")
 
-    def test_ddc_path_never_claims_on(self):
-        """v2.01.0：DDC/system 读不到可信的亮灭，0xD6=1 会撒谎，只能说不知道。"""
-        row = self._row("LUID/0001/0002/1", False)
-        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
-        with patch_any("ccd_probe_topology", return_value=[row]):
-            v = mb.screen_verdict(self._cfg(method="ddc"), probes=probes)
-        self.assertEqual(v["state"], "unknown")
-        self.assertNotIn("拓扑", v["text"])
-        self.assertIn("以眼睛为准", v["detail"])
-
-    def test_ddc_standby_value_is_trusted_direction(self):
-        """0xD6 只会假阴性：它报了待机就是真待机，可以据此说 off。"""
-        probes = [{"index": 0, "state": "off", "why": "0xD6=2 待机"}]
-        v = mb.screen_verdict(self._cfg(method="system"), probes=probes)
-        self.assertEqual(v["state"], "off")
-        self.assertIn("待机", v["text"])
-
-    def test_screen_verdict_never_reads_state_bookkeeping(self):
-        """配置里塞进旧的 screen_state 也不影响结论——程序不认这个字段。"""
-        cfg = self._cfg(method="system", screen_state="off", screen_state_at="11-27 21:00")
-        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
-        v = mb.screen_verdict(cfg, probes=probes)
-        self.assertEqual(v["state"], "unknown")
-        self.assertNotIn("21:00", v["text"] + v["detail"])
-
-    def test_unknown_verdict_carries_short_evidence(self):
-        """GUI 提示行要直接显示"为什么不知道"，所以证据得单独给一份短的。"""
-        probes = [{"index": 0, "state": "on", "why": "0xD6=1 开"}]
-        v = mb.screen_verdict(self._cfg(method="system"), probes=probes)
-        self.assertEqual(v["state"], "unknown")
-        self.assertIn("0=开", v["evidence"])
-        self.assertIn("依据：", v["detail"])      # 长版仍带前缀
 
     def test_topology_verdict_carries_evidence(self):
         row = self._row("LUID/0001/0002/1", True)
@@ -488,7 +230,6 @@ class TopologyGuiTest(TempConfigCase):
     def test_enable_passes_anchor_to_current_topology(self):
         """v2.01.0：启用不再查历史快照，直接把这块屏交给「现读现算」的接回。"""
         cfg = mb.default_config()
-        cfg["screen_off_method"] = "topology"
         with patch_any("screen_on_cfg",
                                         return_value=([1], [])) as on:
             ok, errs = mb.topology_enable_anchor(cfg, "A2")
@@ -497,7 +238,6 @@ class TopologyGuiTest(TempConfigCase):
 
     def test_enable_rejects_empty_anchor(self):
         cfg = mb.default_config()
-        cfg["screen_off_method"] = "topology"
         with patch_any("screen_on_cfg") as on:
             ok, errs = mb.topology_enable_anchor(cfg, "")
         self.assertEqual(ok, [])
@@ -557,35 +297,6 @@ class TopologyGuiTest(TempConfigCase):
         finally:
             root.destroy()
 
-    def test_panel_hides_row_buttons_for_group_wide_method(self):
-        """系统级熄灭是整组广播：一个逐台按钮都不该有，免得点了没反应。"""
-        try:
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-        except Exception as e:                       # pragma: no cover
-            self.skipTest("没有可用显示：%s" % e)
-        try:
-            cfg = mb.default_config()
-            cfg["screen_off_method"] = "system"
-            fake = types.SimpleNamespace(
-                body=tk.Frame(root), cfg=cfg,
-                monitors=[{"index": 0, "dev": "DISPLAY1"}],
-                mon_info=[("DISPLAY1", 2560, 1440, True)], mon_models={},
-                topo_inactive=[], refresh_monitors=lambda silent=False: None,
-                read_current=lambda: None, on_monitor_toggle=lambda: None,
-                select_none=lambda: None, select_all=lambda: None,
-                monitor_off=lambda i: None, monitor_on=lambda i: None,
-                topology_enable=lambda anchor: None)
-            panel = mb.MonitorPanel(fake)
-            fake.mon_panel = panel
-            panel.rebuild([])
-            got = [_row_button_texts(row)
-                   for row in panel.inner.winfo_children()]
-            self.assertNotIn("熄灭", got)
-            self.assertNotIn("显示", got)
-        finally:
-            root.destroy()
 
     def test_primary_row_has_one_enabled_off_button_in_topology_mode(self):
         """拓扑模式移不走主屏，但「熄灭」**可点**：点了会解释并给替代方案。
@@ -601,7 +312,6 @@ class TopologyGuiTest(TempConfigCase):
             self.skipTest("没有可用显示：%s" % e)
         try:
             cfg = mb.default_config()
-            cfg["screen_off_method"] = "topology"
             fake = types.SimpleNamespace(
                 body=tk.Frame(root), cfg=cfg,
                 monitors=[{"index": 0, "dev": "DISPLAY1"},
@@ -635,37 +345,6 @@ class TopologyGuiTest(TempConfigCase):
         finally:
             root.destroy()
 
-    def test_ddc_mode_switches_button_by_state(self):
-        """DDC 模式下屏幕被枚举不代表面板亮着：按探测结论给「显示」。"""
-        try:
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-        except Exception as e:                       # pragma: no cover
-            self.skipTest("没有可用显示：%s" % e)
-        try:
-            cfg = mb.default_config()
-            cfg["screen_off_method"] = "ddc"
-            fake = types.SimpleNamespace(
-                body=tk.Frame(root), cfg=cfg,
-                monitors=[{"index": 0, "dev": "DISPLAY1"},
-                          {"index": 1, "dev": "DISPLAY2"}],
-                mon_info=[("DISPLAY1", 2560, 1440, True),
-                          ("DISPLAY2", 2560, 1440, False)], mon_models={},
-                topo_inactive=[], _screen_states={1: "off"},
-                refresh_monitors=lambda silent=False: None,
-                read_current=lambda: None, on_monitor_toggle=lambda: None,
-                select_none=lambda: None, select_all=lambda: None,
-                monitor_off=lambda i: None, monitor_on=lambda i: None,
-                topology_enable=lambda anchor: None)
-            panel = mb.MonitorPanel(fake)
-            fake.mon_panel = panel
-            panel.rebuild([])
-            rows = list(panel.inner.winfo_children())
-            self.assertEqual(_row_button_texts(rows[0]), ["熄灭"])   # 亮着
-            self.assertEqual(_row_button_texts(rows[1]), ["显示"])   # DDC 报待机
-        finally:
-            root.destroy()
 
 
 class SelectionAnchorsTest(unittest.TestCase):

@@ -17,12 +17,11 @@ from hw.ddc import (
     enumerate_targets, monitor_label, probe_states, release_targets,
     set_brightness_many,
 )
-from hw.power import take_wake_info
 from schedule import (
     _task_action, apply_schedule, ensure_task_registration, query_task_runtime,
     query_task_status, task_match_reason,
 )
-from service import resolve_monitors, screen_off_cfg, screen_wake_entry
+from service import resolve_monitors, screen_off_cfg, screen_on_cfg
 
 # 0x60 输入源取值（只列常见项，其余照原样显示数字）
 INPUT_LABEL = {1: "模拟1", 2: "模拟2", 3: "DVI-1", 4: "DVI-2", 5: "复合1",
@@ -101,8 +100,6 @@ def cli_apply_schedule():
             _err("显示器 %s: %s" % (i, e))
         if screen:
             _out("屏幕动作: %s" % screen)
-        for line in take_wake_info():
-            _out(line)
         sys.exit(0 if ok else 1)
     except Exception as e:
         _err(e)
@@ -152,8 +149,8 @@ def _diag_header_lines():
     lines.append("Python %s · 打包态=%s · 配置=%s"
          % (sys.version.split()[0], bool(getattr(sys, "frozen", False)), CONFIG_FILE))
     cfg = load_config()
-    lines.append("配置：presets=%s · 熄灭方式=%s（屏幕亮灭每次现读，不记账）"
-         % (cfg.get("presets"), cfg.get("screen_off_method")))
+    lines.append("配置：presets=%s · 熄灭方式=topology（屏幕亮灭每次现读，不记账）"
+         % cfg.get("presets"))
     lines.append("配置里的显示器选择：monitors=%s · monitor_ids=%s · monitor_anchors=%s"
          % (cfg.get("monitors"), cfg.get("monitor_ids"), cfg.get("monitor_anchors")))
     lines.append("接回位置记录：%s" % (cfg.get("monitor_positions") or "{}"))
@@ -299,10 +296,8 @@ def cli_screen(action):
         ok, errs = screen_off_cfg(cfg, targets)
         _out("已熄灭显示器" if ok else "熄灭失败")
     else:
-        ok, errs = screen_wake_entry(cfg, targets)
+        ok, errs = screen_on_cfg(cfg, targets)
         _out("已点亮显示器" if ok else "点亮失败")
-        for line in take_wake_info():
-            _out(line)
     for i, e in errs:
         _out("显示器 %d：%s" % (i, e))
     if errs and not ok:

@@ -171,7 +171,7 @@ class BrightnessActionsTest(unittest.TestCase):
         br_mod._BrightnessActions.on_monitor_toggle(fake)
         self.assertEqual(fake.read_current.call_count, 3)
 
-    def test_refresh_monitors_keeps_only_vdd_in_ddc_mode(self):
+    def test_refresh_monitors_keeps_vdd_and_disconnected_physical(self):
         fake = self._fake()
         targets = [{"index": 0, "handle": 11, "dev": "DISPLAY1",
                     "w": 1920, "h": 1080, "primary": True}]
@@ -184,8 +184,8 @@ class BrightnessActionsTest(unittest.TestCase):
              mock.patch.object(br_mod, "topology_inactive_rows", return_value=inactive):
             br_mod._BrightnessActions.refresh_monitors(fake)
         release.assert_called_once_with(targets)
-        self.assertEqual(len(fake.topo_inactive), 1)
-        self.assertTrue(fake.topo_inactive[0]["vdd"])
+        self.assertEqual(len(fake.topo_inactive), 2)
+        self.assertEqual([r["vdd"] for r in fake.topo_inactive], [False, True])
         fake.mon_panel.rebuild.assert_called_once()
 
     def test_finish_preset_reports_partial_failure(self):

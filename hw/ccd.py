@@ -16,7 +16,6 @@ from hw.ccd_structs import (
     _CcdModeInfo, _CcdPathInfo, _CcdSourceName, _CcdTargetName,
     _QDC_ALL_PATHS, _QDC_VIRTUAL_MODE_AWARE, TOPO_VERIFY_TIMEOUT,
 )
-from hw.ddc import _human_gap, _idle_seconds, probe_states
 
 def _ccd_setup_probe_api(u32):
     """声明只读探测用到的三个 API 签名（不调用）。"""
@@ -170,74 +169,28 @@ def topology_state_for(cfg, rows=None):
     return {"state": state, "detail": detail, "rows": rows}
 
 def screen_verdict(cfg, probes=None):
-    """给出"屏幕现在是亮还是灭"的结论 + 一行依据——**只依据当场读到的信号**。
+    """给出亮灭结论：v2.04 起只依据 CCD 拓扑的 ACTIVE flag。
 
-    ⚠️ v2.01.0 设计纠偏：程序**不维护任何屏幕状态账**。
-    拓扑和系统才是唯一事实源，每次要结论就现场读，读不到就说"不知道"：
-
-      topology  → CCD 的 ACTIVE flag 是系统事实，直接当结论（on/off/unknown）。
-      system /  → Windows 没有公开可靠的"显示器电源"读取接口，
-      ddc          实测 `0xD6` 在面板已黑时仍报 1（会撒谎）。
-                   所以：
-                     · 读到 0xD6=2/3/4/5 → 可信地说明它待机了 → off
-                       （0xD6 只会假阴性，不会假阳性）
-                     · 其余情况 → unknown，把读到的寄存器、上次输入距今时间
-                       摊开给用户自己判断
-                   给个假结论比说"不知道"更糟：v1.5.0 就是
-                   "程序说亮着、屏幕其实黑着"。
-
-    返回 {"state": "on"/"off"/"unknown", "text": "...", "detail": "..."}。
+    `probes` 参数保留是为了兼容旧调用方，已被忽略——程序不再用 0xD6 回读
+    判断亮灭（它在面板已黑时仍可能报 1）。读不到就说"不知道"。
     """
-    if cfg.get("screen_off_method") == "topology":
-        try:
-            topo = topology_state_for(cfg)
-        except Exception as e:
-            topo = {"state": "unknown", "detail": "拓扑读取失败：%s" % e, "rows": []}
-        state = topo["state"]
-        if state == "on":
-            text = "屏幕：显示中（拓扑）"
-            tail = "物理电源键、Windows 自动熄屏不在拓扑追踪范围内"
-        elif state == "off":
-            text = "屏幕：已断开（拓扑）"
-            tail = "接回时按当前拓扑现算，再写亮度"
-        else:
-            text = "屏幕：状态未知（拓扑）"
-            tail = topo["detail"]
-        return {"state": state, "text": text,
-                "evidence": topo["detail"],
-                "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else "")}
-
-    if probes is None:
-        try:
-            probes = probe_states()
-        except Exception:
-            probes = []
-    idle = _idle_seconds()
-    offs = [p for p in (probes or []) if p.get("state") == "off"]
-
-    if offs:
-        state = "off"
-        text = "屏幕：已熄灭（DDC 报待机）"
-        tail = "点「点亮屏幕」恢复；键鼠输入未必唤得回来"
+    try:
+        topo = topology_state_for(cfg)
+    except Exception as e:
+        topo = {"state": "unknown", "detail": "拓扑读取失败：%s" % e, "rows": []}
+    state = topo["state"]
+    if state == "on":
+        text = "屏幕：显示中（拓扑）"
+        tail = "物理电源键、Windows 自动熄屏不在拓扑追踪范围内"
+    elif state == "off":
+        text = "屏幕：已断开（拓扑）"
+        tail = "接回时按当前拓扑现算，再写亮度"
     else:
-        state = "unknown"
-        text = "屏幕：状态未知"
-        tail = "Windows 没有可靠的显示器电源读取接口，亮灭请以眼睛为准"
-
-    bits = []
-    if probes:
-        # 原始寄存器值留给 --probe / --diag，结论行只给人话
-        bits.append("DDC 回读 %s"
-                    % "、".join("%d=%s" % (p["index"],
-                                          {"on": "开", "off": "灭"}.get(p["state"], "未知"))
-                                for p in probes))
-    else:
-        bits.append("DDC 无回读")
-    if idle is not None:
-        bits.append("上次输入 %s" % ("刚发生" if idle < 2 else _human_gap(idle)))
-    evidence = " · ".join(bits)
-    return {"state": state, "text": text, "evidence": evidence,
-            "detail": "依据：" + evidence + ("｜" + tail if tail else "")}
+        text = "屏幕：状态未知（拓扑）"
+        tail = topo["detail"]
+    return {"state": state, "text": text,
+            "evidence": topo["detail"],
+            "detail": "依据：" + topo["detail"] + ("｜" + tail if tail else "")}
 
 def _ccd_api():
     """拿一份声明好函数签名的 user32；非 Windows 返回 None。"""

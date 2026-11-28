@@ -18,7 +18,7 @@ from domain.timeutil import (
     WEEKDAY_LABELS, WEEKDAY_NAMES_PS, normalize_days, parse_hhmm, slots_for_weekday,
 )
 from hw.ddc import set_brightness_many
-from service import resolve_monitors, screen_off_cfg, screen_wake_entry
+from service import resolve_monitors, screen_off_cfg, screen_on_cfg
 from schedule_report import (
     TASK_CATCHUP, TASK_SCHEDULE, TASK_SHORT, _LEGACY_TASKS,
     _as_ok_errs, _boundary_minutes_all, _boundary_to_minutes,
@@ -52,19 +52,17 @@ def apply_schedule(cfg=None):
     screen = slot.get("screen", "")
     targets = resolve_monitors(cfg)
     dlog("sch.decide", slot=slot, level=level, screen=screen, targets=targets,
-         method=cfg.get("screen_off_method"), weekday=_wd,
-         slot_days=slot.get("days") or [])
-    # D3：拓扑模式的 off 跳过亮度（inactive 时 DDC 读不到/写不进）；
+         weekday=_wd, slot_days=slot.get("days") or [])
+    # 拓扑模式的 off/on 跳过这里的亮度：inactive 时 DDC 读不到/写不进；
     # on 的亮度由 screen_on_cfg 在「按当前拓扑接回 → 回读」之后写。
-    topo = cfg.get("screen_off_method") == "topology"
-    if topo and screen in ("off", "on"):
+    if screen in ("off", "on"):
         ok, errs = [], []
     else:
         ok, errs = set_brightness_many(targets, level)
     if screen == "off":
         sok, serrs = screen_off_cfg(cfg, targets)
     elif screen == "on":
-        sok, serrs = screen_wake_entry(cfg, targets)
+        sok, serrs = screen_on_cfg(cfg, targets)
     else:
         sok, serrs = [], []
     ok = ok + sok

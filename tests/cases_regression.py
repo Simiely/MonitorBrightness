@@ -17,20 +17,19 @@ class WalkthroughRound2Test(TempConfigCase):
         取消了，这条回归改成：无论成败，apply_schedule 都不许写配置。）
         """
         cfg = mb.default_config()
-        # 显式选 ddc：这条用例要的是"走 screen_off_cfg 这条路时也不写状态"，
-        # 与默认值无关（v2.01.23 默认改 topology 后不能再依赖默认）。
-        cfg["screen_off_method"] = "ddc"
+        # 走 screen_off_cfg 这条路时也不写状态（v2.04 起它固定走拓扑）。
         cfg["slots"] = mb._coerce_slots([{"time": "08:30", "level": 80, "screen": "off"}])
         with patch_any("active_slot_dict",
                                         return_value={"level": 80, "screen": "off"}), \
                 patch_any("set_brightness_many", return_value=([0], [])), \
                 patch_any("screen_off_cfg",
-                                           return_value=([], [(-1, "DDC 写失败")])), \
+                                           return_value=([], [(-1, "拓扑断开失败")])), \
                 patch_any("save_config") as save:
             level, screen, ok, errs = mb.apply_schedule(cfg)
         save.assert_not_called()
         self.assertNotIn("screen_state", cfg)
-        self.assertEqual(ok, [0])                # 亮度成功仍保留在返回值里
+        # v2.04：off 档跳过这里的亮度写入，返回值只反映拓扑动作
+        self.assertEqual(ok, [])
         self.assertTrue(errs)                    # 屏幕动作错误必须上报
 
     def test_save_failure_is_logged(self):
@@ -166,21 +165,6 @@ class WalkthroughRound2Test(TempConfigCase):
             ok, msg = mb.ensure_task_registration(cfg, force=True)
         self.assertFalse(ok)
         self.assertIn("清理失败", msg)
-
-    def test_leaving_ddc_revokes_undeclared_permission(self):
-        """E2-05：ddc_allow_undeclared 不是单向阀门，离开 ddc 就收回授权。"""
-        cfg = dict(mb.default_config(), screen_off_method="ddc",
-                   ddc_allow_undeclared=True)
-        fake = types.SimpleNamespace(
-            cfg=cfg,
-            msg=types.SimpleNamespace(askyesno=lambda *a, **k: True),
-            status_var=types.SimpleNamespace(set=lambda t: None),
-            refresh_monitors=lambda silent=False: None,
-            probe_screens=lambda: None)
-        with patch_any("save_config", return_value=(True, "")):
-            mb.App.apply_off_method(fake, "system")
-        self.assertFalse(fake.cfg["ddc_allow_undeclared"])
-        self.assertEqual(fake.cfg["screen_off_method"], "system")
 
 
 class WalkthroughFixTest(TempConfigCase):

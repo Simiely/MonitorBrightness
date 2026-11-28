@@ -349,7 +349,7 @@ def topology_off(indices, cfg=None, heir=None):
     `cfg` 给了就把这些屏**此刻**的桌面位置写进 `monitor_positions`，供下次
     接回摆回原位（记录的是平移后的坐标，接回时正好落在新主屏旁边）。
 
-    返回 (成功下标列表, [(下标, 错误), ...])，与 screen_off_many 同形状。
+    返回 (成功下标列表, [(下标, 错误), ...])，与逐台接口同形状。
     """
     u32 = _ccd_api()
     if u32 is None:

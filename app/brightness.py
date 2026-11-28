@@ -52,12 +52,10 @@ class _BrightnessActions:
         finally:
             release_targets(targets)
         self.mon_info = [(t["dev"], t["w"], t["h"], t["primary"]) for t in self.monitors]
-        # v2.01.21：CCD 探测（QDC_ALL_PATHS，实测 0.1ms）在**任何模式**都做：
-        #   1) 填 `_ccd_names` —— DDC 读型号要 6.2 秒，期间先用真实友好名显示，
-        #      别让用户看"显示器 0"（截图实证）；
-        #   2) 填 `topo_inactive` —— 虚拟显示器始终列出来。以前只有 topology
-        #      模式才列，默认 ddc 模式下串流在跑也看不见 VDD（用户报"没刷新出
-        #      虚拟显示器"）。物理断开屏仍只在 topology 模式列（只有它能接回）。
+        # CCD 探测（QDC_ALL_PATHS，实测 0.1ms）：
+        #   1) 填 `_ccd_names` —— DDC 读型号要 6.2 秒，期间先用真实友好名显示；
+        #   2) 填 `topo_inactive` —— 虚拟屏与物理断开屏都列出来。
+        #      v2.04 起只走拓扑，这一份列表就是唯一事实源。
         try:
             rows = ccd_probe_topology()
             self._vdd_devs = {_short_dev(r.get("gdi"))
@@ -66,11 +64,7 @@ class _BrightnessActions:
                                for r in rows
                                if r.get("gdi") and r.get("friendly")}
             inactive = topology_inactive_rows(rows)
-            if self.cfg.get("screen_off_method") == "topology":
-                self.topo_inactive = inactive
-            else:
-                # 非拓扑模式：只留 VDD（灰显、无操作按钮），它代表串流在跑
-                self.topo_inactive = [r for r in inactive if r.get("vdd")]
+            self.topo_inactive = inactive
         except Exception:
             self._vdd_devs = set()
             self._ccd_names = {}

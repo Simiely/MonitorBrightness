@@ -10,10 +10,7 @@ SettingsSheet 已在 R4-1 从主文件搬入（配置层已就位），__init__ 
 import tkinter as tk
 from tkinter import ttk
 
-from core.config import (
-    APP_VERSION, OFF_METHODS, OFF_METHOD_LABEL, SETTING_BY_KEY,
-    get_autostart,
-)
+from core.config import APP_VERSION, get_autostart
 from core.util import _safe_int
 
 from domain.screen_actions import (
@@ -439,18 +436,13 @@ class HelpSheet(Sheet):
             "DDC 回读只作参考 —— 面板待机时仍会回报“已开机”，不可信。",
             "物理电源键、Windows 自动熄屏不在追踪范围内。",
         ])
-        block("三种熄灭方式", [
-            "系统级：整组一起灭，一定唤得回；任何键鼠输入都会点亮。",
-            "DDC 单屏待机（默认）：键鼠不会点亮，适合远程防窥；唤醒靠四级兜底，"
-            "个别面板仍可能唤不回。",
-            "拓扑断开：把选中的屏从 Windows 桌面移除，串流时只留虚拟显示器。",
+        block("熄灭方式：只用拓扑", [
+            "v2.04 起固定用 CCD 断开副屏：把选中的屏从 Windows 桌面移除，"
+            "串流时只留虚拟显示器。不写面板电源命令，也不发系统级广播。",
             "断开主屏时，会先问「把主屏交给谁」——让另一块屏挪到桌面原点接任主屏，"
-            "再把原主屏摘掉。全程纯拓扑操作，不碰面板电源。",
+            "再把原主屏摘掉。",
             "全部物理屏都断开时，主屏交给虚拟显示器（串流形态）。",
-        ])
-        block("唤醒阶梯", [
-            "0xD6=1 电源模式 → 写回亮度 → 输出重驱动（SC_MONITORPOWER 2→-1）"
-            " → 切信号源，任何一级成功即停。",
+            "接回 = 按当前拓扑现算后写亮度；不再做切源/系统广播兜底。",
         ])
         block("定时为什么这次准了", [
             "每次启动都会校验计划任务是否仍指向当前程序；换了目录/文件名会自动重建。",
@@ -513,19 +505,10 @@ class SettingsSheet(Sheet):
         pbg = off.cget("bg")
         wrap = tk.Frame(off, bg=pbg)
         wrap.pack(fill="x", padx=14, pady=(10, 6))
-        mode_lbl = Label(wrap, "熄灭方式", size=9, bg=pbg)
+        mode_lbl = Label(wrap, "熄灭方式：拓扑断开（固定）", size=9, bg=pbg)
         mode_lbl.pack(anchor="w")
-        # v2.01.15：说明文字全挪到悬停气泡，标题下不再常驻小字
-        Tooltip(mode_lbl, "系统级：整组熄灭、键鼠会点亮\n"
-                          "单屏待机：键鼠不点亮，个别面板唤不回\n"
-                          "拓扑断开：从桌面移除副屏，串流用；接回摆回原位")
-        mode = Segmented(wrap, [OFF_METHOD_LABEL[m] for m in OFF_METHODS],
-                         # fallback 跟着 SETTINGS 的默认值走，别再硬编码
-                         index=OFF_METHODS.index(
-                             cfg.get("screen_off_method")
-                             or SETTING_BY_KEY["screen_off_method"]["default"]),
-                         command=lambda i: app.apply_off_method(OFF_METHODS[i]))
-        mode.pack(fill="x", pady=(5, 0))
+        Tooltip(mode_lbl, "从 Windows 桌面移除选中的副屏；接回时按当前拓扑现算再写亮度。\n"
+                          "v2.04 起不再提供 DDC 单屏待机与系统级整组熄灭。")
         tk.Frame(off, bg=UI["sep"], height=1).pack(fill="x", padx=14)
         self._build_off_behavior(off, app, cfg)
 
@@ -542,10 +525,6 @@ class SettingsSheet(Sheet):
 
         self.row(off, "熄灭后自动点亮", tip="0 = 不自动；远程时建议设个值", builder=_relight)
 
-        self.row(off, "点亮时允许切信号源",
-                 tip="最后一招；DP+HDMI 双线时可能切到空口",
-                 builder=lambda p: Switch(p, bool(cfg.get("wake_switch_input", True)),
-                                          lambda v: app.apply_setting("wake_switch_input", v)).pack())
         # 交接主屏会把所有屏平移，Windows 会顺手把应用窗口挤到一起且不搬回来
         self.row(off, "改显示器时窗口跟着屏走",
                  tip="拓扑变化后把应用窗口搬回原来那块屏；关掉则完全交给 Windows",

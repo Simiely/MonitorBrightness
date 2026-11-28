@@ -176,7 +176,7 @@ def diag_export(dest_dir=None):
             "程序目录：%s" % APP_DIR,
             "日志目录：%s" % LOG_DIR,
             "配置目录：%s" % CONFIG_DIR,
-            "熄灭方式：%s" % cfg.get("screen_off_method"),
+            "熄灭方式：topology（v2.04 起固定）",
             "锚点：%s" % (cfg.get("monitor_anchors") or []),
             "位置记录：%s" % (cfg.get("monitor_positions") or {}),
             "诊断日志：%s" % ("开启" if diag_enabled() else "关闭"),

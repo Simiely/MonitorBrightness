@@ -422,7 +422,7 @@ class _LayoutActions:
                 try:
                     out[t["index"]] = monitor_model(t["handle"], _display_key(t))
                 finally:
-                    # 同 screen_wake_many：句柄由线程自己销毁，避免 join 超时后 UAF
+                    # 句柄由线程自己销毁，避免 join 超时后 UAF
                     try:
                         lib.DestroyPhysicalMonitor(t["handle"])
                     except Exception:

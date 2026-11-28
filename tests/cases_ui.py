@@ -14,23 +14,15 @@ from tests.cases_screen import BusyQueueTest  # noqa: F401
 class UiDecisionTest(unittest.TestCase):
     """v2.03.0 P2：从 App 抽出的界面决策纯函数（不碰 Tk，可独立测）。"""
 
-    def test_status_payload_only_trusts_topology(self):
-        cfg = {"screen_off_method": "topology"}
-        self.assertEqual(mb.status_payload(cfg, "off", "h"),
+    def test_status_payload_uses_topology_result(self):
+        self.assertEqual(mb.status_payload({}, "off", "h"),
                          {"state": "off", "hint": "h"})
-        cfg["screen_off_method"] = "ddc"
-        self.assertEqual(mb.status_payload(cfg, "off", "h"),
-                         {"state": "unknown", "hint": "h"})
-        cfg["screen_off_method"] = "system"
-        self.assertEqual(mb.status_payload(cfg, "on", "h")["state"], "unknown")
+        self.assertEqual(mb.status_payload({}, "on", "h")["state"], "on")
 
     def test_row_action_blocker(self):
-        self.assertIn("整组广播",
-                      mb.row_action_blocker({"screen_off_method": "system"}, False))
-        self.assertEqual(mb.row_action_blocker({"screen_off_method": "ddc"}, True),
+        self.assertEqual(mb.row_action_blocker({}, True),
                          "正在处理上一个操作，请稍候")
-        self.assertEqual(mb.row_action_blocker({"screen_off_method": "ddc"}, False), "")
-        self.assertEqual(mb.row_action_blocker({"screen_off_method": "topology"}, False), "")
+        self.assertEqual(mb.row_action_blocker({}, False), "")
 
     def test_restore_selection(self):
         # 启动：全选
