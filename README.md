@@ -74,8 +74,9 @@ pip install pyinstaller
 pyinstaller --onefile --windowed --name MonitorBrightness monitor_brightness.py
 ```
 
-> 仓库另附 `monitor_brightness_qt.py`（PySide6/Qt 变体，体积约 48 MB），停留在 v1.0.0
-> 的功能水平（单选 / 浅色 / 旧定时逻辑），按需自行改造。
+> `legacy/monitor_brightness_qt.py` 是 v1.0.0 的 PySide6/Qt 旧变体（单选 / 浅色 /
+> 旧定时逻辑），**不随新版分发**；它只读写 `config_qt_legacy.json`，不会覆盖新版
+> `config.json`。仅作历史参考，不建议继续使用。
 
 ## 常见问题（高频 4 条）
 

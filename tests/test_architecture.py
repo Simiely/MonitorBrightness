@@ -107,6 +107,13 @@ class ArchitectureContractTest(unittest.TestCase):
                             src_layer, dst))
         self.assertEqual(violations, [], "反向/越层 import：\n" + "\n".join(violations))
 
+    def test_legacy_qt_does_not_share_main_config(self):
+        """P0-1：旧 Qt 变体必须用自己的配置名，绝不能覆盖新版 config.json。"""
+        legacy = ROOT / "legacy" / "monitor_brightness_qt.py"
+        text = legacy.read_text(encoding="utf-8")
+        self.assertIn('config_qt_legacy.json', text)
+        self.assertNotIn('os.path.join(CONFIG_DIR, "config.json")', text)
+
     def test_no_source_file_over_700_lines(self):
         bad = []
         for path in _source_paths():

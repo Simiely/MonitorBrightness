@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""显示器亮度定时调节 - 简单 GUI 工具 (DDC/CI) [PySide6]
+"""显示器亮度定时调节 - 旧版 PySide6 界面（LEGACY，不随新版分发）
+
+⚠️ 这是 v1.0.0 时期的旧实现，只保留作历史参考。它使用旧配置 schema
+（monitor/day_time/night_level），**不得再读写新版 config.json**；本文件
+已隔离到 `config_qt_legacy.json`，避免误运行覆盖 v3 配置。
 
 功能:
   - 图形界面选择显示器、拖动滑块即时调节亮度（硬件级 DDC/CI，非软件滤镜）
@@ -27,7 +31,7 @@ from PySide6.QtCore import Qt
 
 APP_TITLE = "显示器亮度定时调节"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MonitorBrightness")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config_qt_legacy.json")
 TASK_DAY = "MonitorBrightness_Day"
 TASK_NIGHT = "MonitorBrightness_Night"
 
@@ -307,6 +311,7 @@ def main():
         return
     if get_monitors is None:
         QMessageBox.critical(None, "缺少依赖", "monitorcontrol 未能加载，请重新安装本程序。")
+        return
     app = QApplication(sys.argv)
     w = App()
     w.show()

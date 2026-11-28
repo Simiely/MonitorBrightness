@@ -1952,6 +1952,35 @@ class RegisterScriptTest(unittest.TestCase):
         self.assertIn("REBUILT=FALLBACK", script)
 
 
+class ScheduleSubprocessTest(unittest.TestCase):
+    """P0-2：PowerShell 被卡住/缺失时要返回可读错误，不能 traceback。"""
+
+    def test_timeout_returns_124(self):
+        import subprocess
+        with unittest.mock.patch.object(
+                schedule_mod.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("powershell", 90)):
+            code, out = schedule_mod._ps("Write-Output ok", timeout=90)
+        self.assertEqual(code, 124)
+        self.assertIn("超时", out)
+
+    def test_missing_powershell_returns_127(self):
+        with unittest.mock.patch.object(
+                schedule_mod.subprocess, "run",
+                side_effect=OSError("access denied")):
+            code, out = schedule_mod._ps("Write-Output ok")
+        self.assertEqual(code, 127)
+        self.assertIn("无法启动 PowerShell", out)
+
+    def test_register_tasks_turns_timeout_into_false(self):
+        cfg = mb.default_config()
+        with unittest.mock.patch.object(
+                schedule_mod, "_ps", return_value=(124, "PowerShell 超时（90s）")):
+            ok, out = schedule_mod.register_tasks(cfg)
+        self.assertFalse(ok)
+        self.assertIn("超时", out)
+
+
 class SelectionAnchorsTest(unittest.TestCase):
     """勾选 → 锚点。aliases 是陷阱：每块屏的 aliases 都含 DISPLAY1~4。"""
 
@@ -3471,11 +3500,28 @@ class DefaultLayoutTest(TempConfigCase):
         """快照长度对不上时，一个 SetDisplayConfig 都不该发。"""
         bad = {"pathCount": 99, "modeCount": 1,
                "pathsHex": "00", "modesHex": "00", "targetAnchors": []}
-        with patch_any("_ccd_api", return_value=object()), \
+        with patch_any("_ccd_api", side_effect=AssertionError("不该取 API")), \
                 patch_any("dlog"), \
                 patch_any(
                     "_ccd_apply", side_effect=AssertionError("不该 apply")):
             err = mb.restore_default_layout(snap=bad)
+        self.assertIn("结构不符", err)
+
+    def test_huge_counts_do_not_allocate(self):
+        """P0-3：畸形 count 必须在分配 ctypes 数组之前被拒。"""
+        bad = {"pathCount": 10 ** 9, "modeCount": 10 ** 9,
+               "pathsHex": "", "modesHex": ""}
+        with patch_any("_ccd_api", side_effect=AssertionError("不该取 API")):
+            err = mb.restore_default_layout(snap=bad)
+        self.assertIn("结构不符", err)
+        self.assertIn("结构不符", app_layout_mod._layout_snapshot_error(bad))
+
+    def test_load_rejects_bad_hex_length(self):
+        with open(self.layout_file, "w", encoding="utf-8") as f:
+            json.dump({"pathCount": 1, "modeCount": 1,
+                       "pathsHex": "00", "modesHex": "00"}, f)
+        snap, err = mb.load_default_layout()
+        self.assertIsNone(snap)
         self.assertIn("结构不符", err)
 
     def test_validate_failure_does_not_apply(self):

@@ -120,14 +120,40 @@ def save_default_layout():
         r["friendly"] or "显示器" for r in
         {a: next(x for x in visible if x["anchor"] == a) for a in anchors}.values())), None
 
+def _layout_snapshot_error(snap):
+    """校验快照形状；返回 "" 表示可用。
+
+    P0-3：`pathCount/modeCount` 来自本地 JSON，不能直接拿去分配 ctypes 数组。
+    先卡上限（32 paths / 256 modes）和 hex 字节数，畸形文件只报错、不分配。
+    """
+    if not isinstance(snap, dict):
+        return "默认布局快照格式不对"
+    try:
+        pc = int(snap.get("pathCount"))
+        mc = int(snap.get("modeCount"))
+    except (TypeError, ValueError):
+        return "默认布局快照格式不对"
+    if not (1 <= pc <= 32 and 1 <= mc <= 256):
+        return "默认布局快照与当前显示器结构不符"
+    pb = snap.get("pathsHex")
+    mb_ = snap.get("modesHex")
+    if not isinstance(pb, str) or not isinstance(mb_, str):
+        return "默认布局快照格式不对"
+    if len(pb) != pc * ctypes.sizeof(_CcdPathInfo) * 2:
+        return "默认布局快照与当前显示器结构不符"
+    if len(mb_) != mc * ctypes.sizeof(_CcdModeInfo) * 2:
+        return "默认布局快照与当前显示器结构不符"
+    return ""
+
+
 def load_default_layout():
     """读回默认布局快照；文件不存在/坏掉返回 (None, 原因)。"""
     try:
         with open(DEFAULT_LAYOUT_FILE, "r", encoding="utf-8") as f:
             snap = json.load(f)
-        if not all(k in snap for k in ("pathCount", "modeCount",
-                                       "pathsHex", "modesHex")):
-            return None, "默认布局快照格式不对"
+        err = _layout_snapshot_error(snap)
+        if err:
+            return None, err
         return snap, None
     except FileNotFoundError:
         return None, "还没记住默认布局"
@@ -146,6 +172,10 @@ def restore_default_layout(validate_only=False, snap=None):
         snap, err = load_default_layout()
         if err:
             return err
+    err = _layout_snapshot_error(snap)
+    if err:
+        dlog("app.restore_default.fail", stage="shape", err=err)
+        return err
     u32 = _ccd_api()
     if u32 is None:
         return "恢复双屏仅支持 Windows"

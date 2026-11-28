@@ -7,9 +7,11 @@ import ctypes
 import hashlib
 import os
 import re
+import threading
 from ctypes import wintypes
 
 from core.config import _CAPS_CACHE
+from core.logging import dlog
 from domain.timeutil import clamp_level
 
 # ============================================================
@@ -57,45 +59,55 @@ class PHYSICAL_MONITOR(ctypes.Structure):
                 ("szPhysicalMonitorDescription", wintypes.WCHAR * 128)]
 
 _DXVA2_READY = False
+_DXVA2_LOCK = threading.Lock()
+
 
 def _dxva2():
-    """返回已声明好函数签名的 dxva2（只声明一次）。
+    """返回已声明好函数签名的 dxva2（线程安全，只声明一次）。
 
     为什么必须显式声明：
       - 64 位下 HANDLE 不声明会被按 C int 截断，句柄高位丢失后表现为
         "偶尔某块屏调不动"，且现象随启动顺序变化，极难复现；
       - 数组参数统一用 c_void_p + byref 传，绕开新版 ctypes 对
         "数组冒充 POINTER" 的严格检查（monitorcontrol 4.2.0 就栽在这）。
+
+    P0-4：初始化加锁；只有全部签名声明成功才置 READY。失败不再静默
+    吞掉——写一条 diag，下一次调用还会重试，避免把 64 位句柄按错误
+    签名用到底。
     """
     global _DXVA2_READY
     lib = ctypes.windll.dxva2
     if _DXVA2_READY:
         return lib
-    try:
-        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
-            wintypes.HMONITOR, ctypes.POINTER(wintypes.DWORD)]
-        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-        lib.GetPhysicalMonitorsFromHMONITOR.argtypes = [
-            wintypes.HMONITOR, wintypes.DWORD, ctypes.c_void_p]
-        lib.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-        lib.GetVCPFeatureAndVCPFeatureReply.argtypes = [
-            wintypes.HANDLE, wintypes.BYTE, ctypes.c_void_p,
-            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
-        lib.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
-        lib.SetVCPFeature.argtypes = [wintypes.HANDLE, wintypes.BYTE, wintypes.DWORD]
-        lib.SetVCPFeature.restype = wintypes.BOOL
-        lib.DestroyPhysicalMonitor.argtypes = [wintypes.HANDLE]
-        lib.DestroyPhysicalMonitor.restype = wintypes.BOOL
-        lib.GetCapabilitiesStringLength.argtypes = [
-            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        lib.GetCapabilitiesStringLength.restype = wintypes.BOOL
-        lib.CapabilitiesRequestAndCapabilitiesReply.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
-        lib.CapabilitiesRequestAndCapabilitiesReply.restype = wintypes.BOOL
-    except Exception:
-        pass
-    _DXVA2_READY = True
-    return lib
+    with _DXVA2_LOCK:
+        if _DXVA2_READY:
+            return lib
+        try:
+            lib.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
+                wintypes.HMONITOR, ctypes.POINTER(wintypes.DWORD)]
+            lib.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+            lib.GetPhysicalMonitorsFromHMONITOR.argtypes = [
+                wintypes.HMONITOR, wintypes.DWORD, ctypes.c_void_p]
+            lib.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+            lib.GetVCPFeatureAndVCPFeatureReply.argtypes = [
+                wintypes.HANDLE, wintypes.BYTE, ctypes.c_void_p,
+                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+            lib.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
+            lib.SetVCPFeature.argtypes = [wintypes.HANDLE, wintypes.BYTE, wintypes.DWORD]
+            lib.SetVCPFeature.restype = wintypes.BOOL
+            lib.DestroyPhysicalMonitor.argtypes = [wintypes.HANDLE]
+            lib.DestroyPhysicalMonitor.restype = wintypes.BOOL
+            lib.GetCapabilitiesStringLength.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            lib.GetCapabilitiesStringLength.restype = wintypes.BOOL
+            lib.CapabilitiesRequestAndCapabilitiesReply.argtypes = [
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            lib.CapabilitiesRequestAndCapabilitiesReply.restype = wintypes.BOOL
+        except Exception as e:
+            dlog("ddc.dxva2_init_fail", err="%s: %s" % (type(e).__name__, e))
+            return lib
+        _DXVA2_READY = True
+        return lib
 
 def _read_vcp(handle, code):
     """读一个 VCP 特性，返回 (当前值, 最大值)；失败返回 None。"""

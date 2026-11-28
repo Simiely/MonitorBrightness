@@ -88,13 +88,21 @@ def _ps(script, timeout=90):
                        "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     if not os.path.exists(exe):
         exe = "powershell"
-    proc = subprocess.run(
-        [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        creationflags=_NO_WINDOW,
-    )
+    try:
+        proc = subprocess.run(
+            [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        # 计划任务被安全软件/组策略卡住时，不能让 TimeoutExpired 冒到 CLI
+        # 入口变成 traceback；返回统一的 124（与 timeout(1) 同口径）。
+        return 124, "PowerShell 超时（%ss）" % timeout
+    except OSError as e:
+        return 127, "无法启动 PowerShell：%s" % e
     out = proc.stdout.decode("mbcs", "replace") if proc.stdout else ""
     return proc.returncode, out.strip()
 
