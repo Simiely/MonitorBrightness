@@ -12,3 +12,4 @@ from tests.cases_ui import *  # noqa: F401,F403
 from tests.cases_topology import *  # noqa: F401,F403
 from tests.cases_regression import *  # noqa: F401,F403
 from tests.cases_coverage_cli import *  # noqa: F401,F403
+from tests.cases_coverage_app import *  # noqa: F401,F403
