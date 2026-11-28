@@ -70,6 +70,7 @@ from app.brightness import _BrightnessActions
 from app.screen_power import _ScreenPowerActions
 from app.schedule import _ScheduleActions
 from app.layout import DEFAULT_LAYOUT_FILE, _LayoutActions, _SDC_VALIDATE, load_default_layout, remember_layout_snapshot, restore_default_layout, save_default_layout, topology_heir_candidates
+from app.topology_actions import _TopologyActions
 
 
 if __name__ == "__main__":

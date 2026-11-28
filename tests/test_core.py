@@ -9,6 +9,7 @@
   - v1.9.2 任务重建成功：经 after(0) 创建的「确认」窗在下一轮事件可见，点确认销毁；失败/启动自愈不弹
 """
 import app.base as app_base_mod
+import app.cli_entry as app_cli_entry_mod
 import app.brightness as app_bright_mod
 import app.common as app_common_mod
 import app.diag as app_diag_mod
@@ -3739,17 +3740,17 @@ class MainDispatchTest(unittest.TestCase):
         self.assertFalse(app_base_mod._run_cli(["--not-a-command"]))
 
     def test_list_dispatches_and_returns_true(self):
-        with unittest.mock.patch.object(app_base_mod, "cli_list") as fn:
+        with unittest.mock.patch.object(app_cli_entry_mod, "cli_list") as fn:
             self.assertTrue(app_base_mod._run_cli(["--list"]))
             fn.assert_called_once_with()
 
     def test_screen_status_uses_live_verdict(self):
         with unittest.mock.patch.object(
-                app_base_mod, "load_config", return_value={"x": 1}), \
+                app_cli_entry_mod, "load_config", return_value={"x": 1}), \
                 unittest.mock.patch.object(
-                    app_base_mod, "screen_verdict",
+                    app_cli_entry_mod, "screen_verdict",
                     return_value={"text": "亮着", "detail": ""}) as verdict, \
-                unittest.mock.patch.object(app_base_mod, "_out"):
+                unittest.mock.patch.object(app_cli_entry_mod, "_out"):
             self.assertTrue(app_base_mod._run_cli(["--screen", "status"]))
             verdict.assert_called_once_with({"x": 1})
 

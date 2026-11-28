@@ -12,13 +12,10 @@ from ctypes import wintypes
 from datetime import datetime
 import tkinter as tk
 from core.paths import CONFIG_DIR, ERROR_FILE, LOG_DIR
-from core.util import _out
 import core.config as _config
 from core.config import APP_TITLE, APP_VERSION, load_config, old_config_present
-from core.logging import _diag_file, _write_event_log, dlog, diag_dump, diag_export
-from hw.ccd import screen_verdict
+from core.logging import _write_event_log, dlog
 from service import current_level
-from cli import cli_set, cli_apply_schedule, cli_list, cli_probe, cli_diag, cli_ensure_schedule, cli_selftest, parse_screen_action, cli_screen
 from ui.theme import PIL_OK, UI, apply_dark_theme, apply_tk_scaling, apply_dark_titlebar
 from ui.widgets import Button, ScrollArea
 from ui.sheets import DarkBox, HelpSheet, SettingsSheet
@@ -29,6 +26,8 @@ from app.brightness import _BrightnessActions
 from app.screen_power import _ScreenPowerActions
 from app.schedule import _ScheduleActions
 from app.layout import _LayoutActions
+from app.cli_entry import _run_cli
+from app.topology_actions import _TopologyActions
 
 
 def _migrate_old_logs():
@@ -90,7 +89,7 @@ def install_wheel_router(root):
 
 
 class App(_BrightnessActions, _ScreenPowerActions, _ScheduleActions,
-          _LayoutActions,
+          _LayoutActions, _TopologyActions,
           _SettingsActions, _DiagActions):
     """协调者：服务调用、异步编排、弹窗；界面细节都在上面的控件里。"""
 
@@ -473,60 +472,6 @@ def _activate_existing_window():
         user32.SetForegroundWindow(hwnd)
 
 
-def _run_cli(args):
-    """处理命令行分支；返回 True 表示已处理，main() 应直接返回。"""
-    if not args:
-        return False
-    cmd = args[0]
-    if cmd == "--diag-log":
-        # 诊断日志（临时命令，v2.01.4）：直接打印最近若干行
-        lines = diag_dump(200)
-        _out("diag.log：%s（%d 行）" % (_diag_file(), len(lines)))
-        for line in lines:
-            _out(line)
-        return True
-    if cmd == "--diag-export":
-        # 导出诊断包（临时命令）：日志 + 配置打成一个 zip
-        path, err = diag_export()
-        _out(err or ("已导出：%s" % path))
-        return True
-    if cmd == "--set" and len(args) >= 3:
-        cli_set(args[1], args[2])
-        return True
-    if cmd == "--apply-schedule":
-        cli_apply_schedule()
-        return True
-    if cmd == "--screen" and len(args) >= 2:
-        arg = args[1].strip().lower()
-        if arg == "status":
-            # 与界面同一套结论：当场读、不读任何记账（v2.01.0）
-            v = screen_verdict(load_config())
-            _out(v["text"])
-            if v.get("detail"):
-                _out("  " + v["detail"])
-            return True
-        action = parse_screen_action(args[1])
-        if action is None:
-            _out("--screen 参数需为 off 或 on")
-            sys.exit(2)
-        cli_screen(action)
-        return True
-    if cmd == "--list":
-        cli_list()
-        return True
-    if cmd == "--probe":
-        cli_probe()
-        return True
-    if cmd == "--diag":
-        cli_diag()
-        return True
-    if cmd == "--selftest":
-        cli_selftest()
-        return True
-    if cmd == "--ensure-schedule":
-        cli_ensure_schedule()
-        return True
-    return False
 
 
 def _start_gui(args):
