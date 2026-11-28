@@ -16,6 +16,46 @@ from core.logging import _diag_file, diag_dump, diag_export
 from core.util import _out
 from hw.ccd import screen_verdict
 
+# 存名字而不是函数对象：测试 patch `app.cli_entry.cli_list` 后，
+# 运行时再取全局名才能命中 mock（函数对象会被 import 时提前绑定）。
+_SIMPLE_COMMANDS = {
+    "--apply-schedule": "cli_apply_schedule",
+    "--list": "cli_list",
+    "--probe": "cli_probe",
+    "--diag": "cli_diag",
+    "--selftest": "cli_selftest",
+    "--ensure-schedule": "cli_ensure_schedule",
+}
+
+
+def _run_diag_log(args):
+    lines = diag_dump(200)
+    _out("diag.log：%s（%d 行）" % (_diag_file(), len(lines)))
+    for line in lines:
+        _out(line)
+
+
+def _run_diag_export(args):
+    path, err = diag_export()
+    _out(err or ("已导出：%s" % path))
+
+
+def _run_screen_cli(arg):
+    """`--screen status|off|on`；参数非法时按原行为退出码 2。"""
+    arg = arg.strip().lower()
+    if arg == "status":
+        # 与界面同一套结论：当场读、不读任何记账（v2.01.0）
+        v = screen_verdict(load_config())
+        _out(v["text"])
+        if v.get("detail"):
+            _out("  " + v["detail"])
+        return
+    action = parse_screen_action(arg)
+    if action is None:
+        _out("--screen 参数需为 off 或 on")
+        sys.exit(2)
+    cli_screen(action)
+
 
 def _run_cli(args):
     """处理命令行分支；返回 True 表示已处理，main() 应直接返回。"""
@@ -23,51 +63,23 @@ def _run_cli(args):
         return False
     cmd = args[0]
     if cmd == "--diag-log":
-        # 诊断日志（临时命令，v2.01.4）：直接打印最近若干行
-        lines = diag_dump(200)
-        _out("diag.log：%s（%d 行）" % (_diag_file(), len(lines)))
-        for line in lines:
-            _out(line)
+        _run_diag_log(args)
         return True
     if cmd == "--diag-export":
-        # 导出诊断包（临时命令）：日志 + 配置打成一个 zip
-        path, err = diag_export()
-        _out(err or ("已导出：%s" % path))
+        _run_diag_export(args)
         return True
-    if cmd == "--set" and len(args) >= 3:
+    if cmd == "--set":
+        if len(args) < 3:
+            return False
         cli_set(args[1], args[2])
         return True
-    if cmd == "--apply-schedule":
-        cli_apply_schedule()
+    if cmd == "--screen":
+        if len(args) < 2:
+            return False
+        _run_screen_cli(args[1])
         return True
-    if cmd == "--screen" and len(args) >= 2:
-        arg = args[1].strip().lower()
-        if arg == "status":
-            # 与界面同一套结论：当场读、不读任何记账（v2.01.0）
-            v = screen_verdict(load_config())
-            _out(v["text"])
-            if v.get("detail"):
-                _out("  " + v["detail"])
-            return True
-        action = parse_screen_action(args[1])
-        if action is None:
-            _out("--screen 参数需为 off 或 on")
-            sys.exit(2)
-        cli_screen(action)
-        return True
-    if cmd == "--list":
-        cli_list()
-        return True
-    if cmd == "--probe":
-        cli_probe()
-        return True
-    if cmd == "--diag":
-        cli_diag()
-        return True
-    if cmd == "--selftest":
-        cli_selftest()
-        return True
-    if cmd == "--ensure-schedule":
-        cli_ensure_schedule()
-        return True
-    return False
+    handler = _SIMPLE_COMMANDS.get(cmd)
+    if handler is None:
+        return False
+    globals()[handler]()
+    return True
