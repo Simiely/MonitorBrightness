@@ -160,6 +160,40 @@ def load_default_layout():
     except Exception as e:
         return None, "读默认布局失败：%s" % e
 
+def _build_layout_arrays(snap):
+    """把快照 hex 装回 ctypes 数组；返回 (paths, modes, (pc, mc), err)。"""
+    paths = (_CcdPathInfo * int(snap["pathCount"]))()
+    modes = (_CcdModeInfo * int(snap["modeCount"]))()
+    pb = bytes.fromhex(snap["pathsHex"])
+    mb_ = bytes.fromhex(snap["modesHex"])
+    if len(pb) != ctypes.sizeof(paths) or len(mb_) != ctypes.sizeof(modes):
+        return None, None, None, "快照与当前显示器结构不符，拒绝写回"
+    if len(pb):
+        ctypes.memmove(ctypes.byref(paths), pb, len(pb))
+    if len(mb_):
+        ctypes.memmove(ctypes.byref(modes), mb_, len(mb_))
+    return paths, modes, (int(snap["pathCount"]), int(snap["modeCount"])), None
+
+
+def _verify_restored_layout(snap):
+    """写回后回读验证：只拿物理屏锚点，VDD 因 allow_vdd=False 会被过滤。"""
+    anchors = list(snap.get("targetAnchors") or [])
+    # v2.01.19：快照可能是在串流形态（VDD 当主屏）下记的，此时 targetAnchors
+    # 含 VDD。_ccd_wait_state 的 allow_vdd=False 会把 VDD 过滤掉，导致
+    # wanted 里的 VDD 永远等不到 → 误报"2 秒内没读到确认"（实际已写回）。
+    # 所以只拿物理屏锚点做回读验证。
+    try:
+        vdd_anchors = {r["anchor"] for r in ccd_probe_topology()
+                       if r.get("vdd") and r.get("anchor")}
+    except Exception:
+        vdd_anchors = set()
+    phys = [a for a in anchors if a not in vdd_anchors]
+    ok = _ccd_wait_state(phys, True) if phys else True
+    dlog("app.restore_default.done", anchors=anchors, verified=ok,
+         vdd_skipped=sorted(vdd_anchors & set(anchors)))
+    return ok
+
+
 def restore_default_layout(validate_only=False, snap=None):
     """把默认双屏布局整份写回。
 
@@ -186,20 +220,7 @@ def restore_default_layout(validate_only=False, snap=None):
     except (AttributeError, TypeError):
         pass                      # 测试假对象没有 ctypes 的 argtypes
 
-    def build():
-        paths = (_CcdPathInfo * int(snap["pathCount"]))()
-        modes = (_CcdModeInfo * int(snap["modeCount"]))()
-        pb = bytes.fromhex(snap["pathsHex"])
-        mb_ = bytes.fromhex(snap["modesHex"])
-        if len(pb) != ctypes.sizeof(paths) or len(mb_) != ctypes.sizeof(modes):
-            return None, None, None, "快照与当前显示器结构不符，拒绝写回"
-        if len(pb):
-            ctypes.memmove(ctypes.byref(paths), pb, len(pb))
-        if len(mb_):
-            ctypes.memmove(ctypes.byref(modes), mb_, len(mb_))
-        return paths, modes, (snap["pathCount"], snap["modeCount"]), None
-
-    paths, modes, counts, err = build()
+    paths, modes, counts, err = _build_layout_arrays(snap)
     if err:
         dlog("app.restore_default.fail", stage="shape", err=err)
         return err
@@ -217,20 +238,7 @@ def restore_default_layout(validate_only=False, snap=None):
     if rc != 0:
         dlog("app.restore_default.fail", stage="apply", rc=rc)
         return "恢复失败：SetDisplayConfig rc=%d（拓扑未改动）" % rc
-    anchors = list(snap.get("targetAnchors") or [])
-    # v2.01.19：快照可能是在串流形态（VDD 当主屏）下记的，此时 targetAnchors
-    # 含 VDD。_ccd_wait_state 的 allow_vdd=False 会把 VDD 过滤掉，导致
-    # wanted 里的 VDD 永远等不到 → 误报"2 秒内没读到确认"（实际已写回）。
-    # 所以只拿物理屏锚点做回读验证。
-    try:
-        vdd_anchors = {r["anchor"] for r in ccd_probe_topology()
-                       if r.get("vdd") and r.get("anchor")}
-    except Exception:
-        vdd_anchors = set()
-    phys = [a for a in anchors if a not in vdd_anchors]
-    ok = _ccd_wait_state(phys, True) if phys else True
-    dlog("app.restore_default.done", anchors=anchors, verified=ok,
-         vdd_skipped=sorted(vdd_anchors & set(anchors)))
+    ok = _verify_restored_layout(snap)
     return None if ok else "布局已写回，但 2 秒内没读到确认，请「检测」看结果"
 
 

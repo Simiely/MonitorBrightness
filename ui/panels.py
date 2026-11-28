@@ -55,74 +55,84 @@ class MonitorPanel:
     def rebuild(self, keep):
         self._suspend = True
         try:
-            for w in self.inner.winfo_children():
-                w.destroy()
-            self.mon_vars, self.mon_rows = {}, {}
-            self.mon_text = {}
+            self._clear_rows()
             if not self.app.monitors:
                 Label(self.inner, "（未检测到支持 DDC/CI 的显示器）",
                       size=8, color=UI["text3"]).pack(anchor="w", pady=4)
                 return
             for i in range(len(self.app.monitors)):
-                row = tk.Frame(self.inner, bg=UI["card"])
-                row.pack(fill="x")
-                var = tk.BooleanVar(value=(i in keep))
-                var.trace_add("write", lambda *_: self.app.on_monitor_toggle())
-                self.mon_vars[i] = var
-                chk = ttk.Checkbutton(row, variable=var, text="")
-                chk.pack(side="left", padx=(0, 8), pady=7)
-                # 逐台按钮先于文本 pack：文本是 expand 的，后 pack 的侧边控件
-                # 在窄窗口里会被挤掉。顺序：勾选 / 按钮(右) / 文本(左,撑满)。
-                self._row_action_button(row, i)
-                txt = tk.Frame(row, bg=UI["card"])
-                txt.pack(side="left", fill="x", expand=True)
-                self.mon_text[i] = txt
-                info = self.app.mon_info[i] if i < len(self.app.mon_info) else None
-                # VDD 当主屏时它是 index 0，绝不能套用 mon_models[0] 那块物理屏
-                # 的型号名（v2.01.12 修，日志 18:38:43 heir=VDD 实证）
-                mon = self.app.monitors[i] if i < len(self.app.monitors) else {}
-                # v2.01.19：friendly 优先取 CCD 的（"VDD by MTT"），
-                # DDC 的 desc 恒为 "Generic PnP Monitor"，只能当兜底。
-                ccd_name = (getattr(self.app, "ccd_friendly", lambda _i: "")(i)
-                            or mon.get("desc") or (info[0] if info else ""))
-                name_row = {"vdd": bool(getattr(self.app, "is_vdd", lambda _i: False)(i)),
-                            "friendly": ccd_name,
-                            "index": i}
-                name, _is_vdd = display_name_for_row(i, name_row, self.app.mon_models)
-                Label(txt, name, size=9, bg=UI["card"]).pack(anchor="w")
-                sub = ""
-                if info:
-                    sub = "%d × %d · %s · %s" % (
-                        info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
-                Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"],
-                      justify="left", wraplength=320).pack(anchor="w")
-                self.mon_rows[i] = row
+                self._build_monitor_row(i, keep)
             # 拓扑模式：把「断开但设备还在」的屏也列出来（对齐 Windows 设置 →
-            # 屏幕，那里连虚拟显示器都会画出来）。物理屏给「显示」按钮；
-            # VDD 只显示不给按钮——它归串流软件管，本程序断/接它没有意义。
+            # 屏幕，那里连虚拟显示器都会画出来）。
             for extra in (getattr(self.app, "topo_inactive", None) or []):
-                row = tk.Frame(self.inner, bg=UI["card"])
-                row.pack(fill="x")
-                tk.Frame(row, bg=UI["fill_off"], width=3).pack(
-                    side="left", fill="y", padx=(6, 0), pady=7)
-                is_vdd = bool(extra.get("vdd"))
-                if not is_vdd:
-                    Button(row, "显示",
-                           lambda a=extra["anchor"]: self.app.topology_enable(a),
-                           kind="link", height=18, pad_bg=UI["card"],
-                           font_size=8).pack(side="right", padx=(0, 8))
-                txt = tk.Frame(row, bg=UI["card"])
-                txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
-                Label(txt, extra.get("friendly") or "断开的显示器",
-                      size=9, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
-                Label(txt, ("虚拟显示器 · 由串流软件管理，本程序不启用也不断开"
-                            if is_vdd else
-                            "已断开 · 设备仍连接（点「显示」接回，位置会回到原处）"),
-                      size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
+                self._build_inactive_row(extra)
         finally:
             self._btn_state = tuple(
                 self._row_is_off(i) for i in range(len(self.app.monitors or [])))
             self._suspend = False
+
+    def _clear_rows(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.mon_vars, self.mon_rows = {}, {}
+        self.mon_text = {}
+
+    def _build_monitor_row(self, i, keep):
+        """一台活动显示器：勾选 / 动作按钮 / 名称与尺寸。"""
+        row = tk.Frame(self.inner, bg=UI["card"])
+        row.pack(fill="x")
+        var = tk.BooleanVar(value=(i in keep))
+        var.trace_add("write", lambda *_: self.app.on_monitor_toggle())
+        self.mon_vars[i] = var
+        chk = ttk.Checkbutton(row, variable=var, text="")
+        chk.pack(side="left", padx=(0, 8), pady=7)
+        # 逐台按钮先于文本 pack：文本是 expand 的，后 pack 的侧边控件
+        # 在窄窗口里会被挤掉。顺序：勾选 / 按钮(右) / 文本(左,撑满)。
+        self._row_action_button(row, i)
+        txt = tk.Frame(row, bg=UI["card"])
+        txt.pack(side="left", fill="x", expand=True)
+        self.mon_text[i] = txt
+        info = self.app.mon_info[i] if i < len(self.app.mon_info) else None
+        # VDD 当主屏时它是 index 0，绝不能套用 mon_models[0] 那块物理屏
+        # 的型号名（v2.01.12 修，日志 18:38:43 heir=VDD 实证）
+        mon = self.app.monitors[i] if i < len(self.app.monitors) else {}
+        # v2.01.19：friendly 优先取 CCD 的（"VDD by MTT"），
+        # DDC 的 desc 恒为 "Generic PnP Monitor"，只能当兜底。
+        ccd_name = (getattr(self.app, "ccd_friendly", lambda _i: "")(i)
+                    or mon.get("desc") or (info[0] if info else ""))
+        name_row = {"vdd": bool(getattr(self.app, "is_vdd", lambda _i: False)(i)),
+                    "friendly": ccd_name,
+                    "index": i}
+        name, _is_vdd = display_name_for_row(i, name_row, self.app.mon_models)
+        Label(txt, name, size=9, bg=UI["card"]).pack(anchor="w")
+        sub = ""
+        if info:
+            sub = "%d × %d · %s · %s" % (
+                info[1], info[2], "主显示器" if info[3] else "副显示器", info[0])
+        Label(txt, sub, size=8, color=UI["text3"], bg=UI["card"],
+              justify="left", wraplength=320).pack(anchor="w")
+        self.mon_rows[i] = row
+
+    def _build_inactive_row(self, extra):
+        """拓扑模式下断开但设备仍连接的屏；VDD 只显示、不给操作按钮。"""
+        row = tk.Frame(self.inner, bg=UI["card"])
+        row.pack(fill="x")
+        tk.Frame(row, bg=UI["fill_off"], width=3).pack(
+            side="left", fill="y", padx=(6, 0), pady=7)
+        is_vdd = bool(extra.get("vdd"))
+        if not is_vdd:
+            Button(row, "显示",
+                   lambda a=extra["anchor"]: self.app.topology_enable(a),
+                   kind="link", height=18, pad_bg=UI["card"],
+                   font_size=8).pack(side="right", padx=(0, 8))
+        txt = tk.Frame(row, bg=UI["card"])
+        txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        Label(txt, extra.get("friendly") or "断开的显示器",
+              size=9, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
+        Label(txt, ("虚拟显示器 · 由串流软件管理，本程序不启用也不断开"
+                    if is_vdd else
+                    "已断开 · 设备仍连接（点「显示」接回，位置会回到原处）"),
+              size=8, color=UI["text3"], bg=UI["card"]).pack(anchor="w")
 
     def _row_is_off(self, index):
         """这一行现在是不是"灭着"——决定放「熄灭」还是「显示」。
@@ -245,11 +255,16 @@ class SchedulePanel:
         self.inner = card.inner
         self.slots = [dict(x) for x in cfg.get("slots", [])]
         self._rows = []
+        self._build_toggle(cfg)
+        self._build_list()
+        self._build_status()
+        self.render()
 
+    def _build_toggle(self, cfg):
+        """开关 + 档数：切换即保存/注册，没有单独的大按钮。"""
         head = tk.Frame(self.inner, bg=UI["card"])
         head.pack(fill="x")
         self.enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)))
-        # 开关切换即保存/注册，不再需要「保存并启用定时」大按钮
         self.enabled_switch = Switch(head, bool(cfg.get("enabled", False)),
                                      self._on_toggle)
         self.enabled_switch.pack(side="left")
@@ -258,16 +273,17 @@ class SchedulePanel:
         self.count_lbl = Label(head, "", size=8, color=UI["text3"], bg=UI["card"])
         self.count_lbl.pack(side="right")
 
+    def _build_list(self):
         self.list_box = tk.Frame(self.inner, bg=UI["card"])
         self.list_box.pack(fill="x", pady=(4, 0))
-
         add = tk.Frame(self.inner, bg=UI["card"])
         add.pack(fill="x", pady=(6, 0))
         self.add_btn = Button(add, "＋ 添加时间段", self.add_row, kind="link",
                               height=26, pad_bg=UI["card"])
         self.add_btn.pack(side="left")
 
-        # 任务计划实测状态：圆点 + 结论 + 细节 + 下次 + 检测
+    def _build_status(self):
+        """任务计划实测状态：圆点 + 结论 + 细节 + 下次 + 检测。"""
         tk.Frame(self.inner, bg=UI["sep"], height=1).pack(fill="x", pady=(10, 0))
         st = tk.Frame(self.inner, bg=UI["card"])
         st.pack(fill="x", pady=(8, 0))
@@ -280,14 +296,15 @@ class SchedulePanel:
         self.task_title = Label(st, "任务计划：读取中…", size=9, bg=UI["card"])
         self.task_title.pack(side="left", padx=(8, 0))
         # 先放「检测」（贴最右），再放「下次」，顺序才对
-        self.probe_task_btn = Button(st, "检测", app.refresh_task_status,
+        self.probe_task_btn = Button(st, "检测", self.app.refresh_task_status,
                                      kind="link", width=40, height=22,
                                      pad_bg=UI["card"])
         self.probe_task_btn.pack(side="right")
         # 显式重建入口：v1.9.2 之前只有改开关/改时间段才会写任务，
         # 用户想"按现在配置再来一遍"时没有按钮可点。
-        self.apply_btn = Button(st, "应用", app.rebuild_schedule_tasks, kind="secondary",
-                                width=52, height=22, pad_bg=UI["card"])
+        self.apply_btn = Button(st, "应用", self.app.rebuild_schedule_tasks,
+                                kind="secondary", width=52, height=22,
+                                pad_bg=UI["card"])
         self.apply_btn.pack(side="right", padx=(0, 6))
         self.task_next = Label(st, "", size=8, color=UI["text3"], bg=UI["card"])
         self.task_next.pack(side="right", padx=(0, 8))
@@ -298,8 +315,6 @@ class SchedulePanel:
         # 创建时不 pack —— 没有事件就不占位，否则底部会留一条空白线。
         self.event_lbl = Label(self.inner, "", size=8, color=UI["text3"],
                                bg=UI["card"], justify="left", wraplength=360)
-
-        self.render()
 
     # ---- 渲染 ----
     def render(self):

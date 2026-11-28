@@ -75,8 +75,18 @@ UI = {
 # 五、深色主题
 # ============================================================
 def apply_dark_theme(root):
+    """装配深色主题：基础壳 → 按钮 → 输入 → 滑杆/滚动条 → 自绘勾选框。"""
     D = DARK
     style = ttk.Style(root)
+    _theme_base(root, style, D)
+    _theme_buttons(style, D)
+    _theme_inputs(root, style, D)
+    _theme_entries(style, D)
+    # 勾选框：换掉指示器元素（见 install_dark_tickbox 里的依据说明）
+    install_dark_tickbox(style, root)
+
+
+def _theme_base(root, style, D):
     try:
         style.theme_use("clam")   # clam 是内置主题里最容易改色的
     except Exception:
@@ -101,6 +111,8 @@ def apply_dark_theme(root):
     style.configure("TLabelframe.Label", background=D["surface"], foreground=D["group_fg"],
                     font=FONT_UI)
 
+
+def _theme_buttons(style, D):
     style.configure("TButton", background=D["button"], foreground=D["fg"],
                     bordercolor=D["border"], focuscolor=D["button"],
                     relief="flat", padding=(10, 5), font=FONT_UI)
@@ -117,6 +129,8 @@ def apply_dark_theme(root):
               foreground=[("disabled", D["fg_dim"])],
               bordercolor=[("active", D["accent_hover"])])
 
+
+def _theme_inputs(root, style, D):
     # Combobox（定时行的「屏幕」下拉框）：ttk 输入框部分走 style；
     # 弹出的下拉列表是原生 Listbox，必须走 option_add 才能变深色
     style.configure("TCombobox", fieldbackground=D["surface"], background=D["surface"],
@@ -134,10 +148,11 @@ def apply_dark_theme(root):
         root.option_add(_pat + "selectForeground", "#ffffff")
         root.option_add(_pat + "font", FONT_UI)
 
+
+def _theme_entries(style, D):
     # 勾选框不用 ttk.Checkbutton：clam 主题的"选中"态画的是**叉**（X）而不是勾，
     # 语义别扭；经典 tk.Checkbutton 的 selectcolor 又会让"未勾选"也带颜色。
-    # 改用下面的自绘 CheckBox 类（空框 / 强调色底 + 白勾，状态一眼可辨）。
-
+    # 改用自绘 CheckBox 类（空框 / 强调色底 + 白勾，状态一眼可辨）。
     for name in ("TEntry", "TSpinbox"):
         style.configure(name, fieldbackground=D["field"], foreground=D["fg"],
                         insertcolor=D["fg"], bordercolor=D["border"],
@@ -159,9 +174,6 @@ def apply_dark_theme(root):
                     darkcolor=D["button"])
     style.map("Vertical.TScrollbar",
               background=[("active", D["button_hover"])])
-
-    # 勾选框：换掉指示器元素（见 install_dark_tickbox 里的依据说明）
-    install_dark_tickbox(style, root)
 
 
 def apply_tk_scaling(root):
