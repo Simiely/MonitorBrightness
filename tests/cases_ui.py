@@ -646,3 +646,23 @@ class ApplyCallbackTest(unittest.TestCase):
         seen["cb"](([0], []))
         self.assertEqual(seen["level"], 80)
         self.assertEqual(seen["result"], ([0], []))
+
+class SingleInstanceStateTest(unittest.TestCase):
+    """R6 批次 B：互斥体句柄由 app.runtime_state 保活，且注入名不碰真实实例。"""
+
+    @unittest.skipUnless(os.name == "nt", "Windows 互斥体专属")
+    def test_mutex_handle_kept_in_runtime_state(self):
+        import ctypes as _ctypes
+        from app.base import acquire_single_instance
+        from app.runtime_state import RUNTIME_STATE
+
+        before = RUNTIME_STATE.mutex_handle
+        handle = None
+        try:
+            self.assertTrue(acquire_single_instance("MonitorBrightness_R6_UnitTest"))
+            handle = RUNTIME_STATE.mutex_handle
+            self.assertIsNotNone(handle)
+        finally:
+            RUNTIME_STATE.mutex_handle = before
+            if handle:
+                _ctypes.windll.kernel32.CloseHandle(handle)

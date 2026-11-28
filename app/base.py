@@ -27,6 +27,7 @@ from app.screen_power import _ScreenPowerActions
 from app.schedule import _ScheduleActions
 from app.layout import _LayoutActions
 from app.cli_entry import _run_cli
+from app.runtime_state import RUNTIME_STATE
 from app.topology_actions import _TopologyActions
 
 
@@ -427,7 +428,7 @@ class App(_BrightnessActions, _ScreenPowerActions, _ScheduleActions,
 _MUTEX_NAME = "MonitorBrightness_SingleInstance"
 
 
-_mutex_handle = None
+# R6 批次 B：互斥体句柄由 app.runtime_state.RUNTIME_STATE 保活。
 
 
 def acquire_single_instance(name=_MUTEX_NAME):
@@ -437,7 +438,6 @@ def acquire_single_instance(name=_MUTEX_NAME):
     name 参数供测试注入专用互斥体名（默认用全局单实例名）。
     互斥体随进程退出自动释放（崩溃残留的 abandoned 状态不影响下次创建）。
     """
-    global _mutex_handle
     if os.name != "nt":
         return True
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -449,7 +449,7 @@ def acquire_single_instance(name=_MUTEX_NAME):
         if handle:
             k32.CloseHandle(handle)
         return False
-    _mutex_handle = handle                      # 保引用，防止句柄被 GC 关闭
+    RUNTIME_STATE.mutex_handle = handle         # 保引用，防止句柄被 GC 关闭
     return True
 
 
