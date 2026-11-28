@@ -2,7 +2,8 @@
 """P1-8 拆分出的测试用例；由 tests/test_core.py 聚合运行。"""
 
 from tests.support import (  # noqa: F401
-    _FakeU32, _PATCH_MODULES, _TopoFixture, _UNSET, _row_button_texts,
+    _FakeU32, _PATCH_MODULES, _TopoFixture, _UNSET, _core_state,
+    _row_button_texts,
     TempConfigCase, cfg_mod, glob, json, mb, os, unittest,
 )
 
@@ -283,3 +284,12 @@ class SessionEventsTest(TempConfigCase):
         got = mb.read_session_events(3)
         self.assertEqual(len(got), 3)
         self.assertIn("事件 59", got[-1])
+
+    def test_state_compat_reads_follow_accessors(self):
+        """R6：旧模块名只读转发，且可变容器保持同一对象身份。"""
+        _core_state.set_load_error("boom")
+        self.assertEqual(mb.CONFIG_LOAD_ERROR, "boom")
+        self.assertEqual(cfg_mod.CONFIG_LOAD_ERROR, "boom")
+        self.assertIs(mb._CAPS_CACHE, _core_state.caps_cache())
+        self.assertIs(cfg_mod._CAPS_CACHE, _core_state.caps_cache())
+        self.assertIs(mb._SESSION_EVENTS, _core_state.session_events())

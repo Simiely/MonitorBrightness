@@ -14,6 +14,7 @@ import shutil
 import tempfile
 from datetime import datetime
 
+from core import state as _state
 from core.logging import _write_event_log, diag_set_enabled
 from core.paths import CONFIG_DIR, CONFIG_FILE, _LEGACY_CONFIG_DIR
 from domain.timeutil import normalize_days, normalize_time_input, parse_hhmm
@@ -243,7 +244,7 @@ def normalize_indices(value):
 # 每次熄灭前都重读一遍曾让 DDC 熄灭耗时 6.3s/2 台 —— 缓存后只剩真正的写入
 # (~62ms/台)。随配置持久化（load_config 播种 / save_config 写回），
 # 换显示器后 EDID 变化 → key 不命中 → 首次实测刷新。
-_CAPS_CACHE = {}
+# R6：实际 dict 由 core.state 持有；这里保留旧名字的只读兼容（见文件末尾 __getattr__）。
 
 
 def _coerce_slots(value):
@@ -287,7 +288,7 @@ def _load_model_cache(raw):
 
 
 # 配置读取失败时的说明（GUI 启动后显式提示；CLI 不受影响）
-CONFIG_LOAD_ERROR = ""
+# R6：实际值由 core.state 持有；旧名字的只读兼容见文件末尾 __getattr__。
 
 
 def _backup_bad_config(reason):
@@ -307,8 +308,7 @@ def load_config():
     逐键走 coerce_setting，所以新增一个设置**不用**再来这里加一行校验。
     读坏时不再静默吞掉：备份坏文件 + 把原因记到 CONFIG_LOAD_ERROR，由界面提示。
     """
-    global CONFIG_LOAD_ERROR
-    CONFIG_LOAD_ERROR = ""
+    _state.set_load_error("")
     cfg = default_config()
     _recovered_off_method = False
     if not os.path.exists(CONFIG_FILE):
@@ -345,7 +345,7 @@ def load_config():
         if isinstance(_caps_raw, dict):
             for _dev, _caps in _caps_raw.items():
                 if isinstance(_caps, str) and _caps and "#" in str(_dev):
-                    _CAPS_CACHE.setdefault(_dev, _caps)
+                    _state.caps_cache().setdefault(_dev, _caps)
         for key in SETTING_BY_KEY:
             if key in raw:
                 cfg[key] = coerce_setting(key, raw[key])
@@ -359,7 +359,7 @@ def load_config():
             else:
                 _write_event_log("熄灭方式恢复失败（磁盘仍为 system）：%s" % _err)
     except Exception as e:
-        CONFIG_LOAD_ERROR = _backup_bad_config("%s: %s" % (type(e).__name__, e))
+        _state.set_load_error(_backup_bad_config("%s: %s" % (type(e).__name__, e)))
     return cfg
 
 
@@ -398,8 +398,8 @@ def save_config(cfg):
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         payload = dict(cfg)
-        if _CAPS_CACHE:
-            payload["caps"] = dict(_CAPS_CACHE)
+        if _state.caps_cache():
+            payload["caps"] = dict(_state.caps_cache())
         payload["version"] = CONFIG_VERSION
         _atomic_write_text(CONFIG_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         return True, ""
@@ -462,3 +462,16 @@ def set_autostart(enable, command):
                 winreg.DeleteValue(k, AUTOSTART_RUN_NAME)
         except FileNotFoundError:
             pass
+
+
+def __getattr__(name):
+    """R6 兼容层：旧模块级名字只读转发到 core.state。
+
+    写入请改用 core.state.set_load_error() / caps_cache()；对旧名字赋值只会
+    在本模块创建一个快照属性，不再跟随状态（见 docs/交接文档.md §9.14）。
+    """
+    if name == "CONFIG_LOAD_ERROR":
+        return _state.get_load_error()
+    if name == "_CAPS_CACHE":
+        return _state.caps_cache()
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))

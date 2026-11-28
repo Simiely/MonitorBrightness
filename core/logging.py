@@ -14,6 +14,7 @@ import threading
 import zipfile
 from datetime import datetime
 
+from core import state as _state
 from core.paths import APP_DIR, CONFIG_DIR, CONFIG_FILE, EVENTS_FILE, LOG_DIR
 
 
@@ -35,8 +36,9 @@ def _write_event_log(text):
                 pass
             with open(EVENTS_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-            _SESSION_EVENTS.append(line)
-            del _SESSION_EVENTS[:-40]
+            _events = _state.session_events()
+            _events.append(line)
+            del _events[:-40]
     except Exception:
         pass
     return line
@@ -48,11 +50,11 @@ def read_session_events(limit=3):
     不读 events.log 文件：那里面是历史，界面一开机就把上周的记录摆出来，
     用户会以为"一直报错"。历史留给 --diag / 诊断包，界面只反映这一次。
     """
-    return list(_SESSION_EVENTS[-limit:])
+    return list(_state.session_events()[-limit:])
 
 
 _EVENT_LOCK = threading.Lock()
-_SESSION_EVENTS = []            # 本次进程写的事件，界面只看这一份
+# R6：本次进程写的事件由 core.state 持有，旧名字只读兼容见文件末尾 __getattr__。
 
 
 def read_recent_events(limit=3):
@@ -80,7 +82,7 @@ def read_recent_events(limit=3):
 # 排查时 `findstr /c:"\"tag\": \"topo.on\"" diag.log` 就能把一次接回的全过程串起来。
 # ============================================================================
 _DIAG_LOCK = threading.Lock()
-_DIAG_ON = True                 # 由配置项 diag_log 同步；关掉后 dlog 立即返回
+# R6：开关由 core.state 持有（diag_log 同步）；旧名字只读兼容见文件末尾。
 _DIAG_LIMIT = 512 * 1024        # 超过就轮转到 diag.log.1，只留一份
 
 
@@ -91,12 +93,11 @@ def _diag_file():
 
 def diag_set_enabled(value):
     """配置变化时同步开关（load_config / apply_setting 各调一次就够了）。"""
-    global _DIAG_ON
-    _DIAG_ON = bool(value)
+    _state.set_diag_on(value)
 
 
 def diag_enabled():
-    return _DIAG_ON
+    return _state.get_diag_on()
 
 
 def dlog(tag, **fields):
@@ -108,7 +109,7 @@ def dlog(tag, **fields):
       ccd.*   和 SetDisplayConfig 打交道的细粒度动作
       sch.*   定时档位判定
     """
-    if not _DIAG_ON:
+    if not _state.get_diag_on():
         return
     rec = {"t": datetime.now().strftime("%m-%d %H:%M:%S.%f")[:-3],
            "pid": os.getpid(), "th": threading.current_thread().name,
@@ -199,3 +200,17 @@ def diag_export(dest_dir=None):
 # ============================================================================
 # 诊断日志结束（以上整块可删）
 # ============================================================================
+
+
+def __getattr__(name):
+    """R6 兼容层：旧模块级名字只读转发到 core.state。
+
+    写入请改用 core.state.set_diag_on() / session_events()；对旧名字赋值只会
+    创建快照属性，不再跟随状态（见 docs/交接文档.md §9.14）。
+    """
+    if name == "_SESSION_EVENTS":
+        return _state.session_events()
+    if name == "_DIAG_ON":
+        return _state.get_diag_on()
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+

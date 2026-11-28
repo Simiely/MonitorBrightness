@@ -34,6 +34,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.config as cfg_mod
+from core import state as _core_state
 import core.logging as log_mod
 import domain.slots as slots_mod
 import hw.ccd as hw_ccd
@@ -151,24 +152,27 @@ class TempConfigCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mb-test-")
         self._old = (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-                     mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR,
+                     mb.LOG_DIR, mb._LEGACY_CONFIG_DIR,
                      cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE,
-                     cfg_mod.CONFIG_LOAD_ERROR, cfg_mod._LEGACY_CONFIG_DIR,
+                     cfg_mod._LEGACY_CONFIG_DIR,
                      log_mod.LOG_DIR, log_mod.EVENTS_FILE)
+        # R6：会被重新赋值的状态走访问器，旧模块名只做只读兼容。
+        self._old_load_error = _core_state.get_load_error()
         # R1：主文件与 core 模块各有一份 import 时绑定的路径常量，必须同步改。
         mb.CONFIG_DIR = cfg_mod.CONFIG_DIR = self.tmp
         mb.CONFIG_FILE = cfg_mod.CONFIG_FILE = os.path.join(self.tmp, "config.json")
         mb.LOG_DIR = log_mod.LOG_DIR = self.tmp
         mb.EVENTS_FILE = log_mod.EVENTS_FILE = os.path.join(self.tmp, "events.log")
-        mb.CONFIG_LOAD_ERROR = cfg_mod.CONFIG_LOAD_ERROR = ""
+        _core_state.set_load_error("")
         mb._LEGACY_CONFIG_DIR = cfg_mod._LEGACY_CONFIG_DIR = os.path.join(self.tmp, "legacy")
 
     def tearDown(self):
         (mb.CONFIG_DIR, mb.CONFIG_FILE, mb.EVENTS_FILE,
-         mb.LOG_DIR, mb.CONFIG_LOAD_ERROR, mb._LEGACY_CONFIG_DIR,
+         mb.LOG_DIR, mb._LEGACY_CONFIG_DIR,
          cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE,
-         cfg_mod.CONFIG_LOAD_ERROR, cfg_mod._LEGACY_CONFIG_DIR,
+         cfg_mod._LEGACY_CONFIG_DIR,
          log_mod.LOG_DIR, log_mod.EVENTS_FILE) = self._old
+        _core_state.set_load_error(self._old_load_error)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 def _row_button_texts(row):

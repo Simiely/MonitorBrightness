@@ -46,8 +46,9 @@ from domain.timeutil import WEEKDAY_LABELS, WEEKDAY_NAMES_PS, WEEKDAY_PRESETS, c
 from core.paths import APP_DIR, CONFIG_DIR, CONFIG_FILE, ERROR_FILE, EVENTS_FILE, LOG_DIR, _LEGACY_CONFIG_DIR, _app_dir, _dir_writable, _pick_log_dir
 from core.util import _err, _out, _safe_int, _short_dt
 import core.config as _config
-from core.config import APP_TITLE, APP_VERSION, AUTOSTART_RUN_NAME, CONFIG_LOAD_ERROR, CONFIG_VERSION, DEFAULT_SLOTS, OFF_METHODS, OFF_METHOD_LABEL, SETTINGS, SETTING_BY_KEY, _CAPS_CACHE, _as_iterable, _atomic_write_text, _autostart_path, _backup_bad_config, _coerce_ids, _coerce_levels, _coerce_positions, _coerce_slots, _load_model_cache, _split_spec, _to_index, _valid_hhmm, coerce_setting, default_config, get_autostart, load_config, normalize_indices, old_config_present, save_config, set_autostart
-from core.logging import _DIAG_LIMIT, _DIAG_ON, _EVENT_LOCK, _SESSION_EVENTS, _diag_file, _write_event_log, dlog, diag_dump, diag_enabled, diag_export, diag_set_enabled, read_recent_events, read_session_events
+from core import state as _core_state
+from core.config import APP_TITLE, APP_VERSION, AUTOSTART_RUN_NAME, CONFIG_VERSION, DEFAULT_SLOTS, OFF_METHODS, OFF_METHOD_LABEL, SETTINGS, SETTING_BY_KEY, _as_iterable, _atomic_write_text, _autostart_path, _backup_bad_config, _coerce_ids, _coerce_levels, _coerce_positions, _coerce_slots, _load_model_cache, _split_spec, _to_index, _valid_hhmm, coerce_setting, default_config, get_autostart, load_config, normalize_indices, old_config_present, save_config, set_autostart
+from core.logging import _DIAG_LIMIT, _EVENT_LOCK, _diag_file, _write_event_log, dlog, diag_dump, diag_enabled, diag_export, diag_set_enabled, read_recent_events, read_session_events
 from hw.ddc import PHYSICAL_MONITOR, _dxva2, _read_vcp, _write_vcp, enumerate_targets, release_targets, _select, _capabilities, _DISPLAY_DEVICE, _display_uid, _display_key, _capabilities_cached, _caps_model, _caps_inputs, _caps_power, monitor_model, monitor_label, _luminance_max, _raw_from_percent, set_brightness_many, get_brightness_many, probe_states, _idle_seconds, _human_gap, NO_MONITOR_MSG, VCP_BRIGHTNESS, VCP_INPUT_SOURCE, VCP_POWER_MODE, POWER_ON, POWER_STANDBY, POWER_SUSPEND, POWER_SOFT_OFF, POWER_OFF, POWER_LABEL, _DXVA2_READY, _EDID_CACHE, _MAX_LUM
 from hw.ccd_structs import _CcdLuid, _CcdRational, _CcdSourceInfo, _CcdTargetInfo, _CcdPathInfo, _CcdPoint, _CcdSourceMode, _CcdModeInfo, _CcdInfoHeader, _CcdSourceName, _CcdTargetName, _Ccd2D, _CcdVideoSignalInfo, _CcdTargetPreferredMode, _QDC_ALL_PATHS, _QDC_VIRTUAL_MODE_AWARE, _CCD_PATH_ACTIVE, _CCD_GET_SOURCE_NAME, _CCD_GET_TARGET_NAME, _DC_GET_TARGET_PREFERRED_MODE, _CCD_PIXELFORMAT_NONGDI, _CCD_EDID_IDS_VALID, _CCD_TARGET_IN_USE, _SDC_USE_SUPPLIED, _SDC_APPLY, _SDC_SAVE_TO_DATABASE, _SDC_ALLOW_CHANGES, _SDC_VIRTUAL_MODE_AWARE, _CCD_APPLY_FLAGS, _CCD_MODE_IDX_INVALID, TOPO_VERIFY_TIMEOUT, _CCD_TYPE_SOURCE, _CCD_TYPE_TARGET, _CCD_TYPE_DESKTOP
 from hw.ccd import _ccd_setup_probe_api, _ccd_query_all_paths, _ccd_rows_from_paths, _ccd_merge_rows_by_anchor, ccd_probe_topology, topology_state_for, screen_verdict, _ccd_api, _ccd_query_raw, _ccd_slice_bytes, _ccd_make_snapshot, _ccd_apply, _ccd_restore_from_bytes, _ccd_wait_state, _ccd_mode_entries, _ccd_pick_mode
@@ -71,6 +72,19 @@ from app.screen_power import _ScreenPowerActions
 from app.schedule import _ScheduleActions
 from app.layout import DEFAULT_LAYOUT_FILE, _LayoutActions, _SDC_VALIDATE, load_default_layout, remember_layout_snapshot, restore_default_layout, save_default_layout, topology_heir_candidates
 from app.topology_actions import _TopologyActions
+
+
+def __getattr__(name):
+    """兼容再导出：R6 后这些名字的可变状态在 core.state，按访问器实时读取。"""
+    if name == "CONFIG_LOAD_ERROR":
+        return _core_state.get_load_error()
+    if name == "_CAPS_CACHE":
+        return _core_state.caps_cache()
+    if name == "_SESSION_EVENTS":
+        return _core_state.session_events()
+    if name == "_DIAG_ON":
+        return _core_state.get_diag_on()
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 
 if __name__ == "__main__":
