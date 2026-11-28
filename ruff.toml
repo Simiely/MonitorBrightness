@@ -1,0 +1,10 @@
+# 最小可用基线：先锁“会真出错”的规则，不追求历史格式一次清零。
+# - F821/F811/F841：未定义名、重复定义、未使用变量
+# - B：bugbear 里与运行时行为相关的低噪声规则
+# 历史格式（UP031/UP009/I001）和兼容再导出（F401）暂不纳入，避免大 diff。
+# 后续要收紧时先跑：py -m ruff check --select <新规则> --statistics
+[lint]
+select = ["F821", "F811", "F841", "B"]
+
+[format]
+quote-style = "double"

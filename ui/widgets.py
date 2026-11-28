@@ -273,7 +273,6 @@ class Slider(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
-        w = max(self.winfo_width(), 2)
         h = max(self.winfo_height(), 2)
         x0, x1, _ = self._track()
         cy = h / 2.0

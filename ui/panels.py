@@ -73,7 +73,7 @@ class MonitorPanel:
                 chk.pack(side="left", padx=(0, 8), pady=7)
                 # 逐台按钮先于文本 pack：文本是 expand 的，后 pack 的侧边控件
                 # 在窄窗口里会被挤掉。顺序：勾选 / 按钮(右) / 文本(左,撑满)。
-                btns = self._row_action_button(row, i)
+                self._row_action_button(row, i)
                 txt = tk.Frame(row, bg=UI["card"])
                 txt.pack(side="left", fill="x", expand=True)
                 self.mon_text[i] = txt

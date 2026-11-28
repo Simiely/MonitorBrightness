@@ -176,7 +176,7 @@ def _register_header_lines(exe, arg, slots):
         % ", ".join(_ps_quote(x) for x in _LEGACY_TASKS),
         "$triggers = @(",
     ]
-    for i, x in enumerate(slots):
+    for x in slots:
         lines.append(_ps_trigger_line(x))
     return lines
 
